@@ -3,31 +3,60 @@ name = "orbweaver"
 version = "0.1.0"
 edition = "2021"
 
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+# Define the library implicitly by having src/lib.rs
+# [lib]
+# name = "orbweaver_lib" # Optional: specify library name
+# path = "src/lib.rs"
+
 [dependencies]
 # Core biotechnology libraries
-bqtools = "0.1.0"  # For VBQ format handling
-bio = "1.3.1"      # Rust bioinformatics library
+bio = "2.2.0"      # Rust bioinformatics library
+# binseq = "0.6.2"    # For sequence encoding (VBQ) - Replaced by vbinseq
+vbinseq = "0.1.7"   # Used for VBQ reader/writer initially, but problematic. Keeping for now if needed elsewhere.
+bitnuc = "0.2.11"    # Core 2-bit nucleotide encoding (dependency of vbinseq, can use directly)
+byteorder = "1.5"    # For handling byte order in custom binary format (Added)
 
 # Data structures and algorithms
-petgraph = "0.6.3" # Graph data structures
-fm-index = "0.1.0" # FM-Index for efficient substring queries
+petgraph = "0.8.1" # Graph data structures
+# fm-index = "0.3.0" # FM-Index for efficient substring queries - Requires nightly via vers-vecs
+suffix = "1.3.0" # NOTE: Version was 1.3.0 in doc build
+suffix_array = "0.5.0" # Explicitly add dependency seen in build log
+glob = "0.3.1" # Add glob needed by ncbi.rs
 
 # Parallelization
 rayon = "1.7.0"    # Data parallelism library
 
 # Database integration
-neo4rs = "0.6.2"   # Neo4j Rust driver
+neo4rs = "0.8.0"   # Neo4j Rust driver
+
+# Dependency override for compatibility
+# vers-vecs = "=1.5.1" # Reverted due to compiler incompatibility
 
 # Utility libraries
-anyhow = "1.0.72"  # Error handling
-clap = { version = "4.3.19", features = ["derive"] } # Command line argument parsing
-serde = { version = "1.0.174", features = ["derive"] } # Serialization/deserialization
-serde_json = "1.0.103" # JSON support
-tempfile = "3.6.0" # Temporary file handling
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+csv = "1.3"
+dotenv = "0.15"
+quick-xml = { version = "0.35", features = ["serialize"] }
+reqwest = { version = "0.12", features = ["json", "blocking"] } # Start with blocking for simplicity, can switch to async later
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+# tokio = { version = "1", features = ["full"] } # Add if switching reqwest to async
 
 # Async runtime
 tokio = { version = "1.29.1", features = ["rt-multi-thread", "macros", "time"] }
 
 # Logging
 log = "0.4.19"
-env_logger = "0.10.0"
+env_logger = "0.11.8"
+bqtools = "0.3.19"
+
+# The main binary uses src/main.rs by default
+# No need for [[bin]] sections anymore
+
+rustls-pki-types = "0.1"
+
+# Orbweaver specific dependencies
+sysinfo = "0.30"

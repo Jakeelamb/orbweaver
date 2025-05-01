@@ -1,1 +1,36 @@
-/target
+# Rust build artifacts
+/target/
+
+# Downloaded data
+/genomes/
+*.zip
+
+# Generated data files
+*.csv
+*.tsv
+*.vbq
+*.fasta
+*.fna
+*.fa
+*.fastq
+*.fq
+*.fastqc.zip
+*.fastqc.html
+*.fastqc.zip
+*.gz
+*.tar
+*.tar.gz
+*.tar.bz2
+*.tar.xz
+*.tar.lz
+*.tar.lzma
+# Environment variables
+.env
+
+# IDE/Editor specific files
+.vscode/
+.idea/
+
+# OS specific files
+.DS_Store
+Thumbs.db

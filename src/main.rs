@@ -1,230 +1,123 @@
-use anyhow::Result;
-use clap::Parser;
-use log::{debug, info, warn, LevelFilter};
-use rayon::prelude::*;
-use std::path::Path;
+use anyhow::{Context, Result};
+use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 
-mod genome;
-mod slp;
-mod graph;
-mod database;
-mod analysis;
-mod utils;
+// Use the modules declared in src/lib.rs
+use orbweaver::ncbi;
+use orbweaver::encoding;
+use orbweaver::slp;
+use orbweaver::motifs;
 
-use crate::database::DatabaseConfig;
-use crate::genome::{Chromosome, Genome};
-use crate::graph::MotifGraph;
-use crate::slp::SLPBuilder;
-use crate::utils::ensure_dir_exists;
-
-/// Orbweaver: A tool for computing assembly indices and building substring motif graphs
-/// for genome assemblies from NCBI.
+/// Orbweaver: A tool for processing genomic data, including NCBI fetching, encoding, and SLP construction.
 #[derive(Parser, Debug)]
-#[clap(author, version, about)]
-struct Args {
-    /// Path to input FASTA file containing chromosomes/scaffolds
-    #[clap(short, long)]
-    input: String,
-
-    /// Output directory for storing results
-    #[clap(short, long, default_value = "output")]
-    output: String,
-
-    /// Neo4j connection URI
-    #[clap(long, default_value = "bolt://localhost:7687")]
-    neo4j_uri: String,
-
-    /// Neo4j username
-    #[clap(long, default_value = "neo4j")]
-    neo4j_user: String,
-
-    /// Neo4j password
-    #[clap(long)]
-    neo4j_password: String,
-
-    /// Genome ID
-    #[clap(long)]
-    genome_id: String,
-
-    /// Species name
-    #[clap(long)]
-    species_name: String,
-
-    /// Related group (taxonomic group, clade, etc.)
-    #[clap(long)]
-    related_group: String,
-
-    /// SLP threshold factor (higher means more aggressive compression)
-    #[clap(long, default_value = "1000000")]
-    threshold_factor: f64,
-
-    /// Number of threads to use for parallel processing
-    #[clap(short, long, default_value = "0")]
-    threads: usize,
-
-    /// Skip database operations
-    #[clap(long)]
-    skip_db: bool,
-
-    /// Debug mode
-    #[clap(short, long)]
-    debug: bool,
+#[clap(author, version, about, long_about = None)]
+struct Cli {
+    #[clap(subcommand)]
+    command: Commands,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    // Parse command line arguments
-    let args = Args::parse();
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Fetch data from NCBI, process, and optionally download sample genomes.
+    FetchNcbi {
+        #[clap(long, help = "Force fetch data from NCBI and overwrite existing CSV files.")]
+        generate: bool,
 
-    // Setup logging
-    let log_level = if args.debug {
-        LevelFilter::Debug
-    } else {
-        LevelFilter::Info
-    };
-    
-    env_logger::builder()
-        .filter_level(log_level)
-        .init();
+        #[clap(long, value_parser, default_value = "metazoan_chromosome_assemblies_with_lineage.csv", help = "Path to the main CSV file for loading/saving assembly data.")]
+        csv_file: PathBuf,
+    },
 
-    info!("Starting Orbweaver...");
-    
-    // Set up thread pool size if specified
-    if args.threads > 0 {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(args.threads)
-            .build_global()?;
-        info!("Using {} threads for parallel processing", args.threads);
-    }
+    /// Encode a FASTA file into VBQ format.
+    EncodeVbq {
+        #[clap(value_parser, help = "Input FASTA file path (.fa, .fasta, .fna)")]
+        input: PathBuf,
 
-    // Create output directories
-    let output_dir = Path::new(&args.output);
-    ensure_dir_exists(output_dir)?;
+        #[clap(value_parser, help = "Output VBQ file path (.vbq)")]
+        output: PathBuf,
 
-    // Process genome to get chromosomes with VBQ files
-    info!("Processing input genome from {}", args.input);
-    let mut genome_processor = genome::GenomeProcessor::new(&args.input, &args.output)?;
-    let mut genome = genome_processor.process()?;
-    
-    // Update genome with command line arguments
-    genome.id = args.genome_id;
-    genome.species_name = args.species_name;
-    genome.related_group = args.related_group;
-    
-    info!("Processed genome: {} ({}) with {} chromosomes", 
-        genome.species_name, genome.id, genome.chromosomes.len());
+        #[clap(short, long, value_parser, default_value_t = 0, help = "Compression level (0-9)")]
+        level: u8,
+    },
 
-    // Process each chromosome to build SLPs and calculate metrics
-    info!("Building SLPs and calculating assembly indices for each chromosome");
-    
-    // Use ParallelIterator to process chromosomes in parallel
-    let chromosome_results: Vec<Result<(Chromosome, MotifGraph)>> = genome.chromosomes
-        .par_iter()
-        .map(|chromosome| {
-            info!("Processing chromosome: {}", chromosome.id);
-            
-            // Build SLP
-            let mut slp_builder = SLPBuilder::new()
-                .with_threshold_factor(args.threshold_factor);
-            
-            let slp = slp_builder.build_from_vbq(chromosome)?;
-            
-            // Convert SLP to graph
-            let motif_graph = MotifGraph::from_slp(&slp)?;
-            
-            // Create updated chromosome with metrics
-            let mut updated_chromosome = chromosome.clone();
-            updated_chromosome.assembly_index = Some(slp.assembly_index);
-            updated_chromosome.graph_depth = Some(motif_graph.depth);
-            updated_chromosome.avg_motif_length = Some(motif_graph.avg_motif_length);
-            
-            info!(
-                "Chromosome {} processed: assembly index = {}, graph depth = {}, avg motif length = {:.2}",
-                updated_chromosome.id,
-                updated_chromosome.assembly_index.unwrap(),
-                updated_chromosome.graph_depth.unwrap(),
-                updated_chromosome.avg_motif_length.unwrap()
-            );
-            
-            Ok((updated_chromosome, motif_graph))
-        })
-        .collect();
-    
-    // Process results and update genome
-    let mut chromosome_graphs = Vec::new();
-    let mut updated_chromosomes = Vec::new();
-    let mut total_assembly_index = 0.0;
-    let mut total_weight = 0.0;
-    
-    for result in chromosome_results {
-        match result {
-            Ok((chromosome, graph)) => {
-                // Calculate weighted assembly index
-                let weight = chromosome.processed_length as f64;
-                total_assembly_index += chromosome.assembly_index.unwrap() as f64 * weight;
-                total_weight += weight;
-                
-                updated_chromosomes.push(chromosome);
-                chromosome_graphs.push(graph);
+    /// Encode a FASTA file into the custom Orbweaver binary format (.orb).
+    EncodeOrb {
+        #[clap(value_parser, help = "Input FASTA file path (.fa, .fasta, .fna)")]
+        input: PathBuf,
+
+        #[clap(value_parser, help = "Output ORB file path (.orb)")]
+        output: PathBuf,
+    },
+
+    /// Build a Straight-Line Program (SLP) from a FASTA file (first sequence).
+    BuildSlp {
+        #[clap(short, long, value_parser, help = "Input FASTA file path.")]
+        input: PathBuf,
+
+        #[clap(short, long, value_parser, default_value_t = 1_000_000.0, help = "Normalization factor N for SLP stopping condition (freq < 1 / (len * N))")]
+        n_factor: f64,
+
+        // Placeholder for potential output file argument
+        // #[clap(short, long, value_parser, help = "Output file for the generated SLP rules (optional).")]
+        // output: Option<PathBuf>,
+    },
+
+    /// Find repeating substrings in a custom Orbweaver binary file (.orb).
+    FindRepeats {
+        #[clap(short, long, value_parser, help = "Input ORB file path (.orb).")]
+        input: PathBuf,
+
+        #[clap(short, long, value_parser, default_value_t = 10, help = "Minimum length of repeats to report.")]
+        min_len: usize,
+    },
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    // Match on the subcommand
+    match cli.command {
+        Commands::FetchNcbi { generate, csv_file } => {
+            println!("Running NCBI Fetch command...");
+            ncbi::run_ncbi_fetch(generate, csv_file)
+                .context("NCBI Fetch command failed")?
+        }
+        Commands::EncodeVbq { input, output, level } => {
+            println!("Running Encode VBQ command...");
+            encoding::run_fasta_to_vbq(input, output, level)
+                .context("Encode VBQ command failed")?
+        }
+        Commands::EncodeOrb { input, output } => {
+            println!("Running Encode ORB command...");
+            encoding::run_fasta_to_orb_bin(input, output)
+                .context("Encode ORB command failed")?
+        }
+        Commands::BuildSlp { input, n_factor } => {
+            println!("Running Build SLP command...");
+            slp::run_slp_build(input, n_factor)
+                .context("Build SLP command failed")?
+            // TODO: Add logic to handle optional SLP output file
+        }
+        Commands::FindRepeats { input, min_len } => {
+            println!("Running Find Repeats command (on .orb file)...");
+
+            // Calls the modified motifs::find_repeats which expects .orb format
+            let repeats = motifs::find_repeats(&input, min_len)
+                .context("Failed to find repeats")?;
+
+            // Print the results (potentially large output)
+            println!("\nFound {} unique repeats (length >= {}):", repeats.len(), min_len);
+             let mut sorted_repeats: Vec<_> = repeats.into_iter().collect();
+             sorted_repeats.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+            let max_to_print = 50; // Limit output
+            for (repeat, count) in sorted_repeats.iter().take(max_to_print) {
+                 println!("  - \"{}\" : {}", repeat, count);
             }
-            Err(e) => {
-                warn!("Error processing chromosome: {}", e);
+            if sorted_repeats.len() > max_to_print {
+                println!("  ... (output truncated, {} repeats total)", sorted_repeats.len());
             }
         }
     }
-    
-    // Update genome with processed chromosomes and weighted average assembly index
-    genome.chromosomes = updated_chromosomes;
-    genome.assembly_index_avg = Some(total_assembly_index / total_weight);
-    
-    info!(
-        "Genome processing complete. Average assembly index: {:.2}",
-        genome.assembly_index_avg.unwrap()
-    );
-    
-    // Store results in database
-    if !args.skip_db {
-        info!("Connecting to Neo4j database");
-        let db_config = DatabaseConfig::new(
-            &args.neo4j_uri,
-            &args.neo4j_user,
-            &args.neo4j_password,
-            30, // 30 second timeout
-        );
-        
-        let db = database::Database::new(&db_config).await?;
-        
-        // Test connection
-        db.test_connection().await?;
-        
-        // Store genome
-        db.store_genome(&genome).await?;
-        
-        // Store motif graphs for each chromosome
-        for (i, graph) in chromosome_graphs.iter().enumerate() {
-            let chromosome = &genome.chromosomes[i];
-            db.store_motif_graph(&genome.id, &chromosome.id, graph).await?;
-        }
-        
-        // Run analysis
-        let analyzer = analysis::Analyzer::new(
-            &args.neo4j_uri,
-            &args.neo4j_user,
-            &args.neo4j_password,
-            &args.output,
-        ).await?;
-        
-        // Generate comparative analysis
-        analyzer.calculate_group_statistics().await?;
-        analyzer.analyze_size_vs_index_correlation().await?;
-        analyzer.export_chromosome_metrics_csv().await?;
-        
-        info!("Analysis complete and results saved to {}", args.output);
-    } else {
-        info!("Skipping database operations as requested");
-    }
-    
-    info!("Orbweaver processing complete!");
-    
+
     Ok(())
 }
