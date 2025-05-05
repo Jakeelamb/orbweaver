@@ -1,0 +1,8 @@
+== Final Sequence (3 symbols) ==
+R2+ R3+ R3+
+
+== Rules (4 total) ==
+R0 [Usage=5] -> G+ T+
+R1 [Usage=5] -> A+ C+
+R2 [Usage=5] -> R1+ R0+
+R3 [Usage=2] -> R2+ R2+

@@ -1,0 +1,20 @@
+digraph Grammar {
+  rankdir=LR;
+  node [shape=box, style=filled, fillcolor=lightgrey];
+  R3+ [label="R3 (Usage=2)", shape=box, fillcolor=lightblue];
+  R0+ [label="R0 (Usage=5)", shape=box, fillcolor=lightblue];
+  R2+ [label="R2 (Usage=5)", shape=box, fillcolor=lightblue];
+  R1+ [label="R1 (Usage=5)", shape=box, fillcolor=lightblue];
+  R3+ -> R2+;
+  R3+ -> R2+;
+  T_G+ [label="G+", shape=ellipse, fillcolor=white];
+  R0+ -> T_G+;
+  T_T+ [label="T+", shape=ellipse, fillcolor=white];
+  R0+ -> T_T+;
+  T_A+ [label="A+", shape=ellipse, fillcolor=white];
+  R2+ -> T_A+;
+  R2+ -> R1+;
+  T_C+ [label="C+", shape=ellipse, fillcolor=white];
+  R1+ -> T_C+;
+  R1+ -> R0+;
+}

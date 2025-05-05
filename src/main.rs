@@ -1,123 +1,309 @@
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, command, ArgGroup};
 use std::path::PathBuf;
+use std::fs;
+use orbweaver::fasta::reader::read_fasta_sequences;
+use orbweaver::fasta::encoder::{encode_dna_2bit, decode_dna_2bit};
+use orbweaver::grammar::builder::GrammarBuilder;
+use orbweaver::io::output_json::write_grammar_json;
+use orbweaver::io::output_gfa::write_grammar_gfa;
+use orbweaver::io::output_text::write_grammar_text;
+use orbweaver::io::output_fasta::export_rules_as_fasta;
+use orbweaver::analysis::stats::calculate_and_print_stats;
+use orbweaver::io::output_dot::write_grammar_dot;
 
-// Use the modules declared in src/lib.rs
-use orbweaver::ncbi;
-use orbweaver::encoding;
-use orbweaver::slp;
-use orbweaver::motifs;
+// Use the configuration module if needed, or args directly
+// use orbweaver::config::Config; 
 
-/// Orbweaver: A tool for processing genomic data, including NCBI fetching, encoding, and SLP construction.
+// Use other library modules as needed later
+// use orbweaver::io; // Example
+// use orbweaver::fasta;
+// use orbweaver::grammar;
+// use orbweaver::analysis; // If motifs analysis is re-integrated later
+
+/// Orbweaver: A grammar-based approach to genomic sequence analysis.
+/// 
+/// Orbweaver processes DNA sequences from FASTA files to build context-free grammars
+/// by identifying repeating patterns. It can output the grammar in various formats and
+/// provide statistics about the compression and structure.
 #[derive(Parser, Debug)]
-#[clap(author, version, about, long_about = None)]
-struct Cli {
-    #[clap(subcommand)]
-    command: Commands,
-}
+#[command(author = "Orbweaver Team", version, about, long_about = None)]
+#[command(help_template = "\
+{before-help}{name} {version}
+{author-with-newline}{about-with-newline}
+{usage-heading} {usage}
 
-#[derive(Subcommand, Debug)]
-enum Commands {
-    /// Fetch data from NCBI, process, and optionally download sample genomes.
-    FetchNcbi {
-        #[clap(long, help = "Force fetch data from NCBI and overwrite existing CSV files.")]
-        generate: bool,
+{all-args}{after-help}
+")]
+struct OrbweaverArgs {
+    /// Input FASTA file path (.fa, .fasta, .fna).
+    /// 
+    /// Path to the file containing DNA sequences in FASTA format.
+    /// Currently processes the first sequence in multi-sequence files.
+    #[clap(short, long, value_parser, required = true)]
+    input: PathBuf,
 
-        #[clap(long, value_parser, default_value = "metazoan_chromosome_assemblies_with_lineage.csv", help = "Path to the main CSV file for loading/saving assembly data.")]
-        csv_file: PathBuf,
-    },
+    // --- Output Format Options ---
+    
+    /// Output JSON file path for the grammar.
+    /// 
+    /// Writes a detailed JSON representation of the grammar including all
+    /// rules and the final compressed sequence.
+    #[clap(short = 'j', long, value_parser)]
+    output_json: Option<PathBuf>,
 
-    /// Encode a FASTA file into VBQ format.
-    EncodeVbq {
-        #[clap(value_parser, help = "Input FASTA file path (.fa, .fasta, .fna)")]
-        input: PathBuf,
+    /// Output human-readable text representation of the grammar.
+    /// 
+    /// Writes a simplified text format showing rules and the final sequence
+    /// in a more readable format than JSON.
+    #[clap(long, value_parser)]
+    output_text: Option<PathBuf>,
 
-        #[clap(value_parser, help = "Output VBQ file path (.vbq)")]
-        output: PathBuf,
+    /// Output GFAv1 representation of the grammar.
+    /// 
+    /// Exports the grammar as a graph in GFA (Graphical Fragment Assembly) format,
+    /// which can be visualized with tools like Bandage.
+    #[clap(long, value_parser)]
+    output_gfa: Option<PathBuf>,
 
-        #[clap(short, long, value_parser, default_value_t = 0, help = "Compression level (0-9)")]
-        level: u8,
-    },
+    /// Generate a .dot file for visualizing the grammar.
+    /// 
+    /// Creates a DOT file for visualization with Graphviz tools like dot, neato, etc.
+    /// Example usage: dot -Tpng grammar.dot -o grammar.png
+    #[clap(long, value_parser)]
+    visualize: Option<PathBuf>,
 
-    /// Encode a FASTA file into the custom Orbweaver binary format (.orb).
-    EncodeOrb {
-        #[clap(value_parser, help = "Input FASTA file path (.fa, .fasta, .fna)")]
-        input: PathBuf,
+    /// Export grammar rules as sequences in FASTA format.
+    /// 
+    /// Writes each grammar rule as a separate FASTA record, where each record
+    /// contains the fully expanded DNA sequence for that rule.
+    #[clap(long, value_parser)]
+    export_blocks: Option<PathBuf>,
 
-        #[clap(value_parser, help = "Output ORB file path (.orb)")]
-        output: PathBuf,
-    },
+    /// Print statistics about the generated grammar.
+    /// 
+    /// Displays metrics about the grammar: rule count, depth, compression ratio, etc.
+    #[clap(long, action = clap::ArgAction::SetTrue)]
+    stats: bool,
 
-    /// Build a Straight-Line Program (SLP) from a FASTA file (first sequence).
-    BuildSlp {
-        #[clap(short, long, value_parser, help = "Input FASTA file path.")]
-        input: PathBuf,
+    // --- Grammar Construction Options ---
 
-        #[clap(short, long, value_parser, default_value_t = 1_000_000.0, help = "Normalization factor N for SLP stopping condition (freq < 1 / (len * N))")]
-        n_factor: f64,
+    /// K-mer size for processing.
+    /// 
+    /// Used in some analysis algorithms. The grammar builder currently uses
+    /// digrams (k=2) internally regardless of this setting.
+    #[clap(short, long, value_parser, default_value_t = 21)]
+    kmer_size: usize,
 
-        // Placeholder for potential output file argument
-        // #[clap(short, long, value_parser, help = "Output file for the generated SLP rules (optional).")]
-        // output: Option<PathBuf>,
-    },
+    /// Minimum usage count for a rule to be kept.
+    /// 
+    /// A digram must appear at least this many times to be replaced by a rule.
+    /// Higher values lead to fewer rules with more usage each.
+    #[clap(long, value_parser, default_value_t = 2)]
+    min_rule_usage: usize,
 
-    /// Find repeating substrings in a custom Orbweaver binary file (.orb).
-    FindRepeats {
-        #[clap(short, long, value_parser, help = "Input ORB file path (.orb).")]
-        input: PathBuf,
+    /// Maximum number of rules allowed (triggers eviction).
+    /// 
+    /// When the number of rules exceeds this limit, less frequently used rules
+    /// are evicted. If not specified, no limit is enforced.
+    /// Note: Eviction is not yet implemented.
+    #[clap(long, value_parser)]
+    max_rule_count: Option<usize>,
 
-        #[clap(short, long, value_parser, default_value_t = 10, help = "Minimum length of repeats to report.")]
-        min_len: usize,
-    },
+    /// Perform reverse complement canonicalization.
+    /// 
+    /// When enabled, a digram and its reverse complement are treated as equivalent.
+    /// For example, "AC" and "GT" (reverse complement) are considered the same pattern.
+    #[clap(long, default_value_t = true, action = clap::ArgAction::Set)]
+    reverse_aware: bool,
+
+    // --- Input Processing Options ---
+
+    /// Skip N bases in FASTA input.
+    /// 
+    /// When enabled, 'N' or 'n' characters in the input are skipped,
+    /// as they typically represent unknown bases.
+    #[clap(long, default_value_t = true, action = clap::ArgAction::Set)]
+    skip_ns: bool,
+
+    /// Process genome in chunks of this size.
+    /// 
+    /// Divides large sequences into smaller chunks for processing.
+    /// Useful for very large genomes that exceed available memory.
+    /// Note: Chunking is not yet fully implemented.
+    #[clap(long, value_parser)]
+    chunk_size: Option<usize>,
+
+    /// Overlap between chunks when chunking is enabled.
+    /// 
+    /// Specifies the number of bases that overlap between adjacent chunks.
+    /// Helps ensure patterns spanning chunk boundaries are detected.
+    /// Note: Only relevant when chunking is enabled.
+    #[clap(long, value_parser, default_value_t = 1000)]
+    chunk_overlap: usize,
+    
+    /// Use 2-bit encoding to reduce memory usage.
+    /// 
+    /// When enabled, the input DNA sequence is encoded using 2 bits per base
+    /// before being processed, significantly reducing memory consumption.
+    /// This is especially useful for large genomes.
+    #[clap(long, default_value_t = true, action = clap::ArgAction::Set)]
+    use_encoding: bool,
 }
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let args = OrbweaverArgs::parse();
 
-    // Match on the subcommand
-    match cli.command {
-        Commands::FetchNcbi { generate, csv_file } => {
-            println!("Running NCBI Fetch command...");
-            ncbi::run_ncbi_fetch(generate, csv_file)
-                .context("NCBI Fetch command failed")?
-        }
-        Commands::EncodeVbq { input, output, level } => {
-            println!("Running Encode VBQ command...");
-            encoding::run_fasta_to_vbq(input, output, level)
-                .context("Encode VBQ command failed")?
-        }
-        Commands::EncodeOrb { input, output } => {
-            println!("Running Encode ORB command...");
-            encoding::run_fasta_to_orb_bin(input, output)
-                .context("Encode ORB command failed")?
-        }
-        Commands::BuildSlp { input, n_factor } => {
-            println!("Running Build SLP command...");
-            slp::run_slp_build(input, n_factor)
-                .context("Build SLP command failed")?
-            // TODO: Add logic to handle optional SLP output file
-        }
-        Commands::FindRepeats { input, min_len } => {
-            println!("Running Find Repeats command (on .orb file)...");
-
-            // Calls the modified motifs::find_repeats which expects .orb format
-            let repeats = motifs::find_repeats(&input, min_len)
-                .context("Failed to find repeats")?;
-
-            // Print the results (potentially large output)
-            println!("\nFound {} unique repeats (length >= {}):", repeats.len(), min_len);
-             let mut sorted_repeats: Vec<_> = repeats.into_iter().collect();
-             sorted_repeats.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-
-            let max_to_print = 50; // Limit output
-            for (repeat, count) in sorted_repeats.iter().take(max_to_print) {
-                 println!("  - \"{}\" : {}", repeat, count);
-            }
-            if sorted_repeats.len() > max_to_print {
-                println!("  ... (output truncated, {} repeats total)", sorted_repeats.len());
-            }
-        }
+    println!("Starting Orbweaver...");
+    println!("Input file: {}", args.input.display());
+    if let Some(out) = &args.output_json {
+        println!("Output JSON: {}", out.display());
+    }
+    println!("K-mer size: {}", args.kmer_size);
+    println!("Skip Ns: {}", args.skip_ns);
+    println!("Reverse Aware: {}", args.reverse_aware);
+    println!("Using 2-bit encoding: {}", args.use_encoding);
+    if let Some(cs) = args.chunk_size {
+        println!("Chunk Size: {}", cs);
+        println!("Chunk Overlap: {}", args.chunk_overlap);
     }
 
+    // --- Input Validation ---
+    if !args.input.exists() {
+        anyhow::bail!("Input file not found: {}", args.input.display());
+    }
+    if !args.input.is_file() {
+        anyhow::bail!("Input path is not a file: {}", args.input.display());
+    }
+
+    if args.kmer_size == 0 {
+        anyhow::bail!("K-mer size must be greater than 0.");
+    }
+    
+    if let Some(chunk_s) = args.chunk_size {
+         if chunk_s <= args.chunk_overlap {
+            anyhow::bail!("Chunk overlap ({}) must be smaller than chunk size ({}).", 
+                         args.chunk_overlap, chunk_s);
+        }
+    }
+    
+    if let Some(max_rules) = args.max_rule_count {
+        if max_rules > 0 && max_rules < args.min_rule_usage {
+             // Use eprintln for warnings
+             eprintln!("Warning: --max-rule-count ({}) is less than --min-rule-usage ({}). This might lead to unexpected eviction behavior.", max_rules, args.min_rule_usage);
+        }
+        if max_rules == 0 {
+            anyhow::bail!("--max-rule-count cannot be zero.");
+        }
+    }
+    if args.min_rule_usage == 0 {
+        anyhow::bail!("--min-rule-usage must be at least 1.");
+    }
+
+    // --- Create Config (Optional - args can be passed directly) ---
+    // let config = Config::new(args); // Pass the whole args struct?
+    // config.validate()?; // Or validate within Config::new
+
+    println!("Configuration validated.");
+    println!("----------------------------------------");
+
+    // --- Core Logic --- 
+
+    // 1. Read FASTA sequence(s)
+    let sequences = read_fasta_sequences(&args.input, args.skip_ns)
+        .context("Failed to read FASTA file")?;
+    
+    if sequences.is_empty() {
+        println!("No sequences found in the input file after processing.");
+        return Ok(()); // Or return an error?
+    }
+
+    // For now, process only the first sequence.
+    // TODO: Handle multiple sequences (concatenate? separate grammars?)
+    let (first_seq_id, first_seq_data) = &sequences[0];
+    println!(
+        "Processing first sequence: '{}' ({} bases)",
+        first_seq_id,
+        first_seq_data.len()
+    );
+    if sequences.len() > 1 {
+         println!("Warning: Input FASTA has multiple sequences. Only the first one ('{}') will be processed.", first_seq_id);
+    }
+
+    let initial_len = first_seq_data.len(); // Store initial length for stats
+
+    // 2. Optionally encode the sequence to reduce memory usage
+    let sequence_to_process = if args.use_encoding {
+        println!("Encoding sequence using 2-bit representation to reduce memory usage...");
+        match encode_dna_2bit(first_seq_data) {
+            Ok(encoded) => {
+                println!("  Original size: {} bytes, Encoded size: {} bytes ({}% reduction)",
+                    first_seq_data.len(),
+                    encoded.len(),
+                    (100.0 * (first_seq_data.len() - encoded.len()) as f64 / first_seq_data.len() as f64) as u32
+                );
+                // Decode back for processing - this is an intermediate step
+                // In a full implementation, the grammar builder would work with encoded data directly
+                let decoded = decode_dna_2bit(&encoded, first_seq_data.len());
+                decoded
+            },
+            Err(e) => {
+                println!("Warning: Failed to encode sequence: {}. Falling back to raw processing.", e);
+                first_seq_data.clone()
+            }
+        }
+    } else {
+        first_seq_data.clone()
+    };
+
+    // 3. Build Grammar
+    let mut grammar_builder = GrammarBuilder::new(args.min_rule_usage, args.reverse_aware);
+    
+    grammar_builder.build_grammar(&sequence_to_process)
+        .context("Failed during grammar construction")?;
+
+    // 4. Get final grammar (sequence and rules)
+    let (final_sequence, rules) = grammar_builder.get_grammar();
+    println!("----------------------------------------");
+    println!("Grammar construction complete.");
+    println!("  Final sequence length: {}", final_sequence.len());
+    println!("  Number of rules generated: {}", rules.len());
+    // Optionally print some rules or sequence snippet here for debugging
+    // if !rules.is_empty() {
+    //     println!("  Example Rule 0: {:?}", rules.get(&0));
+    // }
+
+    // 5. Write Output Files
+    if let Some(json_path) = &args.output_json {
+        write_grammar_json(&grammar_builder, json_path)
+            .context("Failed to write grammar to JSON")?;
+    }
+    if let Some(gfa_path) = &args.output_gfa {
+        write_grammar_gfa(&grammar_builder, gfa_path)
+            .context("Failed to write grammar to GFA")?;
+    }
+    if let Some(text_path) = &args.output_text {
+        write_grammar_text(&grammar_builder, text_path)
+            .context("Failed to write grammar to Text")?;
+    }
+    if let Some(fasta_path) = &args.export_blocks {
+         export_rules_as_fasta(&grammar_builder, fasta_path)
+            .context("Failed to export rules to FASTA")?;
+    }
+
+    // 6. Calculate and Print Stats
+    if args.stats {
+        calculate_and_print_stats(&grammar_builder, initial_len)
+            .context("Failed to calculate statistics")?;
+    }
+
+    // 7. Write Visualization
+    if let Some(dot_path) = &args.visualize {
+        write_grammar_dot(&grammar_builder, dot_path)
+            .context("Failed to write grammar to DOT")?;
+    }
+
+    println!("----------------------------------------");
+    println!("Orbweaver finished.");
     Ok(())
 }

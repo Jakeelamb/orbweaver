@@ -60,3 +60,11 @@ rustls-pki-types = "0.1"
 
 # Orbweaver specific dependencies
 sysinfo = "0.30"
+crossbeam-channel = "0.5"
+memmap2 = "0.9" # Add memmap2
+twox-hash = "1.6"
+
+[dev-dependencies]
+assert_cmd = "2.0"
+predicates = "3.0"
+tempfile = "3.10"

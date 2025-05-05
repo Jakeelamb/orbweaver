@@ -1,181 +1,310 @@
-# Orbweaver
+# Orbweaver: Grammar-Based Genomic Sequence Analysis
 
-Orbweaver is a Rust-based tool for computing assembly indices, constructing substring motif graphs for genome assemblies, and performing comparative genomic analysis.
+[![Rust](https://github.com/your-username/orbweaver/actions/workflows/rust.yml/badge.svg)](https://github.com/your-username/orbweaver/actions/workflows/rust.yml)
 
-## Overview
+Orbweaver is a command-line tool written in Rust for building and analyzing context-free grammars (CFGs) from genomic sequences. It identifies repeating patterns in DNA sequences and replaces them with non-terminal symbols (rules), effectively compressing the sequence into a hierarchical grammar representation.
 
-Orbweaver processes genome assemblies at the chromosome level to:
+## Table of Contents
 
-1. Compute the assembly index—a measure of structural complexity based on assembly theory—for individual chromosomes and scaffolds.
-2. Construct substring motif graphs (representing Straight-Line Programs - SLPs) per chromosome to represent hierarchical sequence construction.
-3. Store results (per-chromosome metrics, graphs, and genome-level summaries) in a Neo4j graph database for comparative analysis across multiple genomes.
-4. Export CSV files for analysis across taxonomic groups.
+- [Features](#features)
+- [Installation](#installation)
+- [Quick Start](#quick-start)
+- [How It Works](#how-it-works)
+- [Usage Guide](#usage-guide)
+- [Output Formats](#output-formats)
+- [Examples](#examples)
+- [Configuration](#configuration)
+- [Architecture](#architecture)
+- [Known Limitations](#known-limitations)
+- [Development](#development)
+- [Contributing](#contributing)
+- [License](#license)
 
 ## Features
 
-- **VBQ Format Support**: Uses the vbinseq (VBQ) format via bqtools for efficient encoding and decoding of genomic sequences.
-- **Straight-Line Program Construction**: Implements a greedy, Byte Pair Encoding (BPE)-like algorithm to build hierarchical motif representations of genomic sequences.
-- **FM-Index Integration**: Uses FM-Index for efficient substring queries during SLP construction, optimizing the process for large chromosomes.
-- **Graph Representation**: Converts SLPs to directed graphs for visualization and analysis.
-- **Parallel Processing**: Processes chromosomes in parallel for improved performance.
-- **Metadata Acquisition**: Integrates with NCBI taxonomy to automatically determine taxonomic groups and lineage information.
-- **Neo4j Integration**: Stores genome metadata, chromosome metrics, and motif graphs in a Neo4j graph database.
-- **Batch Processing**: Efficiently processes batches of genomes using a single command.
+- **FASTA Processing**: Reads sequences from FASTA files with support for skipping ambiguous bases (N).
+- **Grammar Construction**: Builds a grammar by iteratively replacing the most frequent digrams.
+- **Reverse Complement Awareness**: Can treat a digram and its reverse complement as equivalent.
+- **Multiple Output Formats**:
+  - **JSON**: Serialized representation of the grammar structure
+  - **Text**: Human-readable format showing rules and final sequence
+  - **GFA**: Graph-based representation (Graphical Fragment Assembly)
+  - **DOT**: For visualization using Graphviz
+  - **FASTA**: Exports expanded sequences for each rule
+- **Statistics**: Calculates compression ratio, rule depth, and other metrics
+- **Parallelization**: Utilizes multi-threading for performance on large genomes
 
 ## Installation
 
 ### Prerequisites
 
-- Rust 1.56 or later
-- Neo4j 4.x or later (if using database features)
-- bqtools (for VBQ format handling)
-- Python 3.6+ with required packages (for metadata acquisition)
+- Rust and Cargo (1.70.0+)
+- For visualization: Graphviz (optional)
 
-### Required Python Packages
+### From Source
 
-For metadata acquisition, the following Python packages are required:
 ```bash
-pip install pandas numpy requests dotenv
+# Clone the repository
+git clone https://github.com/your-username/orbweaver.git
+cd orbweaver
+
+# Build the project
+cargo build --release
+
+# The executable will be in target/release/orbweaver
 ```
+
+## Quick Start
+
+```bash
+# Process a FASTA file and output the grammar as JSON
+./target/release/orbweaver -i input.fasta -j output.json
+
+# Generate all outputs and print statistics
+./target/release/orbweaver -i genome.fna \
+  -j output/grammar.json \
+  --output-text output/grammar.txt \
+  --output-gfa output/grammar.gfa \
+  --visualize output/grammar.dot \
+  --export-blocks output/rules.fasta \
+  --stats
+
+# See all available options
+./target/release/orbweaver --help
+```
+
+## How It Works
+
+Orbweaver implements a variant of the Sequitur algorithm, which iteratively identifies the most frequent adjacent pairs (digrams) in a sequence and replaces them with non-terminal symbols. These replacements create a hierarchical grammar that compactly represents the original sequence.
+
+The process works as follows:
+
+1. **Initialization**: Convert the input DNA sequence to a series of terminal symbols.
+2. **Iteration**:
+   - Find the most frequent digram in the current sequence
+   - If the digram appears at least `min_rule_usage` times:
+     - Create a new rule that expands to this digram
+     - Replace all occurrences of the digram with the new rule
+   - Repeat until no digram appears frequently enough
+3. **Output**: The resulting grammar consists of:
+   - A final sequence (now containing both terminals and non-terminals)
+   - A set of production rules
+
+When "reverse-aware" mode is enabled, digrams that are reverse complements of each other (e.g., "AC" and "GT") are treated as equivalent, which can lead to more effective compression in biological sequences.
+
+## Usage Guide
+
+### Basic Usage
+
+```bash
+orbweaver -i <input_fasta> [options]
+```
+
+### Required Arguments
+
+- `-i, --input <FILE>`: Input FASTA file path (.fa, .fasta, .fna)
+
+### Output Options
+
+- `-j, --output-json <FILE>`: Write grammar to JSON file
+- `--output-text <FILE>`: Write grammar in human-readable text format
+- `--output-gfa <FILE>`: Write grammar in GFA (graph) format
+- `--visualize <FILE>`: Generate DOT file for visualization
+- `--export-blocks <FILE>`: Export grammar rules as FASTA sequences
+- `--stats`: Print statistics about the generated grammar
+
+### Grammar Construction Options
+
+- `-k, --kmer-size <INT>`: K-mer size (default: 21)
+- `--min-rule-usage <INT>`: Minimum digram frequency for rule creation (default: 2)
+- `--max-rule-count <INT>`: Maximum number of rules allowed (optional)
+- `--reverse-aware <BOOL>`: Enable reverse complement awareness (default: true)
+
+### Input Processing Options
+
+- `--skip-ns <BOOL>`: Skip 'N' bases in input (default: true)
+- `--chunk-size <INT>`: Process genome in chunks of this size (optional)
+- `--chunk-overlap <INT>`: Overlap between chunks (default: 1000)
+
+For full details, run `orbweaver --help`.
+
+## Output Formats
+
+### JSON Format
+
+Contains the complete grammar structure:
+- `final_sequence`: Array of symbols in the compressed sequence
+- `rules`: Map of rule definitions
+
+```json
+{
+  "final_sequence": [
+    {"id": 10, "symbol_type": {"NonTerminal": 0}, "strand": "+"},
+    {"id": 11, "symbol_type": {"NonTerminal": 1}, "strand": "-"}
+  ],
+  "rules": {
+    "0": {
+      "id": 0,
+      "symbols": [
+        {"id": 0, "symbol_type": {"Terminal": 65}, "strand": "+"},
+        {"id": 1, "symbol_type": {"Terminal": 67}, "strand": "+"}
+      ],
+      "usage_count": 4
+    }
+  }
+}
+```
+
+### Text Format
+
+Human-readable representation:
+
+```
+== Final Sequence (3 symbols) ==
+R0+ R1- R0+
+
+== Rules (2 total) ==
+R0 [Usage=2] -> A+ C+
+R1 [Usage=1] -> R0+ G-
+```
+
+### FASTA Format
+
+Each rule expanded to its full sequence:
+
+```
+>Rule_0 [Usage=4]
+ACGTACGT
+>Rule_1 [Usage=2]
+TTGC
+```
+
+See [Output Formats Documentation](docs/output_formats.md) for more details.
+
+## Examples
+
+### Basic Grammar Construction
+
+```bash
+orbweaver -i sample.fasta -j grammar.json --stats
+```
+
+### Visualizing the Grammar
+
+```bash
+# Generate DOT file
+orbweaver -i sample.fasta --visualize grammar.dot
+
+# Convert to PNG using Graphviz
+dot -Tpng grammar.dot -o grammar.png
+```
+
+### Tweaking Grammar Construction
+
+```bash
+# More stringent rule creation (digram must appear at least 5 times)
+orbweaver -i sample.fasta -j grammar.json --min-rule-usage 5
+
+# Disable reverse complement awareness
+orbweaver -i sample.fasta -j grammar.json --reverse-aware false
+```
+
+## Configuration
+
+### Environment Variables
+
+Orbweaver can be configured using environment variables:
+- `ORBWEAVER_THREADS`: Number of threads to use for parallelization
+- `ORBWEAVER_LOG_LEVEL`: Set logging verbosity (debug, info, warn, error)
+
+### Configuration File (Coming Soon)
+
+You can also use a YAML/TOML configuration file to specify complex settings:
+
+```yaml
+# orbweaver.yaml
+input:
+  path: "genome.fasta"
+  skip_ns: true
+output:
+  json: "output/grammar.json"
+  text: "output/grammar.txt"
+grammar:
+  min_rule_usage: 3
+  reverse_aware: true
+```
+
+## Architecture
+
+Orbweaver follows a modular architecture:
+
+- **fasta**: FASTA file reading and sequence handling
+- **grammar**: Core grammar construction logic
+- **io**: Input/output operations for different formats
+- **analysis**: Statistical analysis of the grammar
+
+See [Architecture Documentation](docs/architecture.md) for more details.
+
+## Known Limitations
+
+- **Memory Usage**: The current implementation loads the entire sequence into memory
+- **Multiple Sequences**: Only processes the first sequence in multi-FASTA files
+- **Performance**: Large genomes may require significant time and memory
+- **Eviction Strategy**: Rule eviction is not yet implemented
+- **GFA Output**: The GFA representation is experimental and may not be optimal for all visualization tools
+
+## Development
 
 ### Building from Source
 
 ```bash
-git clone https://github.com/yourusername/orbweaver.git
+# Clone repository
+git clone https://github.com/your-username/orbweaver.git
 cd orbweaver
+
+# Run tests
+cargo test
+
+# Build in debug mode
+cargo build
+
+# Build in release mode
 cargo build --release
 ```
 
-The compiled binary will be available at `target/release/orbweaver`.
-
-## Usage
-
-Orbweaver provides three main commands:
-
-### Process a Single Genome
+### Using Helper Scripts
 
 ```bash
-orbweaver process --input genome.fasta --genome-id "GCF_000001405.39" --species-name "Homo sapiens" --related-group "Primates" --neo4j-password "yourpassword"
+# Build the project
+./scripts/build.sh
+
+# Run the application
+./scripts/run.sh
+
+# Run all tests
+./scripts/test_all.sh
 ```
 
-### Process a Batch of Genomes
+## Contributing
 
-```bash
-orbweaver batch --tsv-file genomes.tsv --neo4j-password "yourpassword"
-```
+Contributions are welcome! Please feel free to submit a Pull Request.
 
-The TSV file should contain genome IDs and paths to FASTA files, with optional species names and taxonomic groups:
-```
-# genome_id   fasta_path
-GCF_000001405.39  /path/to/human_genome.fasta
-GCF_002880755.1   /path/to/chimp_genome.fasta
-```
+1. Fork the repository
+2. Create your feature branch (`git checkout -b feature/amazing-feature`)
+3. Commit your changes (`git commit -m 'Add some amazing feature'`)
+4. Push to the branch (`git push origin feature/amazing-feature`)
+5. Open a Pull Request
 
-### Run Analysis Only
+Please ensure your code follows the project's coding style and includes appropriate tests.
 
-```bash
-orbweaver analyze --output results --neo4j-password "yourpassword"
-```
+### Development Roadmap
 
-### Command Line Options
-
-#### Common Options
-```
-    -o, --output <OUTPUT>                  Output directory for storing results [default: output]
-        --neo4j-uri <NEO4J_URI>            Neo4j connection URI [default: bolt://localhost:7687]
-        --neo4j-user <NEO4J_USER>          Neo4j username [default: neo4j]
-        --neo4j-password <NEO4J_PASSWORD>  Neo4j password
-    -t, --threads <THREADS>                Number of threads to use for parallel processing [default: 0]
-        --threshold-factor <THRESHOLD>     SLP threshold factor (higher means more aggressive compression) [default: 1000000]
-        --use-fm-index                     Use FM-Index for SLP construction
-        --metadata-file <FILE>             Path to metadata CSV file [default: metazoan_chromosome_assemblies_with_lineage.csv]
-        --metadata-script <SCRIPT>         Path to Python script for metadata generation [default: src/ncbi_scrape.py]
-    -d, --debug                            Enable debug logging
-    -h, --help                             Print help information
-    -V, --version                          Print version information
-```
-
-#### Process Command Options
-```
-    -i, --input <INPUT>                    Path to input FASTA file containing chromosomes/scaffolds
-        --genome-id <GENOME_ID>            Genome ID (e.g., accession number)
-        --species-name <SPECIES_NAME>      Species name
-        --related-group <RELATED_GROUP>    Related group (taxonomic group, clade, etc.)
-        --skip-db                          Skip database operations
-```
-
-#### Batch Command Options
-```
-    -i, --tsv-file <TSV_FILE>              Path to TSV file with genome information
-```
-
-## Technical Details
-
-### Genome Preprocessing
-
-Orbweaver processes genome assemblies using bqtools to convert FASTA files to VBQ format. It uses the `-p r` policy (random assignment for non-ATCG nucleotides) to handle ambiguous bases.
-
-### SLP Construction
-
-The tool constructs a Straight-Line Program for each chromosome using a greedy algorithm:
-
-1. Initialize with individual nucleotides (A, C, G, T).
-2. Iteratively find and replace the most frequent pair of adjacent motifs.
-   - Uses FM-Index for efficient substring queries on large sequences.
-3. When multiple pairs have the same frequency, select the pair whose combined sequence comes first lexicographically.
-4. Stop when the highest frequency of any adjacent pair falls below a normalized threshold relative to sequence length.
-
-### Metadata Acquisition
-
-Orbweaver can automatically fetch and process metadata from NCBI, including:
-1. Taxonomic lineage information (kingdom, phylum, class, order, family, genus)
-2. Assembly information (release date, assembly level, genome size)
-3. Species information
-
-The metadata is used to automatically determine the most appropriate taxonomic grouping for comparative analysis.
-
-### Assembly Index Calculation
-
-The assembly index for each chromosome is calculated as:
-```
-Assembly Index = (Total number of unique motifs generated in the chromosome's SLP) - 4
-```
-
-The genome-level assembly index is calculated as a weighted average of chromosome assembly indices, where the weight is the chromosome length.
-
-### Database Schema
-
-Orbweaver uses the following Neo4j schema:
-
-**Nodes**:
-- (:Genome {genome_id, species_name, related_group, original_N_percent_avg, total_processed_size_bp, assembly_index_avg})
-- (:Chromosome {chromosome_id, processed_length_bp, original_N_percent, assembly_index, graph_depth, avg_motif_length})
-- (:Motif {sequence, length, creation_iteration})
-
-**Relationships**:
-- (:Chromosome)-[:PART_OF]->(:Genome)
-- (:Motif)-[:FOUND_IN {frequency}]->(:Chromosome)
-- (:Motif)-[:DERIVED_FROM]->(:Motif)
-
-## Output Files
-
-Orbweaver generates several output files:
-
-- `output/vbq/` - Directory containing VBQ files for each chromosome
-- `output/temp/` - Temporary files used during processing
-- `output/group_statistics.json` - Summary statistics for each taxonomic group
-- `output/correlation_analysis.json` - Basic correlation analysis of genome size vs. assembly index
-- `output/chromosome_metrics.csv` - CSV file with chromosome metrics
-- `output/group_metrics.csv` - Metrics grouped by taxonomic classification
+- [ ] Implement chunking for processing large genomes
+- [ ] Add rule eviction strategy for limiting memory usage
+- [ ] Support multiple sequences in FASTA files
+- [ ] Improve GFA output format
+- [ ] Add benchmarking tools
 
 ## License
 
-[MIT License](LICENSE)
-
-## Citation
-
-If you use Orbweaver in your research, please cite our paper:
-
-```
-[Citation information - to be added]
-``` 
+This project is licensed under the MIT License - see the LICENSE file for details. 

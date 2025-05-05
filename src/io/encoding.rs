@@ -82,42 +82,45 @@ pub fn run_fasta_to_vbq(input: PathBuf, output: PathBuf, level: u8) -> Result<()
     Ok(())
 }
 
-// --- New Custom Binary Format Encoder --- 
+// --- New Custom Binary Format Encoder (Decoded Data) --- 
 
 use byteorder::{LittleEndian, WriteBytesExt};
-use bitnuc::encode_alloc; // Use bitnuc directly
-use std::io::Write; // Need write_all and flush
+// Removed bitnuc::encode_alloc as we write decoded data
+use std::io::{Write, Seek, SeekFrom}; // Need Seek for header update
 
-struct EncodedSequenceData {
-    original_len: u64,
-    packed_len: u64, // Now length in u64 elements
-    packed_data: Vec<u64>, // Corrected type
-}
+// Removed EncodedSequenceData struct
 
-/// Encodes a FASTA file into a custom Orbweaver binary format (.orb).
+/// Encodes a FASTA file into a custom Orbweaver binary format (.orb) storing DECODED data.
 /// Format:
-///   - num_sequences: u64
-///   - for each sequence:
-///     - original_length: u64
-///     - packed_length (in u64 elements): u64 
-///     - packed_data: [u64] (Little Endian)
+///   - num_sequences: u64 (Little Endian)
+///   - total_decoded_length: u64 (Little Endian)
+///   - concatenated_decoded_data: [u8] (Raw sequence bytes)
 pub fn run_fasta_to_orb_bin(input: PathBuf, output: PathBuf) -> Result<()> {
     println!("Reading FASTA from: {}", input.display());
-    println!("Writing custom ORB format to: {}", output.display());
+    println!("Writing custom ORB format (decoded data) to: {}", output.display());
 
     // --- Input FASTA Reader ---
     let reader = fasta::Reader::from_file(&input)
         .with_context(|| format!("Failed to open input FASTA file: {}", input.display()))?;
 
-    // --- Collect encoded data first ---
-    let mut encoded_sequences: Vec<EncodedSequenceData> = Vec::new();
-    let mut total_bases = 0;
+    // --- Output ORB Writer ---
+    let mut output_file = File::create(&output)
+        .with_context(|| format!("Failed to create output ORB file: {}", output.display()))?;
+    // Write placeholder for header (2 * u64 = 16 bytes)
+    let header_placeholder: [u8; 16] = [0; 16];
+    output_file.write_all(&header_placeholder)
+        .context("Failed to write header placeholder")?;
+    
+    // Use BufWriter for the sequence data part
+    let mut writer = BufWriter::new(&mut output_file); // Pass mutable reference
+
+    let mut num_sequences: u64 = 0;
+    let mut total_decoded_length: u64 = 0;
 
     for result in reader.records() {
         let record = result.with_context(|| format!("Failed to read record from {}", input.display()))?;
         let seq_bytes = record.seq();
-        let original_len = seq_bytes.len() as u64;
-        total_bases += original_len;
+        num_sequences += 1;
 
         // Pre-process sequence: Replace non-ACGT with 'A'
         let mut processed_seq = seq_bytes.to_vec();
@@ -136,59 +139,39 @@ pub fn run_fasta_to_orb_bin(input: PathBuf, output: PathBuf) -> Result<()> {
                      replacements, record.id());
         }
 
-        // Encode using bitnuc -> Vec<u64>
-        let packed_data: Vec<u64> = encode_alloc(&processed_seq) // Use processed sequence
-            .context(format!("Failed to encode sequence for record {} using bitnuc", 
-                             record.id()))?;
-        let packed_len = packed_data.len() as u64; // Length is number of u64s
+        // Write processed sequence directly
+        writer.write_all(&processed_seq)
+             .with_context(|| format!("Failed to write sequence data for record {}", record.id()))?;
+        total_decoded_length += processed_seq.len() as u64;
 
-        encoded_sequences.push(EncodedSequenceData {
-            original_len,
-            packed_len,
-            packed_data,
-        });
     }
 
-    let num_sequences = encoded_sequences.len() as u64;
+    // Ensure BufWriter buffer is flushed before writing header
+    writer.flush().context("Failed to flush ORB writer buffer")?;
+    
+    // Drop the BufWriter to regain ownership of the File for seeking
+    drop(writer);
+
     println!(
-        "Read {} records ({} bases), preparing to write to {}",
+        "Finished writing sequence data. Read {} records ({} bases). Writing header...",
         num_sequences,
-        total_bases,
-        output.display()
+        total_decoded_length
     );
 
-    // --- Output ORB Writer ---
-    let output_file = File::create(&output)
-        .with_context(|| format!("Failed to create output ORB file: {}", output.display()))?;
-    let mut writer = BufWriter::new(output_file);
+    // Seek back to the beginning to write the actual header
+    // output_file is already available after BufWriter is dropped
+    output_file.seek(SeekFrom::Start(0))
+        .context("Failed to seek to beginning of ORB file for header write")?;
 
-    // Write header (number of sequences)
-    writer.write_u64::<LittleEndian>(num_sequences)
-        .context("Failed to write number of sequences to ORB file")?;
-
-    // Write each sequence's metadata and data
-    let mut written_count = 0;
-    for encoded_data in encoded_sequences {
-        writer.write_u64::<LittleEndian>(encoded_data.original_len)
-            .with_context(|| format!("Failed to write original length for sequence {}", written_count))?;
-        // Write packed length (number of u64 elements)
-        writer.write_u64::<LittleEndian>(encoded_data.packed_len)
-            .with_context(|| format!("Failed to write packed length for sequence {}", written_count))?;
-        // Write the actual packed u64 data elements
-        for packed_u64 in encoded_data.packed_data {
-             writer.write_u64::<LittleEndian>(packed_u64)
-                 .with_context(|| format!("Failed to write packed data element for sequence {}", written_count))?;
-        }
-        written_count += 1;
-    }
-
-    // Ensure buffer is flushed
-    writer.flush().context("Failed to flush ORB writer buffer")?;
+    output_file.write_u64::<LittleEndian>(num_sequences)
+        .context("Failed to write final number of sequences to ORB header")?;
+    output_file.write_u64::<LittleEndian>(total_decoded_length)
+        .context("Failed to write final total decoded length to ORB header")?;
 
     println!(
         "Successfully encoded {} records ({} bases) to {}",
-        written_count,
-        total_bases,
+        num_sequences,
+        total_decoded_length,
         output.display()
     );
 
