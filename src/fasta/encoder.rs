@@ -79,6 +79,52 @@ pub fn decode_dna_2bit(encoded: &[u8], original_length: usize) -> Vec<u8> {
     decoded
 }
 
+/// Decodes a specific segment from a 2-bit packed DNA sequence.
+/// This is useful for chunked processing of large genomes.
+/// 
+/// Args:
+///     encoded: The 2-bit encoded sequence.
+///     start_pos: The starting position in the original sequence.
+///     length: The number of bases to decode.
+///     total_length: The total length of the original sequence.
+///
+/// Returns:
+///     The decoded segment as a Vec<u8>.
+pub fn decode_dna_2bit_segment(encoded: &[u8], start_pos: usize, length: usize, total_length: usize) -> Vec<u8> {
+    if start_pos >= total_length {
+        return Vec::new();
+    }
+
+    let actual_length = length.min(total_length - start_pos);
+    let mut decoded = Vec::with_capacity(actual_length);
+    
+    // Calculate byte index and bit offset for start_pos
+    let start_byte = start_pos / 4;
+    let start_offset = (start_pos % 4) * 2;
+    
+    let mut bases_decoded = 0;
+    let mut current_byte_idx = start_byte;
+    let mut current_offset = start_offset;
+
+    while bases_decoded < actual_length && current_byte_idx < encoded.len() {
+        let byte = encoded[current_byte_idx];
+        
+        // Extract the 2-bit value at the current offset
+        let shift = 6 - current_offset;
+        let twobit = (byte >> shift) & 0b11;
+        decoded.push(twobit_to_base(twobit));
+        
+        bases_decoded += 1;
+        current_offset += 2;
+        
+        if current_offset >= 8 {
+            current_byte_idx += 1;
+            current_offset = 0;
+        }
+    }
+
+    decoded
+}
 
 /// Computes the reverse complement of a DNA sequence.
 /// Handles case-insensitivity (output is uppercase).

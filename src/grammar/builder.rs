@@ -1,8 +1,8 @@
 use crate::grammar::digram_table::{DigramKey, DigramTable};
 use crate::grammar::rule::Rule;
-use crate::grammar::symbol::Symbol;
+use crate::grammar::symbol::{Symbol, SymbolType};
 use anyhow::Result;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Builds a grammar (set of rules) by iteratively replacing 
 /// the most frequent digrams in a sequence.
@@ -19,7 +19,10 @@ pub struct GrammarBuilder {
     // Configuration settings
     min_rule_usage: usize,
     reverse_aware: bool,
-    // max_rule_count: Option<usize>, // For eviction later
+    // Maximum number of rules to keep before inlining least used rules
+    max_rule_count: Option<usize>,
+    // Track rule depths for hierarchy analysis
+    rule_depths: HashMap<usize, usize>,
 }
 
 impl GrammarBuilder {
@@ -32,7 +35,15 @@ impl GrammarBuilder {
             next_rule_id: 0, // Start rule IDs from 0? Or maybe 1?
             min_rule_usage,
             reverse_aware,
+            max_rule_count: None,
+            rule_depths: HashMap::new(),
         }
+    }
+
+    /// Sets the maximum number of rules before triggering rule eviction.
+    pub fn with_max_rules(mut self, max_rule_count: usize) -> Self {
+        self.max_rule_count = Some(max_rule_count);
+        self
     }
 
     /// Initializes the builder with the input sequence.
@@ -97,12 +108,27 @@ impl GrammarBuilder {
 
                 // Create the new rule
                 let new_rule = Rule::new(rule_id, original_sym1, original_sym2);
+                
+                // Calculate rule depth
+                let depth = self.calculate_rule_depth(rule_id, &new_rule);
+                self.rule_depths.insert(rule_id, depth);
+                
                 // This borrow is fine as it doesn't conflict with the previous table borrow
                 self.rules.insert(rule_id, new_rule); 
 
                 // Call replace_occurrences with the cloned occurrences
                 // This mutable borrow is now fine.
                 self.replace_occurrences(rule_id, canonical_key, &occurrences); 
+
+                // Check if we need to evict rules
+                if let Some(max_count) = self.max_rule_count {
+                    if self.rules.len() > max_count {
+                        self.evict_rules(max_count);
+                    }
+                }
+                
+                // Inline rules that are used only once
+                self.inline_single_use_rules();
 
                 // Rebuild the digram table 
                 // This mutable borrow is also fine now.
@@ -127,6 +153,260 @@ impl GrammarBuilder {
         }
     }
     
+    /// Calculate the depth of a rule based on its symbols
+    fn calculate_rule_depth(&self, rule_id: usize, rule: &Rule) -> usize {
+        let mut max_child_depth = 0;
+        
+        for symbol in &rule.symbols {
+            if let SymbolType::NonTerminal(child_rule_id) = symbol.symbol_type {
+                if let Some(depth) = self.rule_depths.get(&child_rule_id) {
+                    max_child_depth = max_child_depth.max(*depth);
+                }
+            }
+        }
+        
+        // The depth is the maximum depth of its children + 1
+        max_child_depth + 1
+    }
+    
+    /// Find and inline rules that are used only once
+    fn inline_single_use_rules(&mut self) {
+        // First, find all rules with usage_count == 1
+        let single_use_rule_ids: Vec<usize> = self.rules
+            .iter()
+            .filter(|(_, rule)| rule.usage_count == 1)
+            .map(|(id, _)| *id)
+            .collect();
+        
+        if single_use_rule_ids.is_empty() {
+            return;
+        }
+        
+        println!("Inlining {} rules used only once", single_use_rule_ids.len());
+        
+        // Keep track of rules to remove
+        let mut rules_to_remove = HashSet::new();
+        
+        // For each single-use rule
+        for rule_id in single_use_rule_ids {
+            // Skip if already marked for removal
+            if rules_to_remove.contains(&rule_id) {
+                continue;
+            }
+            
+            // Find where this rule is used in the sequence
+            let mut found_in_sequence = false;
+            for (seq_idx, symbol) in self.sequence.iter().enumerate() {
+                if let SymbolType::NonTerminal(nt_rule_id) = symbol.symbol_type {
+                    if nt_rule_id == rule_id {
+                        found_in_sequence = true;
+                        
+                        // Expand the rule and replace it in the sequence
+                        if let Some(rule) = self.rules.get(&rule_id) {
+                            let expanded = rule.expand_for_inlining(&self.rules);
+                            
+                            // Apply the proper strand propagation
+                            let mut final_expansion = Vec::new();
+                            for mut exp_symbol in expanded {
+                                if symbol.strand == '-' {
+                                    // Flip the strand of the expanded symbol
+                                    exp_symbol.strand = if exp_symbol.strand == '+' { '-' } else { '+' };
+                                }
+                                final_expansion.push(exp_symbol);
+                            }
+                            
+                            // Replace the non-terminal with its expansion
+                            self.sequence.splice(seq_idx..seq_idx+1, final_expansion);
+                            
+                            // Mark this rule for removal
+                            rules_to_remove.insert(rule_id);
+                            
+                            // Since we modified the sequence, break and rebuild the whole sequence
+                            break;
+                        }
+                    }
+                }
+            }
+            
+            if !found_in_sequence {
+                // Also check rule definitions for usage of this rule
+                for (other_rule_id, other_rule) in self.rules.iter_mut() {
+                    if *other_rule_id == rule_id || rules_to_remove.contains(other_rule_id) {
+                        continue;
+                    }
+                    
+                    let mut rule_modified = false;
+                    for (sym_idx, symbol) in other_rule.symbols.iter().enumerate() {
+                        if let SymbolType::NonTerminal(nt_rule_id) = symbol.symbol_type {
+                            if nt_rule_id == rule_id {
+                                // Rule is used in another rule definition
+                                // Get the rule to inline
+                                if let Some(rule_to_inline) = self.rules.get(&rule_id) {
+                                    let expanded = rule_to_inline.expand_for_inlining(&self.rules);
+                                    
+                                    // Apply the proper strand propagation
+                                    let mut final_expansion = Vec::new();
+                                    for mut exp_symbol in expanded {
+                                        if symbol.strand == '-' {
+                                            // Flip the strand of the expanded symbol
+                                            exp_symbol.strand = if exp_symbol.strand == '+' { '-' } else { '+' };
+                                        }
+                                        final_expansion.push(exp_symbol);
+                                    }
+                                    
+                                    // Replace the symbol with its expansion in the other rule
+                                    other_rule.symbols.splice(sym_idx..sym_idx+1, final_expansion);
+                                    rule_modified = true;
+                                    
+                                    // Mark this rule for removal
+                                    rules_to_remove.insert(rule_id);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    
+                    if rule_modified {
+                        break;
+                    }
+                }
+            }
+        }
+        
+        // Remove all rules marked for removal
+        for rule_id in rules_to_remove {
+            self.rules.remove(&rule_id);
+            self.rule_depths.remove(&rule_id);
+            println!("Removed inlined rule {}", rule_id);
+        }
+    }
+    
+    /// Evict least-used rules when the total exceeds max_rule_count
+    fn evict_rules(&mut self, max_count: usize) {
+        if self.rules.len() <= max_count {
+            return;
+        }
+        
+        println!("Evicting rules: current count {} exceeds maximum {}", self.rules.len(), max_count);
+        
+        // Sort rules by usage count (ascending)
+        let mut rules_by_usage: Vec<(usize, &Rule)> = self.rules
+            .iter()
+            .map(|(id, rule)| (*id, rule))
+            .collect();
+        
+        rules_by_usage.sort_by_key(|(_, rule)| rule.usage_count);
+        
+        // Calculate how many rules to evict
+        let to_evict = self.rules.len() - max_count;
+        let rules_to_evict: Vec<usize> = rules_by_usage
+            .iter()
+            .take(to_evict)
+            .map(|(id, _)| *id)
+            .collect();
+        
+        println!("Evicting {} least-used rules", to_evict);
+        
+        // Inline each rule being evicted
+        for rule_id in rules_to_evict {
+            // First, capture the rule we're about to evict
+            if let Some(rule) = self.rules.get(&rule_id) {
+                let rule_clone = Rule {
+                    id: rule.id,
+                    symbols: rule.symbols.clone(),
+                    usage_count: rule.usage_count,
+                };
+                
+                // Replace all instances in the sequence
+                self.inline_rule_in_sequence(rule_id, &rule_clone);
+                
+                // Also replace in all other rules
+                self.inline_rule_in_rules(rule_id, &rule_clone);
+                
+                // Finally remove the rule
+                self.rules.remove(&rule_id);
+                self.rule_depths.remove(&rule_id);
+            }
+        }
+    }
+    
+    /// Inline a rule everywhere it's used in the sequence
+    fn inline_rule_in_sequence(&mut self, rule_id: usize, rule: &Rule) {
+        let mut changes = Vec::new();
+        
+        // Find all occurrences in the sequence
+        for (idx, symbol) in self.sequence.iter().enumerate() {
+            if let SymbolType::NonTerminal(nt_rule_id) = symbol.symbol_type {
+                if nt_rule_id == rule_id {
+                    // This symbol needs to be expanded
+                    let expanded = rule.expand_for_inlining(&self.rules);
+                    
+                    // Apply strand propagation
+                    let mut final_expansion = Vec::new();
+                    for mut exp_symbol in expanded {
+                        if symbol.strand == '-' {
+                            exp_symbol.strand = if exp_symbol.strand == '+' { '-' } else { '+' };
+                        }
+                        final_expansion.push(exp_symbol);
+                    }
+                    
+                    changes.push((idx, final_expansion));
+                }
+            }
+        }
+        
+        // Apply changes from highest index to lowest to avoid invalidating indices
+        changes.sort_by_key(|(idx, _)| std::cmp::Reverse(*idx));
+        
+        for (idx, expansion) in changes {
+            self.sequence.splice(idx..idx+1, expansion);
+        }
+    }
+    
+    /// Inline a rule everywhere it's used in other rules
+    fn inline_rule_in_rules(&mut self, rule_id: usize, rule: &Rule) {
+        // Clone rule IDs to avoid borrowing issues
+        let rule_ids: Vec<usize> = self.rules.keys().copied().collect();
+        
+        for other_rule_id in rule_ids {
+            if other_rule_id == rule_id {
+                continue;
+            }
+            
+            if let Some(other_rule) = self.rules.get_mut(&other_rule_id) {
+                let mut changes = Vec::new();
+                
+                // Find all occurrences in this rule's symbols
+                for (idx, symbol) in other_rule.symbols.iter().enumerate() {
+                    if let SymbolType::NonTerminal(nt_rule_id) = symbol.symbol_type {
+                        if nt_rule_id == rule_id {
+                            // This symbol needs to be expanded
+                            let expanded = rule.expand_for_inlining(&self.rules);
+                            
+                            // Apply strand propagation
+                            let mut final_expansion = Vec::new();
+                            for mut exp_symbol in expanded {
+                                if symbol.strand == '-' {
+                                    exp_symbol.strand = if exp_symbol.strand == '+' { '-' } else { '+' };
+                                }
+                                final_expansion.push(exp_symbol);
+                            }
+                            
+                            changes.push((idx, final_expansion));
+                        }
+                    }
+                }
+                
+                // Apply changes from highest index to lowest
+                changes.sort_by_key(|(idx, _)| std::cmp::Reverse(*idx));
+                
+                for (idx, expansion) in changes {
+                    other_rule.symbols.splice(idx..idx+1, expansion);
+                }
+            }
+        }
+    }
+
     /// Replaces occurrences of a digram with a new non-terminal symbol.
     /// Processes occurrences in reverse order of position to handle index shifts.
     fn replace_occurrences(&mut self, rule_id: usize, canonical_key: DigramKey, occurrences: &[(usize, (Symbol, Symbol))]) {
@@ -188,7 +468,6 @@ impl GrammarBuilder {
         // if rule inlining isn't done separately later. (Deferring this complexity for now).
     }
 
-
     /// Builds the grammar from an initial byte sequence.
     pub fn build_grammar(&mut self, initial_sequence: &[u8]) -> Result<()> {
         if initial_sequence.is_empty() {
@@ -199,30 +478,49 @@ impl GrammarBuilder {
         self.initialize_sequence(initial_sequence);
         self.rebuild_digram_table();
 
-        let mut steps = 0;
-        while self.step() {
-            steps += 1;
-            println!("--- Completed Step {} ---", steps);
-            // Add loop limits or other conditions if necessary
-            if steps > 10000 { // Safety break for now
-                 println!("Warning: Reached step limit (10000). Stopping build.");
-                 break;
+        let mut iteration = 0;
+        let max_iterations = 10000; // Safeguard against infinite loops.
+
+        while iteration < max_iterations {
+            iteration += 1;
+            let made_replacement = self.step();
+            if !made_replacement {
+                break; // Stop when no more replacements are possible.
             }
         }
 
-        println!("Grammar build completed in {} steps.", steps);
-        println!("Final sequence length: {}", self.sequence.len());
-        println!("Number of rules created: {}", self.rules.len());
-
-        // TODO: Implement rule inlining (Task 8)
-        // TODO: Implement rule eviction (Task 11)
+        println!("Grammar construction complete after {} iterations. Sequence compressed from {} to {} symbols. Rules: {}.", 
+                 iteration, 
+                 initial_sequence.len(), 
+                 self.sequence.len(),
+                 self.rules.len());
 
         Ok(())
     }
 
-    // Placeholder for getting the final results
+    /// Provides access to the current state of the sequence and rules.
     pub fn get_grammar(&self) -> (&Vec<Symbol>, &HashMap<usize, Rule>) {
         (&self.sequence, &self.rules)
+    }
+    
+    /// Returns the rule depth mapping for analysis.
+    pub fn get_rule_depths(&self) -> &HashMap<usize, usize> {
+        &self.rule_depths
+    }
+    
+    /// Gets the maximum rule depth in the grammar.
+    pub fn get_max_rule_depth(&self) -> usize {
+        self.rule_depths.values().copied().max().unwrap_or(0)
+    }
+    
+    /// Gets average rule depth in the grammar.
+    pub fn get_avg_rule_depth(&self) -> f64 {
+        if self.rule_depths.is_empty() {
+            return 0.0;
+        }
+        
+        let sum: usize = self.rule_depths.values().sum();
+        sum as f64 / self.rule_depths.len() as f64
     }
 }
 

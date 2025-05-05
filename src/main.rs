@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, command, ArgGroup};
 use std::path::PathBuf;
 use std::fs;
-use orbweaver::fasta::reader::read_fasta_sequences;
+use orbweaver::fasta::reader::{read_fasta_sequences, InMemoryFastaReader, ChunkedSequenceIterator};
 use orbweaver::fasta::encoder::{encode_dna_2bit, decode_dna_2bit};
 use orbweaver::grammar::builder::GrammarBuilder;
 use orbweaver::io::output_json::write_grammar_json;
@@ -92,7 +92,7 @@ struct OrbweaverArgs {
     /// 
     /// Used in some analysis algorithms. The grammar builder currently uses
     /// digrams (k=2) internally regardless of this setting.
-    #[clap(short, long, value_parser, default_value_t = 21)]
+    #[clap(short, long, value_parser, default_value_t = 2)]
     kmer_size: usize,
 
     /// Minimum usage count for a rule to be kept.
@@ -105,8 +105,7 @@ struct OrbweaverArgs {
     /// Maximum number of rules allowed (triggers eviction).
     /// 
     /// When the number of rules exceeds this limit, less frequently used rules
-    /// are evicted. If not specified, no limit is enforced.
-    /// Note: Eviction is not yet implemented.
+    /// are evicted and inlined. If not specified, no limit is enforced.
     #[clap(long, value_parser)]
     max_rule_count: Option<usize>,
 
@@ -130,7 +129,6 @@ struct OrbweaverArgs {
     /// 
     /// Divides large sequences into smaller chunks for processing.
     /// Useful for very large genomes that exceed available memory.
-    /// Note: Chunking is not yet fully implemented.
     #[clap(long, value_parser)]
     chunk_size: Option<usize>,
 
@@ -167,6 +165,9 @@ fn main() -> Result<()> {
         println!("Chunk Size: {}", cs);
         println!("Chunk Overlap: {}", args.chunk_overlap);
     }
+    if let Some(max) = args.max_rule_count {
+        println!("Max rule count: {}", max);
+    }
 
     // --- Input Validation ---
     if !args.input.exists() {
@@ -178,6 +179,10 @@ fn main() -> Result<()> {
 
     if args.kmer_size == 0 {
         anyhow::bail!("K-mer size must be greater than 0.");
+    }
+    
+    if args.kmer_size > 255 {
+        anyhow::bail!("K-mer size must not exceed 255.");
     }
     
     if let Some(chunk_s) = args.chunk_size {
@@ -215,11 +220,10 @@ fn main() -> Result<()> {
     
     if sequences.is_empty() {
         println!("No sequences found in the input file after processing.");
-        return Ok(()); // Or return an error?
+        return Ok(());
     }
 
     // For now, process only the first sequence.
-    // TODO: Handle multiple sequences (concatenate? separate grammars?)
     let (first_seq_id, first_seq_data) = &sequences[0];
     println!(
         "Processing first sequence: '{}' ({} bases)",
@@ -232,35 +236,89 @@ fn main() -> Result<()> {
 
     let initial_len = first_seq_data.len(); // Store initial length for stats
 
-    // 2. Optionally encode the sequence to reduce memory usage
-    let sequence_to_process = if args.use_encoding {
-        println!("Encoding sequence using 2-bit representation to reduce memory usage...");
-        match encode_dna_2bit(first_seq_data) {
-            Ok(encoded) => {
-                println!("  Original size: {} bytes, Encoded size: {} bytes ({}% reduction)",
-                    first_seq_data.len(),
-                    encoded.len(),
-                    (100.0 * (first_seq_data.len() - encoded.len()) as f64 / first_seq_data.len() as f64) as u32
-                );
-                // Decode back for processing - this is an intermediate step
-                // In a full implementation, the grammar builder would work with encoded data directly
-                let decoded = decode_dna_2bit(&encoded, first_seq_data.len());
-                decoded
-            },
-            Err(e) => {
-                println!("Warning: Failed to encode sequence: {}. Falling back to raw processing.", e);
-                first_seq_data.clone()
+    // Create the grammar builder with the specified parameters
+    let mut grammar_builder = if let Some(max_rules) = args.max_rule_count {
+        GrammarBuilder::new(args.min_rule_usage, args.reverse_aware)
+            .with_max_rules(max_rules)
+    } else {
+        GrammarBuilder::new(args.min_rule_usage, args.reverse_aware)
+    };
+
+    // 2. Process the sequence based on encoding and chunking options
+    if let Some(chunk_size) = args.chunk_size {
+        println!("Processing sequence in chunks of size {} with {} bases overlap", 
+                 chunk_size, args.chunk_overlap);
+                 
+        // Create a reader for chunked processing
+        let mut reader = InMemoryFastaReader::new(vec![(first_seq_id.clone(), first_seq_data.clone())]);
+        let chunk_iterator = ChunkedSequenceIterator::new(&mut reader, chunk_size, args.chunk_overlap, 0);
+        
+        let mut chunks_processed = 0;
+        let mut total_bases_processed = 0;
+        
+        // Process each chunk
+        for chunk in chunk_iterator {
+            chunks_processed += 1;
+            total_bases_processed += chunk.data.len();
+            
+            println!("Processing chunk {}: bases {} to {} ({} bases)", 
+                     chunks_processed, chunk.start_pos, chunk.end_pos, chunk.data.len());
+            
+            let sequence_to_process = if args.use_encoding {
+                match encode_dna_2bit(&chunk.data) {
+                    Ok(encoded) => {
+                        let decoded = decode_dna_2bit(&encoded, chunk.data.len());
+                        decoded
+                    },
+                    Err(e) => {
+                        println!("Warning: Failed to encode chunk: {}. Using raw data.", e);
+                        chunk.data
+                    }
+                }
+            } else {
+                chunk.data
+            };
+            
+            // Process this chunk with the same grammar builder (continuing from previous chunks)
+            grammar_builder.build_grammar(&sequence_to_process)
+                .with_context(|| format!("Failed processing chunk {}", chunks_processed))?;
+                
+            println!("Completed chunk {}: current grammar has {} rules", 
+                     chunks_processed, grammar_builder.get_grammar().1.len());
+                     
+            if chunk.is_last {
+                println!("Reached end of sequence after {} chunks ({} bases processed)", 
+                         chunks_processed, total_bases_processed);
             }
         }
     } else {
-        first_seq_data.clone()
-    };
+        // Process the entire sequence at once
+        let sequence_to_process = if args.use_encoding {
+            println!("Encoding sequence using 2-bit representation to reduce memory usage...");
+            match encode_dna_2bit(first_seq_data) {
+                Ok(encoded) => {
+                    println!("  Original size: {} bytes, Encoded size: {} bytes ({}% reduction)",
+                        first_seq_data.len(),
+                        encoded.len(),
+                        (100.0 * (first_seq_data.len() - encoded.len()) as f64 / first_seq_data.len() as f64) as u32
+                    );
+                    // Decode back for processing
+                    let decoded = decode_dna_2bit(&encoded, first_seq_data.len());
+                    decoded
+                },
+                Err(e) => {
+                    println!("Warning: Failed to encode sequence: {}. Falling back to raw processing.", e);
+                    first_seq_data.clone()
+                }
+            }
+        } else {
+            first_seq_data.clone()
+        };
 
-    // 3. Build Grammar
-    let mut grammar_builder = GrammarBuilder::new(args.min_rule_usage, args.reverse_aware);
-    
-    grammar_builder.build_grammar(&sequence_to_process)
-        .context("Failed during grammar construction")?;
+        // Build the grammar from the full sequence
+        grammar_builder.build_grammar(&sequence_to_process)
+            .context("Failed during grammar construction")?;
+    }
 
     // 4. Get final grammar (sequence and rules)
     let (final_sequence, rules) = grammar_builder.get_grammar();
@@ -268,10 +326,10 @@ fn main() -> Result<()> {
     println!("Grammar construction complete.");
     println!("  Final sequence length: {}", final_sequence.len());
     println!("  Number of rules generated: {}", rules.len());
-    // Optionally print some rules or sequence snippet here for debugging
-    // if !rules.is_empty() {
-    //     println!("  Example Rule 0: {:?}", rules.get(&0));
-    // }
+    
+    // Print rule depth information if available
+    println!("  Maximum rule depth: {}", grammar_builder.get_max_rule_depth());
+    println!("  Average rule depth: {:.2}", grammar_builder.get_avg_rule_depth());
 
     // 5. Write Output Files
     if let Some(json_path) = &args.output_json {
