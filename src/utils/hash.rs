@@ -4,6 +4,13 @@ use crate::grammar::symbol::Symbol;
 use twox_hash::XxHash64;
 use std::hash::{Hash, Hasher};
 
+/// A general-purpose custom hash function for any hashable type
+pub fn custom_hash<T: Hash>(value: &T) -> u64 {
+    let mut hasher = XxHash64::default();
+    value.hash(&mut hasher);
+    hasher.finish()
+}
+
 /// Hash a vector of symbols using xxHash algorithm for fast hashing
 pub fn hash_symbols(symbols: &[Symbol]) -> u64 {
     let mut hasher = XxHash64::default();

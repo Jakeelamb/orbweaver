@@ -29,6 +29,7 @@ glob = "0.3.1" # Add glob needed by ncbi.rs
 rayon = "1.7.0"    # Data parallelism library
 dashmap = "5.5.3"  # Thread-safe concurrent HashMap
 num_cpus = "1.16.0" # For getting the number of available CPU cores
+ordered-float = "4.1.1" # For ordering floating point values
 
 # Database integration
 neo4rs = "0.8.0"   # Neo4j Rust driver
@@ -49,7 +50,7 @@ uuid = { version = "1.6.1", features = ["v4"] } # For generating unique identifi
 # tokio = { version = "1", features = ["full"] } # Add if switching reqwest to async
 
 # Async runtime
-tokio = { version = "1.29.1", features = ["rt-multi-thread", "macros", "time"] }
+tokio = { version = "1.29.1", features = ["rt-multi-thread", "macros", "fs", "io-util"] }
 
 # Logging
 log = "0.4.19"

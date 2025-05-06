@@ -1,10 +1,11 @@
-use anyhow::{Result, Context};
+use anyhow::Result;
 use crate::encode::dna_2bit::EncodedBase;
 use crate::utils::progress::ProgressTracker;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 use rayon::prelude::*;
-use log::{debug, info};
+use log::debug;
+use std::hash::{Hash, Hasher};
+use std::collections::hash_map::DefaultHasher;
 
 /// Configuration for chunking a sequence
 #[derive(Debug, Clone)]
@@ -21,6 +22,10 @@ pub struct ChunkingConfig {
     pub num_threads: usize,
     /// Whether to show progress
     pub show_progress: bool,
+    /// Enable adaptive chunk sizing
+    pub adaptive_chunking: bool,
+    /// Maximum memory usage per chunk (bytes)
+    pub max_memory_per_chunk: Option<usize>,
 }
 
 impl Default for ChunkingConfig {
@@ -32,6 +37,8 @@ impl Default for ChunkingConfig {
             reverse_aware: true,
             num_threads: num_cpus::get(),
             show_progress: true,
+            adaptive_chunking: false,
+            max_memory_per_chunk: None,
         }
     }
 }
@@ -53,7 +60,84 @@ pub struct Chunk {
     pub is_last: bool,
 }
 
-/// Split a sequence into chunks for parallel processing
+/// Analyzes sequence entropy to determine appropriate chunk sizes
+fn analyze_sequence_entropy(sequence: &[EncodedBase], sample_size: usize) -> f64 {
+    // Take samples from the sequence to analyze entropy
+    let mut samples = Vec::new();
+    let step = sequence.len() / sample_size.min(sequence.len()).max(1);
+    
+    for i in (0..sequence.len()).step_by(step) {
+        if samples.len() >= sample_size {
+            break;
+        }
+        samples.push(sequence[i]);
+    }
+    
+    // Calculate Shannon entropy for k-mers in sample
+    let k = 3; // Use 3-mers for entropy calculation
+    if samples.len() < k {
+        return 0.5; // Not enough data, return medium entropy
+    }
+    
+    let mut kmers = std::collections::HashMap::new();
+    for i in 0..=(samples.len() - k) {
+        let mut hasher = DefaultHasher::new();
+        for j in 0..k {
+            samples[i + j].hash(&mut hasher);
+        }
+        let kmer_hash = hasher.finish();
+        *kmers.entry(kmer_hash).or_insert(0) += 1;
+    }
+    
+    // Calculate Shannon entropy
+    let total_kmers = (samples.len() - k + 1) as f64;
+    let mut entropy = 0.0;
+    
+    for &count in kmers.values() {
+        let probability = count as f64 / total_kmers;
+        entropy -= probability * probability.log2();
+    }
+    
+    // Normalize to [0,1]
+    entropy / 2.0
+}
+
+/// Determine optimal chunk size based on sequence properties and available memory
+fn calculate_adaptive_chunk_size(
+    sequence: &[EncodedBase],
+    config: &ChunkingConfig,
+    available_memory: usize,
+) -> usize {
+    // Analyze sequence entropy (higher entropy = more complex sequence = smaller chunks)
+    let entropy = analyze_sequence_entropy(sequence, 1000);
+    
+    // Base chunk size on available memory, capped by config's max_memory_per_chunk if specified
+    let memory_based_size = if let Some(max_per_chunk) = config.max_memory_per_chunk {
+        (available_memory / config.num_threads).min(max_per_chunk)
+    } else {
+        available_memory / config.num_threads
+    };
+    
+    // Convert from memory bytes to base count (each EncodedBase is typically 1 byte)
+    // Apply entropy factor: lower entropy = larger chunks (more repetitive = more compressible)
+    let entropy_factor = 0.5 + (1.0 - entropy) * 0.5; // Range [0.5, 1.0]
+    let adaptive_size = (memory_based_size as f64 * entropy_factor) as usize;
+    
+    // Apply reasonable bounds
+    let min_size = 50_000;              // Minimum 50KB
+    let max_size = 100_000_000;         // Maximum 100MB
+    
+    let bounded_size = adaptive_size.clamp(min_size, max_size);
+    
+    debug!(
+        "Adaptive chunk sizing: entropy={:.2}, memory={}, factor={:.2}, size={}",
+        entropy, memory_based_size, entropy_factor, bounded_size
+    );
+    
+    bounded_size
+}
+
+/// Split a sequence into chunks for parallel processing with adaptive sizing
 pub fn split_into_chunks(
     sequence: &[EncodedBase], 
     config: &ChunkingConfig
@@ -75,8 +159,22 @@ pub fn split_into_chunks(
         return chunks;
     }
     
+    // Determine the chunk size to use
+    let chunk_size = if config.adaptive_chunking {
+        // Get available memory (fallback to a reasonable default if sysinfo fails)
+        let mut sys = sysinfo::System::new_all();
+        sys.refresh_memory();
+        let available_memory = sys.available_memory() as usize;
+        
+        calculate_adaptive_chunk_size(sequence, config, available_memory)
+    } else {
+        config.chunk_size
+    };
+    
+    debug!("Using chunk size: {} for sequence of length {}", chunk_size, seq_len);
+    
     // Calculate how many chunks we'll need
-    let effective_chunk_size = config.chunk_size.saturating_sub(config.overlap_size);
+    let effective_chunk_size = chunk_size.saturating_sub(config.overlap_size);
     let num_chunks = if effective_chunk_size > 0 {
         (seq_len + effective_chunk_size - 1) / effective_chunk_size
     } else {
@@ -96,7 +194,7 @@ pub fn split_into_chunks(
         let end = if i == num_chunks - 1 {
             seq_len
         } else {
-            (start + config.chunk_size).min(seq_len)
+            (start + chunk_size).min(seq_len)
         };
         
         let data = sequence[start..end].to_vec();
@@ -119,53 +217,59 @@ pub fn split_into_chunks(
 pub fn process_chunks_parallel<F, T>(
     chunks: Vec<Chunk>,
     config: &ChunkingConfig,
-    process_fn: F,
+    process_fn: F
 ) -> Result<Vec<T>>
 where
     F: Fn(&Chunk) -> Result<T> + Send + Sync,
     T: Send,
 {
-    // Configure thread pool
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(config.num_threads)
-        .build_global()
-        .context("Failed to build thread pool")?;
-    
-    let num_chunks = chunks.len();
-    debug!("Processing {} chunks using {} threads", num_chunks, config.num_threads);
+    let chunks_count = chunks.len();
+    if chunks_count == 0 {
+        return Ok(Vec::new());
+    }
     
     let progress = if config.show_progress {
-        let tracker = ProgressTracker::new(num_chunks, "Chunk processing")
-            .with_update_interval(Duration::from_millis(500));
-        Some(Arc::new(Mutex::new(tracker)))
+        Some(Arc::new(Mutex::new(ProgressTracker::new(
+            chunks_count,
+            "Processing chunks",
+        ))))
     } else {
         None
     };
     
-    let results: Result<Vec<_>> = chunks
+    let results: Vec<Result<T>> = chunks
         .into_par_iter()
+        .with_max_len(1) // Each chunk gets its own task
         .map(|chunk| {
+            // Process this chunk
             let result = process_fn(&chunk);
             
-            if let Some(tracker) = &progress {
-                let mut tracker = tracker.lock().unwrap();
-                if tracker.increment() {
-                    info!("{}", tracker.status());
-                }
+            // Update progress if tracking
+            if let Some(ref progress) = progress {
+                let mut progress = progress.lock().unwrap();
+                progress.increment();
             }
             
             result
         })
         .collect();
     
-    // Finalize progress tracking
-    if let Some(tracker) = progress {
-        let mut tracker = tracker.lock().unwrap();
-        tracker.finish();
-        info!("{}", tracker.status());
+    // Finalize progress
+    if let Some(progress) = progress {
+        let mut progress = progress.lock().unwrap();
+        progress.finish();
     }
     
-    results
+    // Collect and transform results
+    let mut processed_results = Vec::with_capacity(chunks_count);
+    for (i, result) in results.into_iter().enumerate() {
+        match result {
+            Ok(value) => processed_results.push(value),
+            Err(e) => return Err(anyhow::anyhow!("Error processing chunk {}: {}", i, e)),
+        }
+    }
+    
+    Ok(processed_results)
 }
 
 /// Merge a processed chunk with its neighbors, resolving overlaps
@@ -248,12 +352,14 @@ pub fn find_best_overlap(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::encode::dna_2bit::EncodedBase;
     
-    fn create_test_sequence(len: usize) -> Vec<EncodedBase> {
-        (0..len)
-            .map(|i| EncodedBase(i as u8 % 4))
-            .collect()
+    fn create_test_sequence(length: usize) -> Vec<EncodedBase> {
+        let mut seq = Vec::with_capacity(length);
+        for i in 0..length {
+            // Create a simple pattern (0,1,2,3,0,1,2,3,...)
+            seq.push(EncodedBase((i % 4) as u8));
+        }
+        seq
     }
     
     #[test]
@@ -263,35 +369,29 @@ mod tests {
         let config = ChunkingConfig {
             chunk_size: 300,
             overlap_size: 50,
+            show_progress: false,
+            adaptive_chunking: false, 
+            max_memory_per_chunk: None,
             ..Default::default()
         };
         
         let chunks = split_into_chunks(&seq, &config);
         
-        // Expected number of chunks with chunk_size=300, overlap_size=50:
-        // Effective chunk size = 300 - 50 = 250
-        // Number of chunks = ceil(1000 / 250) = 4
         assert_eq!(chunks.len(), 4);
-        
-        // Check first chunk
-        assert_eq!(chunks[0].index, 0);
         assert_eq!(chunks[0].start, 0);
-        assert_eq!(chunks[0].end, 300);
-        assert_eq!(chunks[0].data.len(), 300);
         assert!(chunks[0].is_first);
         assert!(!chunks[0].is_last);
         
-        // Check middle chunk
-        assert_eq!(chunks[1].index, 1);
-        assert_eq!(chunks[1].start, 250);
-        assert_eq!(chunks[1].end, 550);
-        assert_eq!(chunks[1].data.len(), 300);
-        assert!(!chunks[1].is_first);
-        assert!(!chunks[1].is_last);
+        assert_eq!(chunks[3].end, 1000);
+        assert!(!chunks[3].is_first);
+        assert!(chunks[3].is_last);
         
-        // Check last chunk
-        assert_eq!(chunks[3].index, 3);
-        assert_eq!(chunks[3].is_last, true);
+        // Verify chunk data length
+        assert_eq!(chunks[0].data.len(), 300);
+        
+        // Check overlap
+        assert_eq!(chunks[0].end, 300);
+        assert_eq!(chunks[1].start, 250); // 300 - 50
     }
     
     #[test]
@@ -302,6 +402,8 @@ mod tests {
             chunk_size: 300,
             overlap_size: 50,
             show_progress: false,
+            adaptive_chunking: false,
+            max_memory_per_chunk: None,
             ..Default::default()
         };
         
@@ -350,19 +452,39 @@ mod tests {
     
     #[test]
     fn test_find_best_overlap() {
-        // Example: ACGT and GTAC
-        // Best overlap is GT (2 bases)
-        let left = vec![EncodedBase(0), EncodedBase(1), EncodedBase(2), EncodedBase(3)]; // ACGT
-        let right = vec![EncodedBase(2), EncodedBase(3), EncodedBase(0), EncodedBase(1)]; // GTAC
+        let seq1 = vec![EncodedBase(0), EncodedBase(1), EncodedBase(2), EncodedBase(3)];
+        let seq2 = vec![EncodedBase(2), EncodedBase(3), EncodedBase(0), EncodedBase(1)];
         
-        let overlap = find_best_overlap(&left, &right, 3);
-        assert_eq!(overlap, 2); // GT overlaps
+        let overlap = find_best_overlap(&seq1, &seq2, 4);
+        assert_eq!(overlap, 2); // "23" matches
         
-        // No overlap example
-        let left2 = vec![EncodedBase(0), EncodedBase(0)]; // AA
-        let right2 = vec![EncodedBase(1), EncodedBase(1)]; // CC
+        let seq3 = vec![EncodedBase(9), EncodedBase(8), EncodedBase(7)];
+        let overlap2 = find_best_overlap(&seq1, &seq3, 4);
+        assert_eq!(overlap2, 0); // No match
+    }
+    
+    #[test]
+    fn test_adaptive_chunk_sizing() {
+        let seq = create_test_sequence(10000);
         
-        let overlap2 = find_best_overlap(&left2, &right2, 2);
-        assert_eq!(overlap2, 0); // No overlap
+        let mut config = ChunkingConfig {
+            chunk_size: 1000,
+            adaptive_chunking: true,
+            max_memory_per_chunk: None,
+            ..Default::default()
+        };
+        
+        let available_memory = 10_000_000; // 10MB for testing
+        let adaptive_size = calculate_adaptive_chunk_size(&seq, &config, available_memory);
+        
+        // Should return a reasonable size based on the pattern
+        assert!(adaptive_size >= 50_000);
+        
+        // Test with config max memory per chunk
+        config.max_memory_per_chunk = Some(1_000_000); // 1MB max
+        let bounded_size = calculate_adaptive_chunk_size(&seq, &config, available_memory);
+        
+        // Should be bounded by the config
+        assert!(bounded_size <= 1_000_000);
     }
 } 

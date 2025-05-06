@@ -2,9 +2,9 @@
 
 use crate::encode::dna_2bit::EncodedBase;
 use crate::fasta::reader::SequenceChunk;
-use crate::grammar::engine::{Grammar, Sequitur};
+use crate::grammar::engine::Grammar;
 use crate::grammar::rule::Rule;
-use crate::grammar::symbol::{Symbol, SymbolType, Direction};
+use crate::grammar::symbol::{Symbol, SymbolType};
 use crate::utils::hash::canonical_hash_symbols;
 use crate::parallel::chunking::{ChunkingConfig, split_into_chunks, Chunk};
 use crate::grammar::builder::GrammarBuilder;
@@ -92,7 +92,8 @@ pub fn parallel_sequitur(
 }
 
 /// Merges multiple grammars into a single grammar
-fn merge_grammars(grammars: Vec<Grammar>, config: &ChunkingConfig, total_sequence_len: usize) -> Result<(Grammar, ParallelMetrics)> {
+/// This function is now public.
+pub fn merge_grammars(grammars: Vec<Grammar>, config: &ChunkingConfig, total_sequence_len: usize) -> Result<(Grammar, ParallelMetrics)> {
     let start_merge = Instant::now();
     let mut metrics = ParallelMetrics::default();
 
@@ -458,6 +459,8 @@ mod tests {
             reverse_aware: false,
             num_threads: 2,
             show_progress: false,
+            adaptive_chunking: false,
+            max_memory_per_chunk: None,
         };
         
         let (grammar, metrics) = parallel_sequitur(&bases, config)?;

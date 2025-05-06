@@ -69,6 +69,82 @@ pub fn read_fasta_sequences(fasta_path: &Path, skip_ns: bool) -> Result<Vec<(Str
     Ok(sequences)
 }
 
+/// Asynchronously reads sequences from a FASTA file, optionally skipping 'N' bases.
+/// 
+/// Args:
+///     fasta_path: Path to the input FASTA file.
+///     skip_ns: If true, 'N' and 'n' bases are excluded from the output sequence.
+///
+/// Returns:
+///     A vector of tuples, where each tuple contains the record ID (String) 
+///     and the processed sequence data (Vec<u8>).
+pub async fn read_fasta_sequences_async(fasta_path: &Path, skip_ns: bool) -> Result<Vec<(String, Vec<u8>)>> {
+    println!("Reading FASTA file asynchronously: {} (skip_ns: {})", fasta_path.display(), skip_ns);
+
+    use tokio::fs::File;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    let file = File::open(fasta_path)
+        .await
+        .with_context(|| format!("Failed to open FASTA file asynchronously: {}", fasta_path.display()))?;
+    let reader = BufReader::new(file);
+    let mut lines = reader.lines();
+
+    let mut sequences = Vec::new();
+    let mut current_id: Option<String> = None;
+    let mut current_sequence: Vec<u8> = Vec::new();
+    let mut record_count = 0;
+    let mut base_count = 0;
+
+    while let Some(line_result) = lines.next_line().await
+        .with_context(|| format!("Failed to read line from FASTA file: {}", fasta_path.display()))? {
+        
+        let line = line_result.trim();
+        if line.is_empty() {
+            continue; // Skip empty lines
+        }
+
+        if line.starts_with('>') {
+            // If we have a sequence buffered, save it
+            if let Some(id) = current_id.take() {
+                if !current_sequence.is_empty() {
+                    base_count += current_sequence.len();
+                    sequences.push((id, std::mem::take(&mut current_sequence)));
+                }
+            }
+            
+            // Start new sequence
+            record_count += 1;
+            let header = line[1..].split_whitespace().next().unwrap_or("");
+            current_id = Some(header.to_string());
+            println!("  Reading record (async): {}", current_id.as_ref().unwrap());
+        } else if current_id.is_some() {
+            // Append sequence data
+            let sequence_part: Vec<u8> = if skip_ns {
+                line.bytes().filter(|&b| b != b'N' && b != b'n').collect()
+            } else {
+                line.bytes().collect()
+            };
+            current_sequence.extend(sequence_part);
+        }
+    }
+
+    // Add the last sequence if any
+    if let Some(id) = current_id.take() {
+        if !current_sequence.is_empty() {
+            base_count += current_sequence.len();
+            sequences.push((id, current_sequence));
+        }
+    }
+
+    if record_count == 0 {
+        anyhow::bail!("No records found in FASTA file (async): {}", fasta_path.display());
+    }
+
+    println!("Finished reading {} records asynchronously, total {} bases (after potential N skipping).", record_count, base_count);
+    Ok(sequences)
+}
+
 // Basic structure to hold FASTA record information parsed from memory-mapped file
 #[derive(Clone)]
 struct MmapFastaRecord {

@@ -2,18 +2,20 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, command};
 use std::path::PathBuf;
 use std::time::Instant;
-use orbweaver::fasta::reader::read_fasta_sequences;
+use orbweaver::fasta::reader::{read_fasta_sequences, read_fasta_sequences_async};
 use orbweaver::encode::dna_2bit::{EncodedBase};
 use orbweaver::grammar::builder::GrammarBuilder;
-use orbweaver::grammar::engine::{Grammar, Sequitur};
+use orbweaver::grammar::engine::{Grammar};
 use orbweaver::io::output_json::write_grammar_json;
 use orbweaver::analysis::stats::calculate_and_print_stats;
-use orbweaver::io::output_dot::DotOptions;
+use orbweaver::utils::visualization::DotOptions;
 use orbweaver::parallel::chunking::ChunkingConfig;
-use orbweaver::parallel::engine::parallel_sequitur;
+use orbweaver::parallel::engine::{parallel_sequitur, merge_grammars};
 use orbweaver::encode::bitvec;
 use rayon::prelude::*;
 use orbweaver::utils;
+use sysinfo::{System};
+use std::sync::Arc;
 
 // Use the configuration module if needed, or args directly
 // use orbweaver::config::Config; 
@@ -34,7 +36,7 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 /// Orbweaver processes DNA sequences from FASTA files to build context-free grammars
 /// by identifying repeating patterns. It can output the grammar in various formats and
 /// provide statistics about the compression and structure.
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[command(author = "Orbweaver Team", version, about, long_about = None)]
 #[command(help_template = "\
 {before-help}{name} {version}
@@ -47,7 +49,7 @@ struct OrbweaverArgs {
     /// Input FASTA file path (.fa, .fasta, .fna).
     /// 
     /// Path to the file containing DNA sequences in FASTA format.
-    /// Currently processes the first sequence in multi-sequence files.
+    /// Processes all sequences in multi-sequence files by default.
     #[clap(short, long, value_parser, required = true)]
     input: PathBuf,
 
@@ -137,8 +139,9 @@ struct OrbweaverArgs {
     /// 
     /// Divides large sequences into smaller chunks for processing.
     /// Useful for very large genomes that exceed available memory.
-    #[clap(long, value_parser)]
-    chunk_size: Option<usize>,
+    /// If set to 0, will determine size dynamically.
+    #[clap(long, value_parser, default_value_t = 0)]
+    chunk_size: usize,
 
     /// Overlap between chunks when chunking is enabled.
     /// 
@@ -175,16 +178,38 @@ struct OrbweaverArgs {
     /// the entire sequence into memory at once. Recommended for large genomes.
     #[clap(long, action = clap::ArgAction::SetTrue)]
     streaming: bool,
+    
+    /// Enable adaptive chunk sizing.
+    /// 
+    /// Dynamically adjust chunk sizes based on sequence complexity
+    /// and available memory. Requires chunked mode.
+    #[clap(long, action = clap::ArgAction::SetTrue)]
+    adaptive_chunking: bool,
+    
+    /// Process only specific sequences by index (0-based).
+    /// 
+    /// For multi-sequence FASTA files, process only the sequences
+    /// with the specified indices. Default: process all sequences.
+    #[clap(long, value_parser, value_delimiter = ',')]
+    sequence_indices: Option<Vec<usize>>,
+    
+    /// Maximum memory usage per chunk (in MB).
+    /// 
+    /// Limits the memory usage of each chunk when adaptive chunking
+    /// is enabled. Helps prevent out-of-memory errors.
+    #[clap(long, value_parser)]
+    max_memory_per_chunk_mb: Option<usize>,
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let args = OrbweaverArgs::parse();
     
     // Start profiling if requested
     #[cfg(feature = "profiling")]
     let guard = if args.profile {
         println!("Starting profiling");
-        let guard = pprof::ProfilerGuard::new(100)?;
+        let guard = pprof::ProfilerGuardBuilder::default().frequency(100).build()?;
         Some(guard)
     } else {
         None
@@ -195,150 +220,282 @@ fn main() -> Result<()> {
     let start = Instant::now();
 
     // Determine execution mode: parallel chunking or standard
-    let grammar = if let Some(chunk_size) = args.chunk_size {
-        // Process in parallel using chunking
-        process_chunked_mode(&args, chunk_size)?
+    let grammar = if args.chunk_size > 0 || args.adaptive_chunking {
+        let args_clone = args.clone();
+        tokio::task::spawn_blocking(move || process_chunked_mode(&args_clone))
+            .await?
+            .context("Chunked processing failed")?
     } else {
-        // Process in standard mode (load entire sequence)
-        process_standard_mode(&args)?
+        process_standard_mode(&args).await?
     };
     
     println!("Grammar construction completed in {:?}", start.elapsed());
     
     // Write outputs in requested formats
-    if let Some(ref path) = args.output_json {
-        write_grammar_json(path, &grammar.sequence, &grammar.rules)?;
-        println!("Wrote JSON grammar to {}", path.display());
-    }
+    generate_outputs(&grammar, &args)?;
     
-    if let Some(ref path) = args.output_text {
-        orbweaver::utils::export::export_grammar_text(&grammar, &mut utils::io::open_file_for_writing(path)?)?;
-        println!("Wrote text grammar to {}", path.display());
-    }
-    
-    if let Some(ref path) = args.output_gfa {
-        orbweaver::utils::export::export_grammar_gfa(&grammar, &mut utils::io::open_file_for_writing(path)?)?;
-        println!("Wrote GFA to {}", path.display());
-    }
-    
-    if let Some(ref path) = args.visualize {
-        let options = DotOptions {
-            include_terminals: true,
-            include_usage_counts: true,
-            color_by_depth: true,
-        };
-        
-        orbweaver::utils::export::export_grammar_dot(&grammar, &mut utils::io::open_file_for_writing(path)?)?;
-        println!("Wrote DOT visualization to {}", path.display());
-    }
-    
-    if let Some(ref path) = args.export_blocks {
-        orbweaver::utils::export::export_grammar_fasta(&grammar, &mut utils::io::open_file_for_writing(path)?)?;
-        println!("Wrote FASTA blocks to {}", path.display());
-    }
-    
-    // Print statistics if requested
-    if args.stats {
-        calculate_and_print_stats(&grammar)?;
-    }
-    
+    // Stop profiling if it was started
     #[cfg(feature = "profiling")]
     if let Some(guard) = guard {
         if let Ok(report) = guard.report().build() {
-            let file = File::create("flamegraph.svg").unwrap();
-            report.flamegraph(file).unwrap();
-            println!("Wrote profiling data to flamegraph.svg");
+            if let Some(parent) = std::path::Path::new("profile").parent() {
+                 std::fs::create_dir_all(parent)?;
+             }
+             let file = File::create("profile/flamegraph.svg")
+                 .context("Failed to create flamegraph file")?;
+            report.flamegraph(file).context("Failed to write flamegraph")?;
+            println!("Wrote profiling data to profile/flamegraph.svg");
+        } else {
+            eprintln!("Failed to build profiling report.");
         }
     }
     
     Ok(())
 }
 
-fn process_standard_mode(args: &OrbweaverArgs) -> Result<Grammar> {
-    println!("Using standard mode (loading entire sequence)");
+/// Generates all requested output files from the final grammar.
+fn generate_outputs(grammar: &Grammar, args: &OrbweaverArgs) -> Result<()> {
+    // Output the grammar in various formats based on CLI args
+    if let Some(json_path) = &args.output_json {
+        println!("Writing grammar to JSON file: {}", json_path.display());
+        write_grammar_json(json_path, &grammar.sequence, &grammar.rules)?;
+    }
     
-    // Read the FASTA file
-    let sequences = read_fasta_sequences(&args.input, args.skip_ns)
-        .context("Failed to read FASTA file")?;
+    if let Some(text_path) = &args.output_text {
+        println!("Writing grammar to text file: {}", text_path.display());
+        utils::export::write_grammar_text(text_path, &grammar.sequence, &grammar.rules)?;
+    }
     
-    if sequences.is_empty() {
+    if let Some(gfa_path) = &args.output_gfa {
+        println!("Writing grammar to GFA file: {}", gfa_path.display());
+        utils::visualization::write_grammar_gfa(gfa_path, grammar)?;
+    }
+    
+    if let Some(dot_path) = &args.visualize {
+        let options = DotOptions {
+            include_terminals: true,
+            include_usage_counts: true,
+            color_by_depth: true,
+        };
+        println!("Writing grammar visualization to DOT file: {}", dot_path.display());
+        utils::visualization::write_grammar_dot(dot_path, grammar, &options)?;
+    }
+    
+    if let Some(fasta_path) = &args.export_blocks {
+        println!("Exporting grammar rules to FASTA file: {}", fasta_path.display());
+        utils::export::export_grammar(grammar, fasta_path, utils::io::OutputFormat::Fasta)?;
+    }
+    
+    if args.stats {
+        // Calculate and print statistics
+        calculate_and_print_stats(grammar)?;
+        
+        // Calculate compression stats
+        let stats = utils::export::calculate_compression_stats(grammar);
+        utils::export::print_compression_stats(&stats)?;
+        
+        // Memory usage estimation with 2-bit encoding
+        if args.use_encoding {
+            let original_size = stats.original_size;
+            let (savings_pct, savings_desc) = bitvec::estimate_memory_savings(original_size, original_size);
+            println!("\n2-Bit Encoding Memory Savings:");
+            println!("  Reduced memory usage by approximately {:.1}% {}", savings_pct, savings_desc);
+            println!("  Original: {} bytes, With 2-bit encoding: ~{} bytes", 
+                original_size, (original_size + 3) / 4);
+        }
+    }
+    
+    Ok(())
+}
+
+async fn process_standard_mode(args: &OrbweaverArgs) -> Result<Grammar> {
+    println!("Using standard mode (loading entire sequence asynchronously)");
+    
+    let all_sequences = read_fasta_sequences_async(&args.input, args.skip_ns).await
+        .context("Failed to read FASTA file asynchronously")?;
+    
+    if all_sequences.is_empty() {
         bail!("No sequences found in input file");
     }
     
-    let (_, bases) = &sequences[0];
-    println!("Processing sequence: {} bases", bases.len());
+    println!("Read {} sequences.", all_sequences.len());
     
-    // Process with 2-bit encoding if enabled
-    if args.use_encoding {
-        let encoded_bases = encode_dna(bases);
-        println!("Using 2-bit encoding (converted {} bytes to {} encoded bases)", 
-            bases.len(), encoded_bases.len());
+    // Filter sequences based on user-provided indices (if any)
+    let selected_sequences = if let Some(ref indices) = args.sequence_indices {
+        println!("Processing selected sequences only: {:?}", indices);
         
-        // Build grammar using sequitur algorithm
-        let mut grammar_builder = GrammarBuilder::new(args.min_rule_usage, args.reverse_aware);
-        
-        // Set rule count limit if specified
-        if let Some(max_rules) = args.max_rule_count {
-            grammar_builder = grammar_builder.with_max_rules(max_rules);
+        let mut filtered = Vec::new();
+        for &idx in indices {
+            if idx < all_sequences.len() {
+                filtered.push(all_sequences[idx].clone());
+            } else {
+                println!("Warning: Sequence index {} is out of range (max: {}), skipping", 
+                         idx, all_sequences.len() - 1);
+            }
         }
         
-        grammar_builder.build_grammar(&encoded_bases)?;
+        if filtered.is_empty() {
+            bail!("No valid sequences selected for processing");
+        }
         
-        // Get the resulting grammar
-        let (sequence, rules) = grammar_builder.get_grammar();
-        let max_depth = grammar_builder.get_max_rule_depth();
-        
-        // Calculate memory savings from 2-bit encoding
-        let (saving_pct, description) = bitvec::estimate_memory_savings(bases.len(), encoded_bases.len());
-        println!("Memory savings from 2-bit encoding: {:.1}% ({})", saving_pct, description);
-        
-        Ok(Grammar {
-            sequence: sequence.clone(),
-            rules: rules.clone(),
-            max_depth,
-        })
+        filtered
     } else {
-        // Process without encoding (less memory efficient)
-        println!("WARNING: Processing without 2-bit encoding (higher memory usage)");
-        // Convert Vec<u8> to Vec<EncodedBase> for Sequitur
-        let encoded_bases_fallback = encode_dna(bases);
-        let mut sequitur = Sequitur::new(args.min_rule_usage, args.reverse_aware);
-        sequitur.build_grammar(&encoded_bases_fallback)
+        all_sequences
+    };
+    
+    println!("Processing {} sequences in total", selected_sequences.len());
+    
+    let args_clone = Arc::new(args.clone());
+    
+    // Process each sequence in parallel using Rayon
+    let mut grammars = vec![];
+    
+    for (seq_id, (record_id, bases)) in selected_sequences.iter().enumerate() {
+        println!("Processing sequence {} ({}): {} bases", seq_id, record_id, bases.len());
+        
+        let args_clone = Arc::clone(&args_clone);
+        let bases_clone = bases.clone();
+        
+        // Process each sequence in a separate blocking task
+        let grammar_result = tokio::task::spawn_blocking(move || -> Result<Grammar, anyhow::Error> {
+            if args_clone.use_encoding {
+                let encoded_bases = encode_dna(&bases_clone);
+                println!("  Using 2-bit encoding ({} bases -> {} encoded bases)", 
+                         bases_clone.len(), encoded_bases.len());
+                
+                let mut grammar_builder = GrammarBuilder::new(args_clone.min_rule_usage, args_clone.reverse_aware);
+                if let Some(max_rules) = args_clone.max_rule_count {
+                    grammar_builder = grammar_builder.with_max_rules(max_rules);
+                }
+                grammar_builder.build_grammar(&encoded_bases)?;
+                let (sequence, rules) = grammar_builder.get_grammar();
+                let max_depth = grammar_builder.get_max_rule_depth();
+                
+                Ok(Grammar {
+                    sequence: sequence.clone(),
+                    rules: rules.clone(),
+                    max_depth,
+                })
+            } else {
+                println!("  WARNING: Processing without 2-bit encoding.");
+                let encoded_bases_fallback = encode_dna(&bases_clone);
+                let mut grammar_builder = GrammarBuilder::new(args_clone.min_rule_usage, args_clone.reverse_aware);
+                grammar_builder.build_grammar(&encoded_bases_fallback)?;
+                let (sequence, rules) = grammar_builder.get_grammar();
+                let max_depth = grammar_builder.get_max_rule_depth();
+                Ok(Grammar { sequence: sequence.clone(), rules: rules.clone(), max_depth })
+            }
+        }).await?
+          .with_context(|| format!("Failed to build grammar for sequence {}", record_id))?;
+        
+        grammars.push(grammar_result);
     }
+    
+    println!("Merging {} individual grammars...", grammars.len());
+    
+    // Merge all grammars
+    let dummy_config = ChunkingConfig::default();
+    let total_len_estimate = selected_sequences.iter().map(|(_, b)| b.len()).sum();
+    let (merged_grammar, merge_metrics) = merge_grammars(grammars, &dummy_config, total_len_estimate)?;
+    
+    println!("Merging complete. Final grammar has {} rules.", merged_grammar.rules.len());
+    println!("Total merging time: {:?}", merge_metrics.merge_time);
+    
+    Ok(merged_grammar)
 }
 
-fn process_chunked_mode(args: &OrbweaverArgs, chunk_size: usize) -> Result<Grammar> {
-    println!("Using parallel chunking mode with chunk size: {}", chunk_size);
+fn process_chunked_mode(args: &OrbweaverArgs) -> Result<Grammar> {
+    // Determine chunk size: use CLI arg, calculate dynamically, or use adaptive sizing
+    let effective_chunk_size = if args.chunk_size > 0 {
+        println!("Using provided chunk size: {}", args.chunk_size);
+        args.chunk_size
+    } else {
+        // Dynamic chunk sizing based on available memory
+        let mut sys = System::new_all();
+        sys.refresh_memory(); // Refresh memory information
+        let available_memory = sys.available_memory() as usize; // In bytes
+        
+        // Heuristic: Use 1/4 of available memory, with min/max bounds
+        let calculated_size = (available_memory / 4) as usize;
+        let min_chunk_size = 1_000_000; // 1MB
+        let max_chunk_size = 500_000_000; // 500MB
+        
+        let dynamic_size = calculated_size.clamp(min_chunk_size, max_chunk_size);
+        println!("Dynamically calculated chunk size based on available memory ({:.2} GB): {} bytes", 
+                 available_memory as f64 / 1_000_000_000.0,
+                 dynamic_size);
+        dynamic_size
+    };
+
+    println!("Using parallel chunking mode with effective chunk size: {}", effective_chunk_size);
     
     // Configure the chunking parameters
+    let max_memory_per_chunk = args.max_memory_per_chunk_mb.map(|mb| mb * 1024 * 1024);
+    
     let config = ChunkingConfig {
-        chunk_size,
+        chunk_size: effective_chunk_size,
         overlap_size: args.chunk_overlap,
         min_rule_usage: args.min_rule_usage,
         reverse_aware: args.reverse_aware,
         num_threads: args.threads.unwrap_or_else(num_cpus::get),
         show_progress: true,
+        adaptive_chunking: args.adaptive_chunking,
+        max_memory_per_chunk,
     };
     
-    // Read and process the sequence
-    if args.use_encoding {
-        // Read the sequence with encoding
-        let sequences = read_fasta_sequences(&args.input, args.skip_ns)?;
-        if sequences.is_empty() {
-            bail!("No sequences found in input file");
+    if !args.use_encoding {
+        bail!("Chunked mode requires use_encoding to be enabled for memory efficiency.");
+    }
+    
+    // Read all sequences from the FASTA file
+    let all_sequences = read_fasta_sequences(&args.input, args.skip_ns)
+        .context("Failed to read FASTA sequence(s) for chunked mode")?;
+    
+    if all_sequences.is_empty() {
+        bail!("No sequences found in input file for chunking");
+    }
+    
+    // Filter sequences based on user-provided indices (if any)
+    let selected_sequences = if let Some(ref indices) = args.sequence_indices {
+        println!("Processing selected sequences only: {:?}", indices);
+        
+        let mut filtered = Vec::new();
+        for &idx in indices {
+            if idx < all_sequences.len() {
+                filtered.push(all_sequences[idx].clone());
+            } else {
+                println!("Warning: Sequence index {} is out of range (max: {}), skipping", 
+                         idx, all_sequences.len() - 1);
+            }
         }
         
-        let (_, bases) = &sequences[0];
-        println!("Processing sequence: {} bases", bases.len());
+        if filtered.is_empty() {
+            bail!("No valid sequences selected for processing");
+        }
         
-        // Convert to EncodedBase for more efficient processing
+        filtered
+    } else {
+        all_sequences
+    };
+    
+    println!("Processing {} sequences in chunked mode", selected_sequences.len());
+    
+    // Process each sequence
+    let mut grammars = Vec::new();
+    let mut total_bases = 0;
+    
+    for (seq_idx, (record_id, bases)) in selected_sequences.iter().enumerate() {
+        println!("Processing sequence {} ({}): {} bases", seq_idx, record_id, bases.len());
+        total_bases += bases.len();
+        
+        // Convert to EncodedBase for parallel processing
         let encoded_bases = encode_dna(bases);
         
-        // Run the parallel sequitur algorithm
-        let (grammar, metrics) = parallel_sequitur(&encoded_bases, config)?;
+        // Run the parallel sequitur algorithm for this sequence
+        let (grammar, metrics) = parallel_sequitur(&encoded_bases, config.clone())?;
         
-        // Display execution metrics
-        println!("Parallel execution metrics:");
+        // Display execution metrics for this sequence
+        println!("Parallel execution metrics for sequence {}:", seq_idx);
         println!("  Chunk count: {}", metrics.chunk_count);
         println!("  Chunk processing time: {:?}", metrics.chunk_processing_time);
         println!("  Merge time: {:?}", metrics.merge_time);
@@ -347,17 +504,31 @@ fn process_chunked_mode(args: &OrbweaverArgs, chunk_size: usize) -> Result<Gramm
         println!("  Rule count (before merge): {}", metrics.rules_before_merge);
         println!("  Rule count (after merge): {}", metrics.rules_after_merge);
         
-        // Calculate memory savings from 2-bit encoding
-        let (saving_pct, description) = bitvec::estimate_memory_savings(bases.len(), encoded_bases.len());
-        println!("Memory savings from 2-bit encoding: {:.1}% ({})", saving_pct, description);
+        grammars.push(grammar);
+    }
+    
+    // Calculate memory savings from 2-bit encoding
+    let (saving_pct, description) = bitvec::estimate_memory_savings(total_bases, total_bases / 4);
+    println!("Memory savings from 2-bit encoding: {:.1}% ({})", saving_pct, description);
+    
+    // If we processed multiple sequences, merge their grammars
+    if grammars.len() > 1 {
+        println!("Merging {} sequence grammars...", grammars.len());
+        let merge_start = Instant::now();
+        let (merged_grammar, merge_metrics) = merge_grammars(grammars, &config, total_bases)?;
         
-        Ok(grammar)
+        println!("Multi-sequence merging complete in {:?}", merge_start.elapsed());
+        println!("Final merged grammar has {} rules", merged_grammar.rules.len());
+        
+        Ok(merged_grammar)
+    } else if grammars.len() == 1 {
+        // Return the single grammar directly
+        Ok(grammars.remove(0))
     } else {
-        bail!("Chunked mode requires use_encoding to be enabled for memory efficiency.")
+        bail!("No grammars were produced")
     }
 }
 
-// Add this helper function for encoding DNA
 fn encode_dna(bases: &[u8]) -> Vec<EncodedBase> {
     bases.iter()
         .filter_map(|&b| EncodedBase::from_base(b))

@@ -24,20 +24,25 @@ orbweaver/
 ├── src/                    # Source code
 │   ├── main.rs             # Entry point, CLI handling (clap)
 │   ├── lib.rs              # Library exports
-│   ├── config.rs           # Configuration utilities (placeholder)
 │   ├── analysis/           # Analysis algorithms
-│   │   ├── motifs.rs       # Pattern finding (suffix arrays, rolling hash, minimizers)
 │   │   ├── stats.rs        # Grammar statistics calculation
 │   │   └── mod.rs          # Module definitions
+│   ├── encode/             # Encoding and memory optimization
+│   │   ├── dna_2bit.rs     # 2-bit encoding for DNA bases
+│   │   ├── bitvec.rs       # Bit-level operations and memory optimization
+│   │   ├── kmer.rs         # K-mer representation and operations
+│   │   └── mod.rs          # Module definitions
 │   ├── fasta/              # FASTA handling
-│   │   ├── reader.rs       # FASTA file reading (via bio crate)
-│   │   ├── encoder.rs      # 2-bit encoding, reverse complementation
+│   │   ├── reader.rs       # FASTA file reading (with streaming support)
+│   │   ├── encoder.rs      # Sequence encoding utilities
 │   │   └── mod.rs          # Module definitions
 │   ├── grammar/            # Core grammar components
 │   │   ├── symbol.rs       # Symbol representation (Terminal/NonTerminal)
 │   │   ├── rule.rs         # Rule data structure
+│   │   ├── digram.rs       # Digram representation and operations
 │   │   ├── digram_table.rs # Efficient digram tracking
 │   │   ├── builder.rs      # Grammar construction algorithm
+│   │   ├── engine.rs       # Grammar types and interfaces
 │   │   └── mod.rs          # Module definitions
 │   ├── io/                 # Input/Output operations
 │   │   ├── output_json.rs  # JSON serialization
@@ -46,9 +51,22 @@ orbweaver/
 │   │   ├── output_fasta.rs # FASTA export of rules
 │   │   ├── output_dot.rs   # DOT graph format for visualization
 │   │   └── mod.rs          # Module definitions
-│   └── utils/              # Shared utilities (placeholder)
+│   ├── parallel/           # Parallelization strategies
+│   │   ├── engine.rs       # Parallel execution engine 
+│   │   ├── chunking.rs     # Adaptive chunking algorithm
+│   │   └── mod.rs          # Module definitions
+│   └── utils/              # Shared utilities
+│       ├── export.rs       # Export utilities for grammar
+│       ├── hash.rs         # Hashing utilities
+│       ├── io.rs           # I/O utilities
+│       ├── progress.rs     # Progress tracking
+│       ├── stats.rs        # Statistical utilities
+│       ├── visualization.rs# Visualization utilities
+│       └── mod.rs          # Module definitions
 ├── tests/                  # Integration tests
-│   └── integration_tests.rs # End-to-end tests
+│   ├── integration_tests.rs# End-to-end tests
+│   ├── memory_opt_tests.rs # Memory optimization tests
+│   └── memory_opt_integration.rs # Memory optimization integration tests
 ```
 
 ## Core Data Types
@@ -61,13 +79,26 @@ The `Symbol` struct represents a single unit in the grammar. It can be either a 
 pub struct Symbol {
     pub id: usize,             // Unique identifier for this instance
     pub symbol_type: SymbolType, // Terminal or NonTerminal
-    pub strand: char,          // '+' or '-' strand
+    pub strand: Direction,     // Forward or Reverse strand
 }
 
 pub enum SymbolType {
-    Terminal(u8),      // ASCII value of DNA base (e.g., 65 for 'A')
-    NonTerminal(usize), // Rule ID
+    Terminal(EncodedBase),  // 2-bit encoded DNA base
+    NonTerminal(usize),     // Rule ID
 }
+
+pub enum Direction {
+    Forward,
+    Reverse,
+}
+```
+
+### EncodedBase
+
+The `EncodedBase` struct provides memory-efficient storage of DNA bases:
+
+```rust
+pub struct EncodedBase(pub u8); // A=0, C=1, G=2, T=3
 ```
 
 ### Rule
@@ -79,6 +110,8 @@ pub struct Rule {
     pub id: usize,           // Unique identifier
     pub symbols: Vec<Symbol>, // The expansion sequence (typically 2 symbols initially)
     pub usage_count: usize,  // Number of times this rule appears
+    pub positions: Vec<usize>, // Original positions where this rule was found
+    pub depth: Option<usize>, // Hierarchical depth of this rule
 }
 ```
 
@@ -87,11 +120,23 @@ pub struct Rule {
 The `DigramTable` is a specialized hash map that efficiently tracks digrams (pairs of adjacent symbols) in the sequence:
 
 ```rust
-pub type DigramKey = ((SymbolType, char), (SymbolType, char));
+pub type DigramKey = u64; // A 64-bit hash representing a canonical digram
 
 pub struct DigramTable {
     // Maps canonical digram key -> Vec of (position, original digram instance)
     occurrences: HashMap<DigramKey, Vec<(usize, (Symbol, Symbol))>>,
+}
+```
+
+### Grammar
+
+The `Grammar` struct represents the final output of the grammar construction process:
+
+```rust
+pub struct Grammar {
+    pub sequence: Vec<Symbol>,   // The compressed sequence
+    pub rules: HashMap<usize, Rule>, // Rules discovered during inference
+    pub max_depth: usize,       // Maximum rule depth (for hierarchy analysis)
 }
 ```
 
@@ -101,12 +146,18 @@ The `GrammarBuilder` orchestrates the construction process:
 
 ```rust
 pub struct GrammarBuilder {
-    sequence: Vec<Symbol>,   // The working sequence
-    rules: HashMap<usize, Rule>, // Rules created during processing
-    digram_table: DigramTable, // Tracks digram occurrences
-    next_rule_id: usize,     // Counter for assigning rule IDs
-    min_rule_usage: usize,   // Configuration settings
-    reverse_aware: bool,     // Configuration settings
+    sequence: Vec<Symbol>,        // The working sequence
+    rules: HashMap<usize, Rule>,  // Rules created during processing
+    digram_table: DigramTable,    // Tracks digram occurrences
+    next_rule_id: usize,          // Counter for assigning rule IDs
+    min_rule_usage: usize,        // Configuration settings
+    reverse_aware: bool,          // Configuration settings
+    max_rule_count: Option<usize>, // Rule count limit for eviction
+    rule_depths: HashMap<usize, usize>, // Track rule depths
+    metrics: PerformanceMetrics,  // Performance tracking
+    stream_mode: bool,            // Streaming mode flag
+    chunk_count: usize,           // Number of chunks processed
+    total_bases_processed: usize, // Total bases processed
 }
 ```
 
@@ -144,6 +195,16 @@ procedure BuildGrammar(sequence, min_rule_usage, reverse_aware):
     return (symbols, rules)
 ```
 
+### Memory-Optimized Extensions
+
+Several extensions to the core algorithm improve memory efficiency:
+
+1. **Streaming Processing**: Process the sequence in chunks rather than all at once
+2. **Adaptive Chunking**: Dynamically adjust chunk sizes based on sequence entropy
+3. **Rule Eviction**: Remove less useful rules when exceeding memory constraints
+4. **2-bit Encoding**: Store DNA bases in 2 bits instead of 8-bit ASCII
+5. **Suffix Array Optimization**: Use suffix arrays for initial digram finding in large sequences
+
 ### Reverse Complement Handling
 
 When `reverse_aware` is enabled, the digram table treats a digram and its reverse complement as equivalent. For example, "AC" (forward strand) and "GT" (reverse strand) are tracked together as a single canonical form. This is particularly useful for DNA where patterns can appear on either strand.
@@ -153,8 +214,8 @@ When `reverse_aware` is enabled, the digram table treats a digram and its revers
 ```
 ┌────────────────┐     ┌─────────────────┐     ┌──────────────────┐
 │                │     │                 │     │                  │
-│  FASTA Input   │────►│  Vec<u8> Bytes  │────►│  Vec<Symbol>     │
-│                │     │                 │     │                  │
+│  FASTA Input   │────►│  EncodedBase    │────►│  Vec<Symbol>     │
+│                │     │  Sequence       │     │                  │
 └────────────────┘     └─────────────────┘     └──────────────────┘
                                                          │
                                                          ▼
@@ -166,25 +227,53 @@ When `reverse_aware` is enabled, the digram table treats a digram and its revers
 └────────────────┘     └─────────────────┘     └──────────────────┘
 ```
 
+### Streaming Mode Flow
+
+```
+┌────────────────┐     ┌─────────────────┐     ┌──────────────────┐
+│                │     │                 │     │                  │
+│  FASTA Input   │────►│  Chunk 1        │────►│  Process Chunk   │
+│  Stream        │     │                 │     │                  │
+└────────────────┘     └─────────────────┘     └──────────────────┘
+       │                                                 │
+       │                                                 ▼
+       │               ┌─────────────────┐     ┌──────────────────┐
+       │               │                 │     │                  │
+       └──────────────►│  Chunk 2...N    │────►│  Process Chunk   │
+                       │                 │     │                  │
+                       └─────────────────┘     └──────────────────┘
+                                                         │
+                                                         ▼
+                                               ┌──────────────────┐
+                                               │                  │
+                                               │  Finalize        │
+                                               │  Grammar         │
+                                               │                  │
+                                               └──────────────────┘
+```
+
 1. **Input Processing** (`src/main.rs` -> `fasta::reader`):
-   - Reads FASTA file using the `bio` crate
+   - Reads FASTA file using streaming or memory-mapped approaches
    - Optionally filters out 'N' bases
-   - Returns sequence as `Vec<u8>`
+   - Processes selected sequences by index (if specified)
+   - Returns sequence as `Vec<EncodedBase>`
 
 2. **Symbol Conversion** (`grammar::builder::initialize_sequence`):
-   - Converts raw bytes to `Vec<Symbol>` with Terminal symbols
+   - Converts encoded bases to `Vec<Symbol>` with Terminal symbols
    - Assigns position IDs and strand information
 
 3. **Digram Tracking** (`grammar::builder::rebuild_digram_table` -> `digram_table::add_digram`):
    - Scans the current sequence to find all adjacent pairs
    - Handles reverse complement canonicalization if enabled
    - Creates efficiency map of digrams to their positions
+   - Uses suffix arrays for initial optimization on large sequences
 
 4. **Rule Creation Loop** (`grammar::builder::step`):
    - Queries the digram table for most frequent pair
    - Creates a new rule if frequency meets threshold
    - Replaces all occurrences with the non-terminal
    - Rebuilds the digram table and repeats
+   - Performs rule eviction if exceeding memory limits
 
 5. **Output Generation** (`io::output_*`):
    - Creates various representations of the final grammar
@@ -204,30 +293,65 @@ The canonicalization strategy in `DigramTable` implements a form of the Strategy
 
 The `Symbol` struct includes factory methods (`terminal` and `non_terminal`) that encapsulate the creation logic, making it more maintainable and preventing invalid states.
 
+### Observer Pattern
+
+The `ProgressTracker` uses an observer-like pattern to monitor and report progress, with periodic callbacks to display status.
+
 ## Memory Management
 
 ### Memory Efficiency
 
+- **2-bit Encoding**: DNA bases stored as 2 bits (A=00, C=01, G=10, T=11) instead of 8-bit ASCII
+- **Streaming Processing**: Processes files incrementally without loading entire sequences
+- **Rule Eviction**: Priority-based eviction of least-used rules to limit memory growth
+- **Adaptive Chunking**: Dynamically sizes chunks based on sequence complexity
+- **Memory-Mapped I/O**: Efficient file access without loading entire contents
+- **Parallel Chunking**: Processes large genomes in overlapping chunks
+- **BitVector**: Efficient bit-level storage and operations for encoded sequences
+
+### Memory Optimizations
+
 - The `DigramTable` efficiently tracks digram occurrences without duplicating symbol data
 - Symbols are stored with minimal overhead (type, ID, strand only)
 - The **replace_occurrences** method works in-place on the sequence
-
-### Potential Improvements
-
-- Chunking for large genomes (not yet implemented) would process segments sequentially
-- Rule eviction could limit memory usage by removing infrequently used rules (not yet implemented)
+- Entropy analysis adjusts chunk sizes for complex vs. repetitive regions
+- Memory usage monitoring and adaptive limits per chunk
+- Selective sequence processing to avoid loading unnecessary sequences
 
 ## Parallelization Strategy
 
-The current implementation has parallelization in the `analysis::motifs` module:
+Orbweaver employs multiple parallelization strategies:
 
-- Motif finding algorithms use Rayon's work-stealing thread pool
-- Memory-mapped I/O with parallel chunk processing
-- Channel-based communication between worker threads
+1. **Chunk-Based Parallelism**:
+   - Divides large sequences into overlapping chunks
+   - Processes chunks in parallel using thread pools
+   - Uses rayon's work-stealing thread pool for load balancing
+   - Merges chunk results to create a unified grammar
 
-Future enhancement opportunities:
-- Parallelized digram scanning
-- Concurrent rule replacements for non-overlapping regions
+2. **Digram Table Parallelism**:
+   - Parallel population of digram table for large sequences
+   - Concurrent processing of non-overlapping digrams
+   - Parallel canonicalization of digrams
+
+3. **Multi-Sequence Parallelism**:
+   - Processes separate sequences in parallel
+   - Applies parallelism at both sequence and chunk levels
+   - Merges grammars from different sequences
+
+4. **Adaptive Parallelism**:
+   - Adjusts thread allocation based on available cores
+   - Optimizes parallelism based on sequence characteristics
+   - Thread count configurable via CLI
+
+### Implementation Details
+
+The `parallel` module coordinates parallelism:
+
+- `parallel::engine`: Manages parallel grammar construction
+- `parallel::chunking`: Handles chunk creation and processing
+- Uses channels for efficient communication between worker threads
+- Thread synchronization via atomic operations and barriers
+- Progress tracking for parallel operations
 
 ## Error Handling
 
@@ -244,6 +368,12 @@ read_fasta_sequences(&args.input, args.skip_ns)
     .context("Failed to read FASTA file")?;
 ```
 
+### Error Recovery
+
+- Graceful handling of memory allocation failures
+- Recovery from chunk processing errors
+- Adaptive reduction of memory usage when constraints are reached
+
 ## Testing Strategy
 
 The codebase employs a multi-level testing approach:
@@ -251,33 +381,41 @@ The codebase employs a multi-level testing approach:
 1. **Unit Tests**: Within module files using `#[cfg(test)]`
    - Tests for `Symbol`, `Rule`, `DigramTable` creation and manipulation
    - Algorithm validations for smaller inputs
+   - Memory optimization verification
 
 2. **Integration Tests**: In the `tests/` directory
    - End-to-end tests that verify the CLI and file outputs
    - Tests for edge cases like empty files, invalid inputs, etc.
+   - Memory optimization integration tests
 
-3. **Continuous Integration**:
+3. **Performance Tests**: Found in `memory_opt_tests.rs`
+   - Verifies memory reduction techniques
+   - Benchmarks performance of different strategies
+
+4. **Continuous Integration**:
    - GitHub Actions workflow runs tests on each commit
    - Verifies functionality across platforms
 
 ## Future Design Considerations
 
-1. **Chunking Strategy**:
-   - Divide large genomes into overlapping chunks
-   - Process each chunk separately
-   - Merge local grammars into a global grammar
+1. **Further Chunking Optimizations**:
+   - Improve chunk boundary handling for better pattern detection
+   - Dynamic adaptation of chunking strategies based on runtime metrics
 
-2. **Rule Eviction**:
-   - Maintain a rule usage priority queue
-   - When rule count exceeds threshold, remove least-used rules
-   - Inline removed rules back into the sequence
+2. **Advanced Rule Eviction**:
+   - Develop more sophisticated eviction policies based on rule utility
+   - Consider compression impact in eviction decisions
+   - Explore probabilistic data structures for rule tracking
 
 3. **Rule Optimization**:
    - Identify rules that can be merged or decomposed
    - Consider optimal rule extraction based on compression metrics
    - Implement rule hierarchy pruning
 
-4. **Multiple Sequence Handling**:
-   - Concatenate sequences with delimiter symbols
-   - Build separate grammars for each sequence
-   - Create a meta-grammar that references shared rules 
+4. **Distributed Processing**:
+   - Support for distributed computation across multiple machines
+   - Cloud-native deployment options
+
+5. **GPU Acceleration**:
+   - Explore GPU-based acceleration for digram finding
+   - Optimize suffix array construction for GPUs 

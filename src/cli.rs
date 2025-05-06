@@ -250,6 +250,8 @@ fn build_grammar(
             reverse_aware,
             num_threads,
             show_progress: true,
+            adaptive_chunking: false,
+            max_memory_per_chunk: None,
         };
         
         let (grammar, metrics) = parallel_sequitur(&bases, chunking_config)?;

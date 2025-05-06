@@ -34,6 +34,12 @@ Orbweaver is a command-line tool written in Rust for building and analyzing cont
   - **FASTA**: Exports expanded sequences for each rule
 - **Statistics**: Calculates compression ratio, rule depth, and other metrics
 - **Parallelization**: Configurable multi-threading for parallel chunk processing on large genomes.
+- **Advanced Memory Management**:
+  - **2-bit Encoding**: Efficient DNA storage using 2 bits per base
+  - **Streaming Mode**: Process very large genomes without loading entirely into memory
+  - **Adaptive Chunking**: Dynamically adjusts chunk sizes based on sequence complexity
+  - **Rule Eviction**: Prevents memory growth by removing less useful rules
+- **Multi-Sequence Support**: Process selected sequences from multi-FASTA files using sequence indices.
 
 ## Installation
 
@@ -69,6 +75,18 @@ cargo build --release
   --visualize output/grammar.dot \
   --export-blocks output/rules.fasta \
   --stats
+
+# Memory-efficient processing of large genomes with streaming
+./target/release/orbweaver -i large_genome.fasta \
+  -j output/grammar.json \
+  --streaming \
+  --max-memory-per-chunk-mb 500 \
+  --min-rule-usage 5
+
+# Process only specific sequences from a multi-FASTA file
+./target/release/orbweaver -i multi_genome.fasta \
+  -j output/grammar.json \
+  --sequence-indices 0,2,5
 
 # See all available options
 ./target/release/orbweaver --help
@@ -127,6 +145,10 @@ orbweaver -i <input_fasta> [options]
 - `--chunk-size <INT>`: Process genome in chunks of this size using parallel processing (optional)
 - `--chunk-overlap <INT>`: Overlap between chunks (default: 1000)
 - `--threads <INT>`: Number of threads to use for parallel processing (default: system's thread count)
+- `--streaming`: Process the FASTA file in streaming mode for lower memory usage
+- `--adaptive-chunking`: Dynamically adjust chunk sizes based on sequence complexity
+- `--sequence-indices <LIST>`: Process only selected sequences from multi-sequence FASTA files
+- `--max-memory-per-chunk-mb <INT>`: Maximum memory usage per chunk in MB (with adaptive chunking)
 
 For full details, run `orbweaver --help`.
 
@@ -201,14 +223,24 @@ orbweaver -i sample.fasta --visualize grammar.dot
 dot -Tpng grammar.dot -o grammar.png
 ```
 
-### Tweaking Grammar Construction
+### Memory-Efficient Processing for Large Genomes
 
 ```bash
-# More stringent rule creation (digram must appear at least 5 times)
-orbweaver -i sample.fasta -j grammar.json --min-rule-usage 5
+# Use streaming mode with adaptive chunking
+orbweaver -i large_genome.fasta -j grammar.json --streaming --adaptive-chunking
 
-# Disable reverse complement awareness
-orbweaver -i sample.fasta -j grammar.json --reverse-aware false
+# Limit memory usage per chunk
+orbweaver -i huge_genome.fasta -j grammar.json --streaming --max-memory-per-chunk-mb 1000
+```
+
+### Processing Multiple Sequences
+
+```bash
+# Select specific sequences from a multi-FASTA file by index (0-based)
+orbweaver -i multi.fasta -j grammar.json --sequence-indices 0,2,5
+
+# Process all sequences from a multi-FASTA file
+orbweaver -i multi.fasta -j grammar.json
 ```
 
 ## Configuration
@@ -246,15 +278,14 @@ Orbweaver follows a modular architecture:
 - **grammar**: Core grammar construction logic
 - **io**: Input/output operations for different formats
 - **analysis**: Statistical analysis of the grammar
+- **parallel**: Parallelization strategies for large genomes
+- **encode**: Efficient DNA encoding and memory optimization
 
 See [Architecture Documentation](docs/architecture.md) for more details.
 
 ## Known Limitations
 
-- **Memory Usage**: The current implementation loads the entire sequence into memory
-- **Multiple Sequences**: Only processes the first sequence in multi-FASTA files
 - **Performance**: Large genomes may require significant time and memory
-- **Eviction Strategy**: Rule eviction is not yet implemented
 - **GFA Output**: The GFA representation is experimental and may not be optimal for all visualization tools
 
 ## Development
@@ -287,6 +318,9 @@ cargo build --release
 
 # Run all tests
 ./scripts/test_all.sh
+
+# Test memory efficiency
+./scripts/test_memory_efficiency.sh input.fasta results
 ```
 
 ## Contributing
@@ -305,7 +339,9 @@ Please ensure your code follows the project's coding style and includes appropri
 
 - [x] Implement chunking for processing large genomes
 - [x] Add rule eviction strategy for limiting memory usage
-- [ ] Support multiple sequences in FASTA files
+- [x] Add streaming mode for large genomes
+- [x] Implement adaptive chunking
+- [x] Support multiple sequences in FASTA files
 - [ ] Improve GFA output format
 - [ ] Add benchmarking tools
 
@@ -315,25 +351,30 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 
 ### Memory Efficiency Improvements
 
-This project now implements three major memory efficiency optimizations:
+This project implements four major memory efficiency optimizations:
 
-1. **Streaming Input Processing**: Instead of loading entire FASTA files into memory, sequences can now be processed in chunks using a streaming approach, dramatically reducing memory footprint for large genomes.
+1. **Streaming Input Processing**: Instead of loading entire FASTA files into memory, sequences can be processed in chunks using a streaming approach, dramatically reducing memory footprint for large genomes.
 
 2. **2-Bit Encoding Optimization**: DNA sequences are efficiently stored using 2-bit encoding (A=00, C=01, G=10, T=11), reducing memory usage by up to 75% compared to ASCII storage.
 
-3. **Rule Eviction Strategy**: A priority queue-based approach now tracks usage of grammar rules and can evict least-used rules when memory constraints are reached, ensuring bounded memory usage even for complex sequences.
+3. **Rule Eviction Strategy**: A priority queue-based approach tracks usage of grammar rules and can evict least-used rules when memory constraints are reached, ensuring bounded memory usage even for complex sequences.
+
+4. **Adaptive Chunking**: Dynamically adjusts chunk sizes based on sequence complexity and available system memory, optimizing both processing speed and memory usage.
 
 To use these memory optimizations:
 
 ```bash
-# Use all memory optimization techniques
-orbweaver -i large_genome.fasta --streaming --max-rule-count 5000
+# Use all memory optimization techniques with adaptive chunking
+orbweaver -i large_genome.fasta --streaming --adaptive-chunking --max-rule-count 5000
 
 # Just use streaming mode with default settings
 orbweaver -i large_genome.fasta --streaming
 
 # Just use rule eviction with a limit of 10,000 rules
 orbweaver -i large_genome.fasta --max-rule-count 10000
+
+# Set maximum memory per chunk
+orbweaver -i large_genome.fasta --streaming --max-memory-per-chunk-mb 500
 ```
 
-These improvements allow processing of large genomes (>1GB) with controlled memory usage. 
+These improvements allow processing of large genomes (>10GB) with controlled memory usage. 
