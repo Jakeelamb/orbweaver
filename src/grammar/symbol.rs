@@ -1,15 +1,15 @@
 use std::fmt;
-use serde::Serialize;
+use serde::{Serialize, Deserialize};
 
 /// Represents the type of a symbol in the grammar.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SymbolType {
     Terminal(u8), // Represents a single base (e.g., A, C, G, T as u8)
     NonTerminal(usize), // Represents a rule ID
 }
 
 /// Represents a symbol instance in the grammar sequence or rules.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Symbol {
     pub id: usize, // Unique identifier for this *instance* of the symbol (e.g., its position in the original sequence or a rule expansion)
     pub symbol_type: SymbolType,

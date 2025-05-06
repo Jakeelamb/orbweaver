@@ -1,0 +1,125 @@
+{
+  "final_sequence": [
+    {
+      "id": 0,
+      "symbol_type": {
+        "NonTerminal": 4
+      },
+      "strand": "+"
+    },
+    {
+      "id": 2,
+      "symbol_type": {
+        "NonTerminal": 4
+      },
+      "strand": "+"
+    }
+  ],
+  "rules": {
+    "3": {
+      "id": 3,
+      "symbols": [
+        {
+          "id": 0,
+          "symbol_type": {
+            "NonTerminal": 2
+          },
+          "strand": "+"
+        },
+        {
+          "id": 2,
+          "symbol_type": {
+            "NonTerminal": 2
+          },
+          "strand": "+"
+        }
+      ],
+      "usage_count": 4,
+      "positions": []
+    },
+    "1": {
+      "id": 1,
+      "symbols": [
+        {
+          "id": 0,
+          "symbol_type": {
+            "Terminal": 65
+          },
+          "strand": "+"
+        },
+        {
+          "id": 1,
+          "symbol_type": {
+            "Terminal": 67
+          },
+          "strand": "+"
+        }
+      ],
+      "usage_count": 8,
+      "positions": []
+    },
+    "4": {
+      "id": 4,
+      "symbols": [
+        {
+          "id": 0,
+          "symbol_type": {
+            "NonTerminal": 3
+          },
+          "strand": "+"
+        },
+        {
+          "id": 2,
+          "symbol_type": {
+            "NonTerminal": 3
+          },
+          "strand": "+"
+        }
+      ],
+      "usage_count": 2,
+      "positions": []
+    },
+    "2": {
+      "id": 2,
+      "symbols": [
+        {
+          "id": 0,
+          "symbol_type": {
+            "NonTerminal": 1
+          },
+          "strand": "+"
+        },
+        {
+          "id": 2,
+          "symbol_type": {
+            "NonTerminal": 0
+          },
+          "strand": "+"
+        }
+      ],
+      "usage_count": 8,
+      "positions": []
+    },
+    "0": {
+      "id": 0,
+      "symbols": [
+        {
+          "id": 2,
+          "symbol_type": {
+            "Terminal": 71
+          },
+          "strand": "+"
+        },
+        {
+          "id": 3,
+          "symbol_type": {
+            "Terminal": 84
+          },
+          "strand": "+"
+        }
+      ],
+      "usage_count": 8,
+      "positions": []
+    }
+  }
+}

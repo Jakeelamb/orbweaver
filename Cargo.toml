@@ -51,7 +51,6 @@ tokio = { version = "1.29.1", features = ["rt-multi-thread", "macros", "time"] }
 # Logging
 log = "0.4.19"
 env_logger = "0.11.8"
-bqtools = "0.3.19"
 
 # The main binary uses src/main.rs by default
 # No need for [[bin]] sections anymore
@@ -64,7 +63,15 @@ crossbeam-channel = "0.5"
 memmap2 = "0.9" # Add memmap2
 twox-hash = "1.6"
 
+# Profiling dependencies
+pprof = { version = "0.11", features = ["flamegraph"] }
+tikv-jemallocator = { version = "0.5", optional = true }
+
 [dev-dependencies]
 assert_cmd = "2.0"
 predicates = "3.0"
 tempfile = "3.10"
+
+[features]
+profiling = ["pprof/flamegraph", "tikv-jemallocator"]
+jemalloc = ["tikv-jemallocator"]

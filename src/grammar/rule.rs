@@ -1,16 +1,25 @@
 use crate::grammar::symbol::{Symbol, SymbolType};
 // use std::fmt; // Remove unused import
-use serde::Serialize; // Import Serialize
+use serde::{Serialize, Deserialize}; // Import both Serialize and Deserialize
 use std::collections::HashMap;
 
-/// Represents a production rule in the grammar.
-/// Typically, rule R -> S1 S2, where S1 and S2 can be Terminal or NonTerminal.
-#[derive(Debug, Serialize)]
+/// Represents a grammar rule containing a sequence of symbols
+/// 
+/// Each rule has a unique ID, a list of symbols (terminals and non-terminals),
+/// and metadata such as a usage counter and original positions in the sequence.
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Rule {
-    pub id: usize,           // Unique identifier for this rule (corresponds to NonTerminal Symbol IDs)
-    pub symbols: Vec<Symbol>, // The sequence this rule produces (initially 2 symbols)
-    pub usage_count: usize,  // How many times this rule is used in the current sequence/other rules
-                             // Strand usage tracking might be added here or managed by the GrammarBuilder
+    /// Unique identifier for this rule
+    pub id: usize,
+    
+    /// The list of symbols (terminals and non-terminals) in this rule
+    pub symbols: Vec<Symbol>,
+    
+    /// How many times this rule is used in the grammar
+    pub usage_count: usize,
+    
+    /// The original positions where this rule was found (for reporting)
+    pub positions: Vec<usize>,
 }
 
 impl Rule {
@@ -20,6 +29,7 @@ impl Rule {
             id,
             symbols: vec![symbol1, symbol2],
             usage_count: 0, // Initial usage count is 0, incremented when used
+            positions: Vec::new(), // Initialize empty positions
         }
     }
     

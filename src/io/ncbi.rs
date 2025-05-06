@@ -13,16 +13,20 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 use glob;
+use std::collections::HashSet;
 
 // --- Configuration & Constants ---
 const EUTILS_BASE_URL: &str = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/";
 const NCBI_RATE_LIMIT_DELAY: Duration = Duration::from_millis(200); // ~5 requests/sec with API key
 const DEFAULT_MAX_IDS: usize = 10000;
-const DEFAULT_CSV_FILE: &str = "metazoan_chromosome_assemblies_with_lineage.csv";
 const GCF_CSV_FILE: &str = "gcf_assemblies_by_size.csv";
 const SAMPLE_TSV_FILE: &str = "sample.tsv";
 const GENOMES_DIR: &str = "genomes";
 const TAXONOMY_RANKS: [&str; 7] = ["superkingdom", "kingdom", "phylum", "class", "order", "family", "genus"];
+
+// Constants for NCBI interaction
+const NCBI_EFETCH_URL: &str = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi";
+const NCBI_ESUMMARY_URL: &str = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi";
 
 // --- Structs for Deserialization & Serialization ---
 // (Keep these internal unless needed elsewhere)
@@ -39,7 +43,7 @@ struct ESearchResponse {
 }
 
 #[derive(Deserialize, Debug, Clone, Serialize)]
-struct AssemblySummary {
+pub struct AssemblySummary {
     #[serde(rename = "assemblyaccession")]
     assembly_accession: String,
     #[serde(rename = "taxid")]
@@ -71,7 +75,7 @@ struct ESummaryResponse {
 }
 
 #[derive(Deserialize, Debug, Default, Clone, Serialize)]
-struct TaxonomyLineage {
+pub struct TaxonomyLineage {
     superkingdom: Option<String>,
     kingdom: Option<String>,
     phylum: Option<String>,
@@ -373,11 +377,6 @@ pub fn save_records_to_csv<T: Serialize>(records: &[T], path: &Path) -> Result<(
     Ok(())
 }
 
-// Helper function to parse N50 values robustly
-fn parse_n50(value_str: &Option<String>) -> Option<u64> {
-    value_str.as_ref().and_then(|s| s.parse::<u64>().ok())
-}
-
 // Helper function to parse 'total-length' from meta string
 fn parse_total_length_from_meta(meta: &Option<String>) -> Option<u64> {
     meta.as_ref().and_then(|m| {
@@ -619,4 +618,10 @@ pub fn run_ncbi_fetch(generate: bool, csv_path: PathBuf) -> Result<()> {
 
     println!("NCBI data processing complete.");
     Ok(())
+}
+
+/// Placeholder function to load existing data from CSV
+pub fn load_existing_data(_csv_path: &Path) -> Result<HashSet<String>> {
+    // ... existing code ...
+    Ok(HashSet::new())
 } 

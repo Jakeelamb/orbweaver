@@ -1,7 +1,9 @@
 use anyhow::{Context, Result};
-use clap::{Parser, command, ArgGroup};
+use clap::{Parser, command};
 use std::path::PathBuf;
-use std::fs;
+use std::time::Instant;
+use std::fs::File;
+use std::io::Write;
 use orbweaver::fasta::reader::{read_fasta_sequences, InMemoryFastaReader, ChunkedSequenceIterator};
 use orbweaver::fasta::encoder::{encode_dna_2bit, decode_dna_2bit};
 use orbweaver::grammar::builder::GrammarBuilder;
@@ -20,6 +22,11 @@ use orbweaver::io::output_dot::write_grammar_dot;
 // use orbweaver::fasta;
 // use orbweaver::grammar;
 // use orbweaver::analysis; // If motifs analysis is re-integrated later
+
+// Configure jemalloc for better memory management if feature is enabled
+#[cfg(feature = "jemalloc")]
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 /// Orbweaver: A grammar-based approach to genomic sequence analysis.
 /// 
@@ -147,10 +154,48 @@ struct OrbweaverArgs {
     /// This is especially useful for large genomes.
     #[clap(long, default_value_t = true, action = clap::ArgAction::Set)]
     use_encoding: bool,
+
+    /// Number of threads to use for parallel processing.
+    /// 
+    /// Sets the number of worker threads for parallelized operations.
+    /// Default: number of logical CPU cores.
+    #[clap(long, value_parser)]
+    threads: Option<usize>,
+
+    /// Enable performance profiling.
+    /// 
+    /// Generates a CPU profile and flame graph of the application execution.
+    /// Results are saved to the 'profile' directory.
+    #[clap(long, action = clap::ArgAction::SetTrue)]
+    profile: bool,
 }
 
 fn main() -> Result<()> {
+    // Initialize logger for better error and warning messages
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    
     let args = OrbweaverArgs::parse();
+    
+    // Set up thread pool for parallel processing
+    if let Some(thread_count) = args.threads {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(thread_count)
+            .build_global()
+            .context("Failed to configure thread pool")?;
+        println!("Using {} threads for parallel operations", thread_count);
+    } else {
+        println!("Using default thread count: {} threads", rayon::current_num_threads());
+    }
+
+    #[cfg(feature = "profiling")]
+    let _guard = if args.profile {
+        println!("Profiling enabled, generating flamegraph");
+        Some(profiling::start_profiling("orbweaver")?)
+    } else {
+        None
+    };
+
+    let start_time = Instant::now();
 
     println!("Starting Orbweaver...");
     println!("Input file: {}", args.input.display());
@@ -205,14 +250,12 @@ fn main() -> Result<()> {
         anyhow::bail!("--min-rule-usage must be at least 1.");
     }
 
-    // --- Create Config (Optional - args can be passed directly) ---
-    // let config = Config::new(args); // Pass the whole args struct?
-    // config.validate()?; // Or validate within Config::new
-
     println!("Configuration validated.");
     println!("----------------------------------------");
 
     // --- Core Logic --- 
+    
+    let read_start = Instant::now();
 
     // 1. Read FASTA sequence(s)
     let sequences = read_fasta_sequences(&args.input, args.skip_ns)
@@ -222,6 +265,9 @@ fn main() -> Result<()> {
         println!("No sequences found in the input file after processing.");
         return Ok(());
     }
+
+    let read_time = read_start.elapsed();
+    println!("FASTA reading completed in {:.2?}", read_time);
 
     // For now, process only the first sequence.
     let (first_seq_id, first_seq_data) = &sequences[0];
@@ -237,6 +283,7 @@ fn main() -> Result<()> {
     let initial_len = first_seq_data.len(); // Store initial length for stats
 
     // Create the grammar builder with the specified parameters
+    let grammar_start = Instant::now();
     let mut grammar_builder = if let Some(max_rules) = args.max_rule_count {
         GrammarBuilder::new(args.min_rule_usage, args.reverse_aware)
             .with_max_rules(max_rules)
@@ -258,6 +305,7 @@ fn main() -> Result<()> {
         
         // Process each chunk
         for chunk in chunk_iterator {
+            let chunk_start = Instant::now();
             chunks_processed += 1;
             total_bases_processed += chunk.data.len();
             
@@ -282,9 +330,10 @@ fn main() -> Result<()> {
             // Process this chunk with the same grammar builder (continuing from previous chunks)
             grammar_builder.build_grammar(&sequence_to_process)
                 .with_context(|| format!("Failed processing chunk {}", chunks_processed))?;
-                
-            println!("Completed chunk {}: current grammar has {} rules", 
-                     chunks_processed, grammar_builder.get_grammar().1.len());
+            
+            let chunk_time = chunk_start.elapsed();
+            println!("Completed chunk {}: current grammar has {} rules (took {:.2?})", 
+                     chunks_processed, grammar_builder.get_grammar().1.len(), chunk_time);
                      
             if chunk.is_last {
                 println!("Reached end of sequence after {} chunks ({} bases processed)", 
@@ -293,6 +342,7 @@ fn main() -> Result<()> {
         }
     } else {
         // Process the entire sequence at once
+        let encode_start = Instant::now();
         let sequence_to_process = if args.use_encoding {
             println!("Encoding sequence using 2-bit representation to reduce memory usage...");
             match encode_dna_2bit(first_seq_data) {
@@ -314,16 +364,20 @@ fn main() -> Result<()> {
         } else {
             first_seq_data.clone()
         };
+        println!("Encoding completed in {:.2?}", encode_start.elapsed());
 
         // Build the grammar from the full sequence
+        let build_start = Instant::now();
         grammar_builder.build_grammar(&sequence_to_process)
             .context("Failed during grammar construction")?;
+        println!("Grammar construction completed in {:.2?}", build_start.elapsed());
     }
 
+    let grammar_time = grammar_start.elapsed();
     // 4. Get final grammar (sequence and rules)
     let (final_sequence, rules) = grammar_builder.get_grammar();
     println!("----------------------------------------");
-    println!("Grammar construction complete.");
+    println!("Grammar construction complete in {:.2?}.", grammar_time);
     println!("  Final sequence length: {}", final_sequence.len());
     println!("  Number of rules generated: {}", rules.len());
     
@@ -332,36 +386,84 @@ fn main() -> Result<()> {
     println!("  Average rule depth: {:.2}", grammar_builder.get_avg_rule_depth());
 
     // 5. Write Output Files
+    let output_start = Instant::now();
     if let Some(json_path) = &args.output_json {
+        let json_start = Instant::now();
         write_grammar_json(&grammar_builder, json_path)
             .context("Failed to write grammar to JSON")?;
+        println!("JSON output completed in {:.2?}", json_start.elapsed());
     }
     if let Some(gfa_path) = &args.output_gfa {
+        let gfa_start = Instant::now();
         write_grammar_gfa(&grammar_builder, gfa_path)
             .context("Failed to write grammar to GFA")?;
+        println!("GFA output completed in {:.2?}", gfa_start.elapsed());
     }
     if let Some(text_path) = &args.output_text {
+        let text_start = Instant::now();
         write_grammar_text(&grammar_builder, text_path)
             .context("Failed to write grammar to Text")?;
+        println!("Text output completed in {:.2?}", text_start.elapsed());
     }
     if let Some(fasta_path) = &args.export_blocks {
+         let fasta_start = Instant::now();
          export_rules_as_fasta(&grammar_builder, fasta_path)
             .context("Failed to export rules to FASTA")?;
+         println!("FASTA output completed in {:.2?}", fasta_start.elapsed());
     }
+    println!("All outputs completed in {:.2?}", output_start.elapsed());
 
     // 6. Calculate and Print Stats
     if args.stats {
+        let stats_start = Instant::now();
         calculate_and_print_stats(&grammar_builder, initial_len)
             .context("Failed to calculate statistics")?;
+        println!("Stats calculation completed in {:.2?}", stats_start.elapsed());
     }
 
     // 7. Write Visualization
     if let Some(dot_path) = &args.visualize {
+        let dot_start = Instant::now();
         write_grammar_dot(&grammar_builder, dot_path)
             .context("Failed to write grammar to DOT")?;
+        println!("DOT visualization completed in {:.2?}", dot_start.elapsed());
+    }
+
+    #[cfg(feature = "profiling")]
+    if args.profile {
+        profiling::finish_profiling(_guard, "orbweaver")?;
     }
 
     println!("----------------------------------------");
-    println!("Orbweaver finished.");
+    println!("Orbweaver finished in {:.2?}.", start_time.elapsed());
+    
+    // Write a simple performance summary file 
+    let summary_path = args.input.with_file_name(format!(
+        "{}_perf_summary.txt", 
+        args.input.file_stem().unwrap_or_default().to_string_lossy()
+    ));
+    
+    let mut summary_file = File::create(&summary_path)?;
+    writeln!(summary_file, "Orbweaver Performance Summary")?;
+    writeln!(summary_file, "------------------------")?;
+    writeln!(summary_file, "Input file: {}", args.input.display())?;
+    writeln!(summary_file, "Sequence length: {} bases", initial_len)?;
+    writeln!(summary_file, "Threads used: {}", rayon::current_num_threads())?;
+    writeln!(summary_file, "Total runtime: {:.2?}", start_time.elapsed())?;
+    writeln!(summary_file, "FASTA reading: {:.2?} ({:.1}%)", 
+        read_time, 
+        100.0 * read_time.as_secs_f64() / start_time.elapsed().as_secs_f64()
+    )?;
+    writeln!(summary_file, "Grammar construction: {:.2?} ({:.1}%)", 
+        grammar_time,
+        100.0 * grammar_time.as_secs_f64() / start_time.elapsed().as_secs_f64()
+    )?;
+    writeln!(summary_file, "------------------------")?;
+    writeln!(summary_file, "Rules generated: {}", rules.len())?;
+    writeln!(summary_file, "Final sequence length: {}", final_sequence.len())?;
+    writeln!(summary_file, "Compression ratio: {:.4}", final_sequence.len() as f64 / initial_len as f64)?;
+    
+    println!("Performance summary written to: {}", summary_path.display());
+    
     Ok(())
 }

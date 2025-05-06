@@ -3,6 +3,8 @@ use crate::grammar::rule::Rule;
 use crate::grammar::symbol::{Symbol, SymbolType};
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
+use rayon::prelude::*;
+use std::time::Instant;
 
 /// Builds a grammar (set of rules) by iteratively replacing 
 /// the most frequent digrams in a sequence.
@@ -23,6 +25,18 @@ pub struct GrammarBuilder {
     max_rule_count: Option<usize>,
     // Track rule depths for hierarchy analysis
     rule_depths: HashMap<usize, usize>,
+    // Performance metrics
+    metrics: PerformanceMetrics,
+}
+
+/// Track performance metrics during grammar construction
+#[derive(Debug, Default)]
+pub struct PerformanceMetrics {
+    digram_table_time: std::time::Duration,
+    step_count: usize,
+    replacement_count: usize,
+    inlining_time: std::time::Duration,
+    eviction_time: std::time::Duration,
 }
 
 impl GrammarBuilder {
@@ -37,6 +51,7 @@ impl GrammarBuilder {
             reverse_aware,
             max_rule_count: None,
             rule_depths: HashMap::new(),
+            metrics: PerformanceMetrics::default(),
         }
     }
 
@@ -62,18 +77,50 @@ impl GrammarBuilder {
     }
 
     /// Populates the digram table based on the current sequence state.
+    /// Uses parallel processing for large sequences.
     fn rebuild_digram_table(&mut self) {
-        self.digram_table = DigramTable::new(); // Clear existing table
-        if self.sequence.len() < 2 {
-            return;
+        let start = Instant::now();
+        
+        // Keep sequential for small sequences
+        if self.sequence.len() < 10000 || self.sequence.len() < 2 {
+            self.digram_table = DigramTable::new(); // Clear existing table
+            if self.sequence.len() >= 2 {
+                for i in 0..(self.sequence.len() - 1) {
+                    let sym1 = self.sequence[i];
+                    let sym2 = self.sequence[i + 1];
+                    // Use the index `i` as the position
+                    self.digram_table.add_digram(i, sym1, sym2, self.reverse_aware);
+                }
+            }
+        } else {
+            // Parallel Reduction for larger sequences
+            let reverse_aware = self.reverse_aware;
+            
+            // Use map_reduce to create local tables and merge them
+            let final_table = self.sequence
+                .par_windows(2) // Process adjacent pairs in parallel
+                .enumerate()      // Get index (position) along with the pair
+                .map(|(i, window)| {
+                    // Create a tiny local table for just this one digram
+                    let mut local_table = DigramTable::new();
+                    let sym1 = window[0];
+                    let sym2 = window[1];
+                    local_table.add_digram(i, sym1, sym2, reverse_aware);
+                    local_table // Return the local table
+                })
+                .reduce(
+                    || DigramTable::new(), // Identity element: an empty table
+                    |mut table1, table2| { // Merge function: merges table2 into table1
+                        table1.merge_with(&table2);
+                        table1 // Return the merged table
+                    }
+                );
+
+            self.digram_table = final_table;
         }
-        for i in 0..(self.sequence.len() - 1) {
-            let sym1 = self.sequence[i];
-            let sym2 = self.sequence[i + 1];
-            // Use the index `i` as the position
-            self.digram_table.add_digram(i, sym1, sym2, self.reverse_aware);
-        }
-        println!("Rebuilt digram table.");
+        
+        let elapsed = start.elapsed();
+        self.metrics.digram_table_time += elapsed;
     }
 
     /// Performs one step of grammar construction: finding and replacing the most frequent digram.
@@ -97,7 +144,8 @@ impl GrammarBuilder {
                 let (_pos, (original_sym1, original_sym2)) = occurrences[0]; // Use cloned occurrences
 
                 println!(
-                    "Step: Found digram {:?} (count {} >= {}). Creating Rule {}. Definition: {:?}, {:?}",
+                    "Step {}: Found digram {:?} (count {} >= {}). Creating Rule {}. Definition: {:?}, {:?}",
+                    self.metrics.step_count + 1,
                     canonical_key,
                     count,
                     self.min_rule_usage,
@@ -119,16 +167,22 @@ impl GrammarBuilder {
                 // Call replace_occurrences with the cloned occurrences
                 // This mutable borrow is now fine.
                 self.replace_occurrences(rule_id, canonical_key, &occurrences); 
+                
+                self.metrics.step_count += 1;
 
                 // Check if we need to evict rules
                 if let Some(max_count) = self.max_rule_count {
                     if self.rules.len() > max_count {
+                        let evict_start = Instant::now();
                         self.evict_rules(max_count);
+                        self.metrics.eviction_time += evict_start.elapsed();
                     }
                 }
                 
                 // Inline rules that are used only once
+                let inline_start = Instant::now();
                 self.inline_single_use_rules();
+                self.metrics.inlining_time += inline_start.elapsed();
 
                 // Rebuild the digram table 
                 // This mutable borrow is also fine now.
@@ -154,7 +208,7 @@ impl GrammarBuilder {
     }
     
     /// Calculate the depth of a rule based on its symbols
-    fn calculate_rule_depth(&self, rule_id: usize, rule: &Rule) -> usize {
+    fn calculate_rule_depth(&self, _rule_id: usize, rule: &Rule) -> usize {
         let mut max_child_depth = 0;
         
         for symbol in &rule.symbols {
@@ -201,9 +255,11 @@ impl GrammarBuilder {
                     if nt_rule_id == rule_id {
                         found_in_sequence = true;
                         
-                        // Expand the rule and replace it in the sequence
-                        if let Some(rule) = self.rules.get(&rule_id) {
-                            let expanded = rule.expand_for_inlining(&self.rules);
+                        // Get the rule to inline
+                        if let Some(rule) = self.rules.get(&rule_id).cloned() {
+                            // Clone the rules map before passing to avoid borrowing conflicts
+                            let rules_snapshot = self.rules.clone();
+                            let expanded = rule.expand_for_inlining(&rules_snapshot);
                             
                             // Apply the proper strand propagation
                             let mut final_expansion = Vec::new();
@@ -229,20 +285,24 @@ impl GrammarBuilder {
             }
             
             if !found_in_sequence {
-                // Also check rule definitions for usage of this rule
-                for (other_rule_id, other_rule) in self.rules.iter_mut() {
+                // We need to collect all rules that need modification first
+                let mut rule_modifications = Vec::new();
+                
+                // Find rules that use this rule
+                for (other_rule_id, other_rule) in &self.rules {
                     if *other_rule_id == rule_id || rules_to_remove.contains(other_rule_id) {
                         continue;
                     }
                     
-                    let mut rule_modified = false;
                     for (sym_idx, symbol) in other_rule.symbols.iter().enumerate() {
                         if let SymbolType::NonTerminal(nt_rule_id) = symbol.symbol_type {
                             if nt_rule_id == rule_id {
                                 // Rule is used in another rule definition
                                 // Get the rule to inline
-                                if let Some(rule_to_inline) = self.rules.get(&rule_id) {
-                                    let expanded = rule_to_inline.expand_for_inlining(&self.rules);
+                                if let Some(rule_to_inline) = self.rules.get(&rule_id).cloned() {
+                                    // Take a snapshot of the rules for expansion
+                                    let rules_snapshot = self.rules.clone();
+                                    let expanded = rule_to_inline.expand_for_inlining(&rules_snapshot);
                                     
                                     // Apply the proper strand propagation
                                     let mut final_expansion = Vec::new();
@@ -254,9 +314,8 @@ impl GrammarBuilder {
                                         final_expansion.push(exp_symbol);
                                     }
                                     
-                                    // Replace the symbol with its expansion in the other rule
-                                    other_rule.symbols.splice(sym_idx..sym_idx+1, final_expansion);
-                                    rule_modified = true;
+                                    // Store the modification to apply later
+                                    rule_modifications.push((*other_rule_id, sym_idx, final_expansion));
                                     
                                     // Mark this rule for removal
                                     rules_to_remove.insert(rule_id);
@@ -265,9 +324,12 @@ impl GrammarBuilder {
                             }
                         }
                     }
-                    
-                    if rule_modified {
-                        break;
+                }
+                
+                // Apply all the modifications
+                for (other_rule_id, sym_idx, expansion) in rule_modifications {
+                    if let Some(other_rule) = self.rules.get_mut(&other_rule_id) {
+                        other_rule.symbols.splice(sym_idx..sym_idx+1, expansion);
                     }
                 }
             }
@@ -315,6 +377,7 @@ impl GrammarBuilder {
                     id: rule.id,
                     symbols: rule.symbols.clone(),
                     usage_count: rule.usage_count,
+                    positions: rule.positions.clone(), // Include positions field
                 };
                 
                 // Replace all instances in the sequence
@@ -363,17 +426,23 @@ impl GrammarBuilder {
         }
     }
     
-    /// Inline a rule everywhere it's used in other rules
+    /// Inline a rule everywhere it's used in rules
     fn inline_rule_in_rules(&mut self, rule_id: usize, rule: &Rule) {
         // Clone rule IDs to avoid borrowing issues
         let rule_ids: Vec<usize> = self.rules.keys().copied().collect();
+        
+        // Clone the rules map to avoid borrowing conflicts
+        let rules_snapshot = self.rules.clone();
+        
+        // Store modifications to apply later
+        let mut rule_modifications = Vec::new();
         
         for other_rule_id in rule_ids {
             if other_rule_id == rule_id {
                 continue;
             }
             
-            if let Some(other_rule) = self.rules.get_mut(&other_rule_id) {
+            if let Some(other_rule) = self.rules.get(&other_rule_id) {
                 let mut changes = Vec::new();
                 
                 // Find all occurrences in this rule's symbols
@@ -381,7 +450,7 @@ impl GrammarBuilder {
                     if let SymbolType::NonTerminal(nt_rule_id) = symbol.symbol_type {
                         if nt_rule_id == rule_id {
                             // This symbol needs to be expanded
-                            let expanded = rule.expand_for_inlining(&self.rules);
+                            let expanded = rule.expand_for_inlining(&rules_snapshot);
                             
                             // Apply strand propagation
                             let mut final_expansion = Vec::new();
@@ -397,10 +466,20 @@ impl GrammarBuilder {
                     }
                 }
                 
+                if !changes.is_empty() {
+                    rule_modifications.push((other_rule_id, changes));
+                }
+            }
+        }
+        
+        // Apply all modifications after we're done collecting them
+        for (other_rule_id, changes) in rule_modifications {
+            if let Some(other_rule) = self.rules.get_mut(&other_rule_id) {
                 // Apply changes from highest index to lowest
-                changes.sort_by_key(|(idx, _)| std::cmp::Reverse(*idx));
+                let mut sorted_changes = changes;
+                sorted_changes.sort_by_key(|(idx, _)| std::cmp::Reverse(*idx));
                 
-                for (idx, expansion) in changes {
+                for (idx, expansion) in sorted_changes {
                     other_rule.symbols.splice(idx..idx+1, expansion);
                 }
             }
@@ -410,9 +489,10 @@ impl GrammarBuilder {
     /// Replaces occurrences of a digram with a new non-terminal symbol.
     /// Processes occurrences in reverse order of position to handle index shifts.
     fn replace_occurrences(&mut self, rule_id: usize, canonical_key: DigramKey, occurrences: &[(usize, (Symbol, Symbol))]) {
+        let repl_count = occurrences.len();
         println!(
             "Replacing {} occurrences of {:?} with Rule {}",
-            occurrences.len(),
+            repl_count,
             canonical_key,
             rule_id
         );
@@ -450,6 +530,8 @@ impl GrammarBuilder {
                  );
             }
         }
+        
+        self.metrics.replacement_count += replacements_done;
 
         println!(
             "Sequence length after {} replacements: {}",
@@ -470,6 +552,8 @@ impl GrammarBuilder {
 
     /// Builds the grammar from an initial byte sequence.
     pub fn build_grammar(&mut self, initial_sequence: &[u8]) -> Result<()> {
+        let start = Instant::now();
+        
         if initial_sequence.is_empty() {
             println!("Input sequence is empty. Nothing to build.");
             return Ok(());
@@ -487,13 +571,37 @@ impl GrammarBuilder {
             if !made_replacement {
                 break; // Stop when no more replacements are possible.
             }
+            
+            // Report progress periodically
+            if iteration % 10 == 0 {
+                println!("Progress: {} iterations, current sequence length: {}, rules: {}", 
+                         iteration, 
+                         self.sequence.len(),
+                         self.rules.len());
+            }
         }
 
-        println!("Grammar construction complete after {} iterations. Sequence compressed from {} to {} symbols. Rules: {}.", 
+        let elapsed = start.elapsed();
+        println!("Grammar construction complete after {} iterations in {:.2?}.", 
                  iteration, 
+                 elapsed);
+        println!("  Sequence compressed from {} to {} symbols. Rules: {}.", 
                  initial_sequence.len(), 
                  self.sequence.len(),
                  self.rules.len());
+        
+        // Report performance metrics
+        println!("Performance metrics:");
+        println!("  Digram table rebuilding: {:.2?} ({:.1}%)", 
+                 self.metrics.digram_table_time,
+                 100.0 * self.metrics.digram_table_time.as_secs_f64() / elapsed.as_secs_f64());
+        println!("  Total replacements: {}", self.metrics.replacement_count);
+        println!("  Rule inlining: {:.2?} ({:.1}%)",
+                 self.metrics.inlining_time,
+                 100.0 * self.metrics.inlining_time.as_secs_f64() / elapsed.as_secs_f64());
+        println!("  Rule eviction: {:.2?} ({:.1}%)",
+                 self.metrics.eviction_time,
+                 100.0 * self.metrics.eviction_time.as_secs_f64() / elapsed.as_secs_f64());
 
         Ok(())
     }
@@ -521,6 +629,11 @@ impl GrammarBuilder {
         
         let sum: usize = self.rule_depths.values().sum();
         sum as f64 / self.rule_depths.len() as f64
+    }
+    
+    /// Gets performance metrics
+    pub fn get_performance_metrics(&self) -> &PerformanceMetrics {
+        &self.metrics
     }
 }
 

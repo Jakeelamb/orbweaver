@@ -132,6 +132,15 @@ impl DigramTable {
          removed // Return true if something was removed
     }
 
+    /// Merges another DigramTable into this one.
+    /// Used for combining results from parallel processing.
+    pub fn merge_with(&mut self, other: &DigramTable) {
+        for (key, occurrences) in &other.occurrences {
+            let entry = self.occurrences.entry(*key).or_default();
+            entry.extend_from_slice(occurrences);
+        }
+    }
+
     // TODO: Add more complex removal logic if necessary, e.g., removing occurrences
     //       that *overlap* the replaced region (pos and pos+1).
 }

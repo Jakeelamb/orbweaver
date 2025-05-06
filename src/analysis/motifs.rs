@@ -9,11 +9,9 @@ use sysinfo::System;
 use crossbeam_channel::{bounded, Receiver, Sender};
 use memmap2::Mmap;
 use std::sync::Arc;
-use std::hash::{Hasher, BuildHasherDefault};
+use std::hash::{Hasher};
 use twox_hash::XxHash64;
 use std::cmp::Reverse;
-
-type FxHasher = BuildHasherDefault<XxHash64>;
 
 /// Analyzes a single chunk of sequence data for repeats.
 ///
