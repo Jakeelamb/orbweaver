@@ -1,9 +1,11 @@
 // Declare the library modules
 pub mod analysis;
+pub mod encode;
 pub mod fasta;
 pub mod grammar;
 pub mod io;
 pub mod utils;
+pub mod parallel;
 // pub mod tests; // Typically tests are not declared as a library module
 
 // Optional: Re-export key functions/structs if needed for easier access

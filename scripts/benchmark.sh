@@ -149,8 +149,7 @@ for threads in "${THREAD_ARRAY[@]}"; do
          "-i" "$INPUT_FASTA" 
          "-j" "$RESULTS_DIR/${BASENAME}_${threads}threads_${i}.json" 
          "--min-rule-usage" "$MIN_RULE_USAGE" 
-         "--threads" "$threads"
-         "--use-encoding")
+         "--threads" "$threads")
     
     # Add profiling if enabled
     if [ "$PROFILE" = true ]; then

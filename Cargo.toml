@@ -27,6 +27,8 @@ glob = "0.3.1" # Add glob needed by ncbi.rs
 
 # Parallelization
 rayon = "1.7.0"    # Data parallelism library
+dashmap = "5.5.3"  # Thread-safe concurrent HashMap
+num_cpus = "1.16.0" # For getting the number of available CPU cores
 
 # Database integration
 neo4rs = "0.8.0"   # Neo4j Rust driver
@@ -43,6 +45,7 @@ quick-xml = { version = "0.35", features = ["serialize"] }
 reqwest = { version = "0.12", features = ["json", "blocking"] } # Start with blocking for simplicity, can switch to async later
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+uuid = { version = "1.6.1", features = ["v4"] } # For generating unique identifiers
 # tokio = { version = "1", features = ["full"] } # Add if switching reqwest to async
 
 # Async runtime
@@ -62,6 +65,7 @@ sysinfo = "0.30"
 crossbeam-channel = "0.5"
 memmap2 = "0.9" # Add memmap2
 twox-hash = "1.6"
+union-find = "0.4"
 
 # Profiling dependencies
 pprof = { version = "0.11", features = ["flamegraph"] }

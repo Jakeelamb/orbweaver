@@ -62,7 +62,7 @@ for arg in "$@"; do
       echo "Examples:"
       echo "  ./scripts/run.sh basic --input=genome.fasta"
       echo "  ./scripts/run.sh memory --input=large_genome.fasta"
-      echo "  ./scripts/run.sh custom -- -i input.fasta --min-rule-usage 5 --use-encoding"
+      echo "  ./scripts/run.sh custom -- -i input.fasta --min-rule-usage 5"
       exit 0
       ;;
     --)
@@ -134,7 +134,6 @@ case "$WORKFLOW" in
             -i "$INPUT_FASTA"
             -j "$OUTPUT_DIR/grammar.json"
             --stats
-            --use-encoding
         )
         ;;
     "full")
@@ -147,7 +146,6 @@ case "$WORKFLOW" in
             --visualize "$OUTPUT_DIR/grammar.dot"
             --export-blocks "$OUTPUT_DIR/rules.fasta"
             --stats
-            --use-encoding
         )
         ;;
     "visual")

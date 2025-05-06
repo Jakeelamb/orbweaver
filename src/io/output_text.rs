@@ -5,10 +5,10 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
-/// Formats a Symbol for text output.
-fn format_symbol(symbol: Symbol) -> String {
+/// Convert a symbol to its text representation - without any ID information
+pub fn symbol_to_text(symbol: &Symbol) -> String {
     match symbol.symbol_type {
-        SymbolType::Terminal(base) => format!("{}{}", base as char, symbol.strand),
+        SymbolType::Terminal(base) => format!("{}{}", base.to_char(), symbol.strand),
         SymbolType::NonTerminal(rule_id) => format!("R{}{}", rule_id, symbol.strand),
     }
 }
@@ -30,7 +30,7 @@ pub fn write_grammar_text(grammar_builder: &GrammarBuilder, output_path: &Path) 
     // --- Write Final Sequence --- 
     writeln!(writer, "== Final Sequence ({} symbols) ==", final_sequence.len())
         .context("Failed to write text header")?;
-    let seq_string: Vec<String> = final_sequence.iter().map(|&s| format_symbol(s)).collect();
+    let seq_string: Vec<String> = final_sequence.iter().map(|&s| symbol_to_text(&s)).collect();
     // Write sequence, potentially wrapping lines for readability
     let max_line_len = 80;
     for chunk in seq_string.join(" ").as_bytes().chunks(max_line_len) {
@@ -48,7 +48,7 @@ pub fn write_grammar_text(grammar_builder: &GrammarBuilder, output_path: &Path) 
     sorted_rules.sort_by_key(|r| r.id);
 
     for rule in sorted_rules {
-        let symbols_str: Vec<String> = rule.symbols.iter().map(|&s| format_symbol(s)).collect();
+        let symbols_str: Vec<String> = rule.symbols.iter().map(|&s| symbol_to_text(&s)).collect();
         writeln!(
             writer,
             "R{} [Usage={}] -> {}",

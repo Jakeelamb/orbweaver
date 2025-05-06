@@ -59,7 +59,7 @@ if [ $EXIT_CODE -eq 0 ]; then
     echo ""
     # Display usage example with encoding
     echo "Example usage with memory-efficient encoding:"
-    echo "  ${BINARY_PATH} -i input.fasta -j output.json --use-encoding"
+    echo "  ${BINARY_PATH} -i input.fasta -j output.json"
     echo ""
     echo "Or use the run script for predefined workflows:"
     echo "  ./scripts/run.sh memory --input=large_genome.fasta"

@@ -19,6 +19,7 @@ Orbweaver is a command-line tool written in Rust for building and analyzing cont
 - [Development](#development)
 - [Contributing](#contributing)
 - [License](#license)
+- [Memory Efficiency Improvements](#memory-efficiency-improvements)
 
 ## Features
 
@@ -32,7 +33,7 @@ Orbweaver is a command-line tool written in Rust for building and analyzing cont
   - **DOT**: For visualization using Graphviz
   - **FASTA**: Exports expanded sequences for each rule
 - **Statistics**: Calculates compression ratio, rule depth, and other metrics
-- **Parallelization**: Utilizes multi-threading for performance on large genomes
+- **Parallelization**: Configurable multi-threading for parallel chunk processing on large genomes.
 
 ## Installation
 
@@ -115,16 +116,17 @@ orbweaver -i <input_fasta> [options]
 
 ### Grammar Construction Options
 
-- `-k, --kmer-size <INT>`: K-mer size (default: 21)
+- `-k, --kmer-size <INT>`: K-mer size used in some analysis algorithms (default: 21)
 - `--min-rule-usage <INT>`: Minimum digram frequency for rule creation (default: 2)
-- `--max-rule-count <INT>`: Maximum number of rules allowed (optional)
-- `--reverse-aware <BOOL>`: Enable reverse complement awareness (default: true)
+- `--max-rule-count <INT>`: Maximum number of rules allowed (enables rule eviction)
+- `--reverse-aware <BOOL>`: Perform reverse complement canonicalization (default: true)
 
 ### Input Processing Options
 
 - `--skip-ns <BOOL>`: Skip 'N' bases in input (default: true)
-- `--chunk-size <INT>`: Process genome in chunks of this size (optional)
+- `--chunk-size <INT>`: Process genome in chunks of this size using parallel processing (optional)
 - `--chunk-overlap <INT>`: Overlap between chunks (default: 1000)
+- `--threads <INT>`: Number of threads to use for parallel processing (default: system's thread count)
 
 For full details, run `orbweaver --help`.
 
@@ -210,6 +212,8 @@ orbweaver -i sample.fasta -j grammar.json --reverse-aware false
 ```
 
 ## Configuration
+
+(Note: Configuration via environment variables or config files is not currently implemented. Use command-line flags.)
 
 ### Environment Variables
 
@@ -299,12 +303,37 @@ Please ensure your code follows the project's coding style and includes appropri
 
 ### Development Roadmap
 
-- [ ] Implement chunking for processing large genomes
-- [ ] Add rule eviction strategy for limiting memory usage
+- [x] Implement chunking for processing large genomes
+- [x] Add rule eviction strategy for limiting memory usage
 - [ ] Support multiple sequences in FASTA files
 - [ ] Improve GFA output format
 - [ ] Add benchmarking tools
 
 ## License
 
-This project is licensed under the MIT License - see the LICENSE file for details. 
+This project is licensed under the MIT License - see the LICENSE file for details.
+
+### Memory Efficiency Improvements
+
+This project now implements three major memory efficiency optimizations:
+
+1. **Streaming Input Processing**: Instead of loading entire FASTA files into memory, sequences can now be processed in chunks using a streaming approach, dramatically reducing memory footprint for large genomes.
+
+2. **2-Bit Encoding Optimization**: DNA sequences are efficiently stored using 2-bit encoding (A=00, C=01, G=10, T=11), reducing memory usage by up to 75% compared to ASCII storage.
+
+3. **Rule Eviction Strategy**: A priority queue-based approach now tracks usage of grammar rules and can evict least-used rules when memory constraints are reached, ensuring bounded memory usage even for complex sequences.
+
+To use these memory optimizations:
+
+```bash
+# Use all memory optimization techniques
+orbweaver -i large_genome.fasta --streaming --max-rule-count 5000
+
+# Just use streaming mode with default settings
+orbweaver -i large_genome.fasta --streaming
+
+# Just use rule eviction with a limit of 10,000 rules
+orbweaver -i large_genome.fasta --max-rule-count 10000
+```
+
+These improvements allow processing of large genomes (>1GB) with controlled memory usage. 

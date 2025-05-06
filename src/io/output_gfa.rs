@@ -45,8 +45,8 @@ pub fn write_grammar_gfa(grammar_builder: &GrammarBuilder, output_path: &Path) -
             let sym2 = rule.symbols[1];
             
             // Get segment IDs and orientations for the link
-            let (seg1_id, seg1_orient) = get_segment_id_and_orientation(sym1);
-            let (seg2_id, seg2_orient) = get_segment_id_and_orientation(sym2);
+            let (seg1_id, seg1_orient) = get_segment_id_and_orientation(&sym1);
+            let (seg2_id, seg2_orient) = get_segment_id_and_orientation(&sym2);
 
             // L <sid1> <orient1> <sid2> <orient2> <overlap> [tags...]
             // Link 1: Connects start of rule to first symbol
@@ -83,14 +83,17 @@ pub fn write_grammar_gfa(grammar_builder: &GrammarBuilder, output_path: &Path) -
     Ok(())
 }
 
-/// Helper to get a segment ID and orientation string for a symbol.
-/// Terminals could be represented as segments themselves (e.g., 'T_A', 'T_C'), 
-/// or we could skip links involving terminals if only rules are segments.
-/// For now, let terminals be represented by their base char.
-fn get_segment_id_and_orientation(symbol: Symbol) -> (String, char) {
+/// Determine the ID and orientation for a symbol in GFA
+fn get_segment_id_and_orientation(symbol: &Symbol) -> (String, char) {
     match symbol.symbol_type {
-        SymbolType::Terminal(base) => (format!("T_{}", base as char), symbol.strand), // e.g., T_A, T_C
-        SymbolType::NonTerminal(rule_id) => (rule_id.to_string(), symbol.strand),
+        SymbolType::Terminal(base) => (
+            format!("T_{}", base.to_char()), // Segment ID for terminal, e.g., T_A
+            symbol.strand.to_char()       // Orientation
+        ),
+        SymbolType::NonTerminal(rule_id) => (
+            format!("R{}", rule_id),        // Segment ID for non-terminal
+            symbol.strand.to_char()       // Orientation
+        )
     }
 }
 
@@ -112,7 +115,7 @@ fn reconstruct_rule_sequence(rule_id: usize, all_rules: &HashMap<usize, Rule>) -
     ) -> Result<()> {
         match symbol.symbol_type {
             SymbolType::Terminal(base) => {
-                current_sequence.push(base as char);
+                current_sequence.push(base.to_char());
             }
             SymbolType::NonTerminal(sub_rule_id) => {
                 if !visited_stack.insert(sub_rule_id) {

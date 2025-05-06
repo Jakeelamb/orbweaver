@@ -1,4 +1,4 @@
-use crate::grammar::symbol::{Symbol, SymbolType};
+use crate::grammar::symbol::{Symbol, SymbolType, Direction};
 // use std::fmt; // Remove unused import
 use serde::{Serialize, Deserialize}; // Import both Serialize and Deserialize
 use std::collections::HashMap;
@@ -20,6 +20,9 @@ pub struct Rule {
     
     /// The original positions where this rule was found (for reporting)
     pub positions: Vec<usize>,
+    
+    /// The hierarchical depth of this rule in the grammar (for analysis)
+    pub depth: Option<usize>,
 }
 
 impl Rule {
@@ -30,6 +33,7 @@ impl Rule {
             symbols: vec![symbol1, symbol2],
             usage_count: 0, // Initial usage count is 0, incremented when used
             positions: Vec::new(), // Initialize empty positions
+            depth: None,
         }
     }
     
@@ -60,9 +64,13 @@ impl Rule {
                         // Apply proper strand propagation
                         for exp_symbol in expanded {
                             let mut new_symbol = exp_symbol;
-                            if symbol.strand == '-' {
+                            if symbol.strand == Direction::Reverse {
                                 // Flip the strand when expanding a rule referenced with a negative strand
-                                new_symbol.strand = if new_symbol.strand == '+' { '-' } else { '+' };
+                                new_symbol.strand = if new_symbol.strand == Direction::Forward { 
+                                    Direction::Reverse 
+                                } else { 
+                                    Direction::Forward 
+                                };
                             }
                             result.push(new_symbol);
                         }
@@ -93,18 +101,46 @@ impl Rule {
         // Set a reasonable recursion limit
         self.expand_recursive(rule_map, 100)
     }
+    
+    /// Increment the usage count of this rule.
+    pub fn increment_usage(&mut self) {
+        self.usage_count += 1;
+    }
+    
+    /// Decrement the usage count of this rule.
+    pub fn decrement_usage(&mut self) {
+        if self.usage_count > 0 {
+            self.usage_count -= 1;
+        }
+    }
+    
+    /// Check if this rule is used more than a given threshold.
+    pub fn is_used_enough(&self, threshold: usize) -> bool {
+        self.usage_count >= threshold
+    }
+    
+    /// Set the depth of this rule in the grammar hierarchy.
+    pub fn set_depth(&mut self, depth: usize) {
+        self.depth = Some(depth);
+    }
+    
+    /// Add a position where this rule appears in the sequence.
+    pub fn add_position(&mut self, position: usize) {
+        self.positions.push(position);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::grammar::symbol::Symbol;
+    use crate::grammar::symbol::{Symbol, Direction};
+    use crate::encode::dna_2bit::EncodedBase;
 
     #[test]
     fn test_rule_creation() {
-        let s1 = Symbol::terminal(0, b'A', '+');
-        let s2 = Symbol::non_terminal(1, 100, '-');
-        let rule = Rule::new(101, s1, s2); // Rule 101 replaces digram (s1, s2)
+        let s1 = Symbol::terminal(0, EncodedBase(0), Direction::Forward);
+        let s2 = Symbol::non_terminal(1, 100, Direction::Reverse);
+        let rule = Rule::new(101, s1, s2);
 
         assert_eq!(rule.id, 101);
         assert_eq!(rule.usage_count, 0);

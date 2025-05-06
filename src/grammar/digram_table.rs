@@ -1,11 +1,11 @@
-use crate::fasta::encoder::reverse_complement;
-use crate::grammar::symbol::{Symbol, SymbolType};
-use std::collections::HashMap;
+use crate::grammar::symbol::{Symbol, SymbolType, Direction};
+use crate::encode::dna_2bit::EncodedBase;
+use dashmap;
+use rayon::prelude::*;
 
-// Represents a digram as a tuple of Symbol types and their strands.
-// We might hash based on the symbol types and strands primarily for canonicalization lookup.
-// The actual Symbol instances with their IDs will be needed later for replacement.
-pub type DigramKey = ((SymbolType, char), (SymbolType, char));
+/// The key used for indexing digrams in the digram table
+/// Format: ((first_symbol_type, first_strand), (second_symbol_type, second_strand))
+pub type DigramKey = ((SymbolType, Direction), (SymbolType, Direction));
 
 /// Stores digram occurrences and handles canonicalization.
 #[derive(Debug, Default)]
@@ -13,12 +13,14 @@ pub struct DigramTable {
     // Stores occurrences: Canonical Digram Key -> List of (position, original_digram_instance)
     // Position usually refers to the index of the first symbol in the sequence.
     // Storing the original Symbol pair allows replacement later.
-    occurrences: HashMap<DigramKey, Vec<(usize, (Symbol, Symbol))>>,
+    occurrences: dashmap::DashMap<DigramKey, Vec<(usize, (Symbol, Symbol))>>,
 }
 
 impl DigramTable {
     pub fn new() -> Self {
-        Default::default()
+        Self {
+            occurrences: dashmap::DashMap::new(),
+        }
     }
 
     /// Adds a digram occurrence observed at a given position.
@@ -39,6 +41,42 @@ impl DigramTable {
             .push((pos, original_digram_instance));
     }
 
+    /// Add digrams in parallel from a sequence
+    pub fn add_digrams_from_sequence(&mut self, sequence: &[Symbol], reverse_aware: bool) {
+        if sequence.len() < 2 {
+            return;
+        }
+
+        if sequence.len() < 10000 {
+            // For small sequences, process sequentially to avoid parallel overhead
+            for i in 0..(sequence.len() - 1) {
+                let sym1 = sequence[i];
+                let sym2 = sequence[i + 1];
+                self.add_digram(i, sym1, sym2, reverse_aware);
+            }
+        } else {
+            // For large sequences, use parallel processing with rayon
+            sequence.par_windows(2)
+                .enumerate()
+                .for_each(|(i, window)| {
+                    let sym1 = window[0];
+                    let sym2 = window[1];
+                    let key = self.get_digram_key(sym1, sym2);
+                    let canonical_key = if reverse_aware {
+                        self.canonicalize_digram_key(key)
+                    } else {
+                        key
+                    };
+                    
+                    // Thread-safe concurrent update using DashMap
+                    self.occurrences
+                        .entry(canonical_key)
+                        .or_default()
+                        .push((i, (sym1, sym2)));
+                });
+        }
+    }
+
     /// Creates the key representation for a digram.
     fn get_digram_key(&self, first: Symbol, second: Symbol) -> DigramKey {
         ((first.symbol_type, first.strand), (second.symbol_type, second.strand))
@@ -55,26 +93,25 @@ impl DigramTable {
                 // Only canonicalize if they are on the same strand initially
                 if strand1 == strand2 {
                     let forward_bases = vec![base1, base2];
-                    let revcomp_bases = reverse_complement(&forward_bases);
+                    let revcomp_bases_enc: Vec<EncodedBase> = forward_bases.iter().rev().map(|b| b.revcomp()).collect();
 
                     // Special case for AC/TG pair
                     // AC (on + strand) is canonical
-                    if (base1 == b'A' && base2 == b'C' && strand1 == '+') ||
-                       (base1 == b'T' && base2 == b'G' && strand1 == '+') {
-                        return ((SymbolType::Terminal(b'A'), '+'), (SymbolType::Terminal(b'C'), '+'));
+                    if (base1 == EncodedBase(0) && base2 == EncodedBase(1) && strand1 == Direction::Forward) ||
+                       (base1 == EncodedBase(3) && base2 == EncodedBase(2) && strand1 == Direction::Forward) {
+                        return ((SymbolType::Terminal(EncodedBase(0)), Direction::Forward), (SymbolType::Terminal(EncodedBase(1)), Direction::Forward));
                     }
 
-                    // For general cases, compare lexicographically
-                    if forward_bases <= revcomp_bases {
+                    // For general cases, compare lexicographically using EncodedBase
+                    if forward_bases <= revcomp_bases_enc {
                         // Forward is canonical or equal
                         key 
                     } else {
                         // Reverse complement is canonical
-                        // Need to flip the strand representation as well.
-                        let flipped_strand = if strand1 == '+' { '-' } else { '+' };
+                        let flipped_strand = strand1.flip();
                         (
-                            (SymbolType::Terminal(revcomp_bases[0]), flipped_strand),
-                            (SymbolType::Terminal(revcomp_bases[1]), flipped_strand),
+                            (SymbolType::Terminal(revcomp_bases_enc[0]), flipped_strand),
+                            (SymbolType::Terminal(revcomp_bases_enc[1]), flipped_strand),
                         )
                     }
                 } else {
@@ -92,78 +129,104 @@ impl DigramTable {
 
     /// Finds the most frequent canonical digram.
     /// Returns Option<(CanonicalDigramKey, count, Vec<(position, original_instance)>)> 
-    pub fn find_most_frequent_digram(&self) -> Option<(DigramKey, usize, &Vec<(usize, (Symbol, Symbol))>)> {
-        self.occurrences
-            .iter()
-            .max_by(|a, b| {
-                let count_a = a.1.len();
-                let count_b = b.1.len();
-                // Compare counts first
-                count_a.cmp(&count_b)
-                 // Add tie-breaking based on the canonical key if needed (e.g., lexicographical)
-                 // .then_with(|| a.0.cmp(&b.0)) // Requires Ord on SymbolType/char, complex
-            })
-            .map(|(key, occurrences)| (*key, occurrences.len(), occurrences))
+    pub fn find_most_frequent_digram(&self) -> Option<(DigramKey, usize, Vec<(usize, (Symbol, Symbol))>)> {
+        let mut max_key = None;
+        let mut max_count = 0;
+        let mut max_occurrences = Vec::new();
+
+        // Iterate over entries and find the one with the most occurrences
+        for entry in self.occurrences.iter() {
+            let key = *entry.key();
+            let occurrences = entry.value();
+            let count = occurrences.len();
+
+            if count > max_count {
+                max_key = Some(key);
+                max_count = count;
+                max_occurrences = occurrences.clone();
+            }
+        }
+
+        max_key.map(|key| (key, max_count, max_occurrences))
     }
 
     /// Removes occurrences associated with a specific digram instance (by position).
     /// Used after a digram is replaced by a rule.
     /// Needs careful handling if multiple digrams overlap the same position.
     pub fn remove_occurrence(&mut self, canonical_key: &DigramKey, position_to_remove: usize) -> bool {
-         let mut removed = false;
-         let mut remove_key_after = false;
-
-         if let Some(occurrences) = self.occurrences.get_mut(canonical_key) {
+        if let Some(mut entry) = self.occurrences.get_mut(canonical_key) {
+            let occurrences = entry.value_mut();
             let initial_len = occurrences.len();
+            
             // Remove occurrences starting at the specified position.
             occurrences.retain(|(pos, _)| *pos != position_to_remove);
-            removed = occurrences.len() < initial_len; // Check if anything was removed
-            // Check if the vec is now empty *after* retain has finished.
+            let removed = occurrences.len() < initial_len; // Check if anything was removed
+            
+            // If the vector became empty, remove the entry
             if occurrences.is_empty() {
-                 remove_key_after = true;
+                drop(entry); // Drop the mutable reference first
+                self.occurrences.remove(canonical_key);
             }
-         } // Mutable borrow of occurrences ends here.
-
-         // Remove the key from the outer map if the vector became empty.
-         if remove_key_after {
-             self.occurrences.remove(canonical_key);
-         }
-
-         removed // Return true if something was removed
+            
+            removed
+        } else {
+            false
+        }
     }
 
     /// Merges another DigramTable into this one.
     /// Used for combining results from parallel processing.
     pub fn merge_with(&mut self, other: &DigramTable) {
-        for (key, occurrences) in &other.occurrences {
-            let entry = self.occurrences.entry(*key).or_default();
-            entry.extend_from_slice(occurrences);
+        for entry in other.occurrences.iter() {
+            let key = *entry.key();
+            let other_occurrences = entry.value().clone();
+            
+            // Get or create the entry in this table
+            if let Some(mut entry) = self.occurrences.get_mut(&key) {
+                // Append the occurrences
+                entry.value_mut().extend_from_slice(&other_occurrences);
+            } else {
+                // Insert a new entry
+                self.occurrences.insert(key, other_occurrences);
+            }
         }
     }
 
-    // TODO: Add more complex removal logic if necessary, e.g., removing occurrences
-    //       that *overlap* the replaced region (pos and pos+1).
-}
+    /// Get the number of distinct digrams in the table
+    pub fn len(&self) -> usize {
+        self.occurrences.len()
+    }
 
+    /// Check if the table is empty
+    pub fn is_empty(&self) -> bool {
+        self.occurrences.is_empty()
+    }
+
+    /// Clear all entries from the table
+    pub fn clear(&mut self) {
+        self.occurrences.clear();
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*; // Imports items from the parent module (digram_table.rs)
-    use crate::grammar::symbol::Symbol; // Need Symbol for tests
+    use crate::grammar::symbol::{Symbol, Direction, SymbolType}; // Ensure Direction is imported
+    use crate::encode::dna_2bit::EncodedBase; // Import EncodedBase
 
     #[test]
     fn test_add_and_find_digram() {
         let mut table = DigramTable::new();
-        let s1 = Symbol::terminal(0, b'A', '+');
-        let s2 = Symbol::terminal(1, b'C', '+');
-        let s3 = Symbol::terminal(2, b'G', '+');
+        let s1 = Symbol::terminal(0, EncodedBase(0), Direction::Forward); // A+
+        let s2 = Symbol::terminal(1, EncodedBase(1), Direction::Forward); // C+
+        let s3 = Symbol::terminal(2, EncodedBase(2), Direction::Forward); // G+
 
         table.add_digram(0, s1, s2, true); // AC @ 0
         table.add_digram(1, s2, s3, true); // CG @ 1
         table.add_digram(5, s1, s2, true); // AC @ 5
 
-        let key_ac = ((SymbolType::Terminal(b'A'), '+'), (SymbolType::Terminal(b'C'), '+'));
-        let key_cg = ((SymbolType::Terminal(b'C'), '+'), (SymbolType::Terminal(b'G'), '+'));
+        let key_ac = ((SymbolType::Terminal(EncodedBase(0)), Direction::Forward), (SymbolType::Terminal(EncodedBase(1)), Direction::Forward));
+        let key_cg = ((SymbolType::Terminal(EncodedBase(1)), Direction::Forward), (SymbolType::Terminal(EncodedBase(2)), Direction::Forward));
 
         assert_eq!(table.occurrences.len(), 2);
         assert_eq!(table.occurrences.get(&key_ac).unwrap().len(), 2);
@@ -183,19 +246,19 @@ mod tests {
         let mut table = DigramTable::new();
         
         // AC -> AC (canonical)
-        let s_a = Symbol::terminal(0, b'A', '+');
-        let s_c = Symbol::terminal(1, b'C', '+');
+        let s_a = Symbol::terminal(0, EncodedBase(0), Direction::Forward); // A+
+        let s_c = Symbol::terminal(1, EncodedBase(1), Direction::Forward); // C+
         // TG -> CA (revcomp) -> AC (canonical)
-        let s_t = Symbol::terminal(2, b'T', '+');
-        let s_g = Symbol::terminal(3, b'G', '+');
+        let s_t = Symbol::terminal(2, EncodedBase(3), Direction::Forward); // T+
+        let s_g = Symbol::terminal(3, EncodedBase(2), Direction::Forward); // G+
 
-        table.add_digram(0, s_a, s_c, true); // AC @ 0. Key: ((T(A),+),(T(C),+)). Canonical: ((T(A),+),(T(C),+))
-        table.add_digram(5, s_t, s_g, true); // TG @ 5. Key: ((T(T),+),(T(G),+)). RevComp: CA. Canonical: AC -> ((T(A),+),(T(C),+))
+        table.add_digram(0, s_a, s_c, true); // AC @ 0.
+        table.add_digram(5, s_t, s_g, true); // TG @ 5.
 
-        let key_ac = ((SymbolType::Terminal(b'A'), '+'), (SymbolType::Terminal(b'C'), '+'));
+        let key_ac = ((SymbolType::Terminal(EncodedBase(0)), Direction::Forward), (SymbolType::Terminal(EncodedBase(1)), Direction::Forward));
 
         // Both AC and TG should map to the canonical AC key
-        assert_eq!(table.occurrences.len(), 1); 
+        assert_eq!(table.occurrences.len(), 1);
         assert!(table.occurrences.contains_key(&key_ac));
         assert_eq!(table.occurrences.get(&key_ac).unwrap().len(), 2);
 
@@ -214,16 +277,16 @@ mod tests {
      #[test]
     fn test_no_reverse_aware() {
         let mut table = DigramTable::new();
-        let s_a = Symbol::terminal(0, b'A', '+');
-        let s_c = Symbol::terminal(1, b'C', '+');
-        let s_t = Symbol::terminal(2, b'T', '+');
-        let s_g = Symbol::terminal(3, b'G', '+');
+        let s_a = Symbol::terminal(0, EncodedBase(0), Direction::Forward); // A+
+        let s_c = Symbol::terminal(1, EncodedBase(1), Direction::Forward); // C+
+        let s_t = Symbol::terminal(2, EncodedBase(3), Direction::Forward); // T+
+        let s_g = Symbol::terminal(3, EncodedBase(2), Direction::Forward); // G+
 
         table.add_digram(0, s_a, s_c, false); // AC, reverse_aware=false
         table.add_digram(5, s_t, s_g, false); // TG, reverse_aware=false
 
-        let key_ac = ((SymbolType::Terminal(b'A'), '+'), (SymbolType::Terminal(b'C'), '+'));
-        let key_tg = ((SymbolType::Terminal(b'T'), '+'), (SymbolType::Terminal(b'G'), '+'));
+        let key_ac = ((SymbolType::Terminal(EncodedBase(0)), Direction::Forward), (SymbolType::Terminal(EncodedBase(1)), Direction::Forward));
+        let key_tg = ((SymbolType::Terminal(EncodedBase(3)), Direction::Forward), (SymbolType::Terminal(EncodedBase(2)), Direction::Forward));
 
         // Should have two separate entries
         assert_eq!(table.occurrences.len(), 2);
@@ -236,14 +299,14 @@ mod tests {
     #[test]
     fn test_remove_occurrence() {
         let mut table = DigramTable::new();
-        let s1 = Symbol::terminal(0, b'A', '+');
-        let s2 = Symbol::terminal(1, b'C', '+');
+        let s1 = Symbol::terminal(0, EncodedBase(0), Direction::Forward); // A+
+        let s2 = Symbol::terminal(1, EncodedBase(1), Direction::Forward); // C+
 
         table.add_digram(0, s1, s2, true); // AC @ 0
         table.add_digram(5, s1, s2, true); // AC @ 5
         table.add_digram(10, s1, s2, true); // AC @ 10
         
-        let key_ac = ((SymbolType::Terminal(b'A'), '+'), (SymbolType::Terminal(b'C'), '+'));
+        let key_ac = ((SymbolType::Terminal(EncodedBase(0)), Direction::Forward), (SymbolType::Terminal(EncodedBase(1)), Direction::Forward));
 
         assert_eq!(table.occurrences.get(&key_ac).unwrap().len(), 3);
 
@@ -270,15 +333,15 @@ mod tests {
     fn test_mixed_and_nonterminal_digrams() {
         // Test that non-terminal digrams are added but not canonicalized by revcomp
         let mut table = DigramTable::new();
-        let s_a = Symbol::terminal(0, b'A', '+');
-        let s_nt1 = Symbol::non_terminal(1, 100, '+');
-        let s_nt2 = Symbol::non_terminal(2, 101, '-');
+        let s_a = Symbol::terminal(0, EncodedBase(0), Direction::Forward); // A+
+        let s_nt1 = Symbol::non_terminal(1, 100, Direction::Forward); // R100+
+        let s_nt2 = Symbol::non_terminal(2, 101, Direction::Reverse); // R101-
 
         table.add_digram(0, s_a, s_nt1, true); // A-R100(+) @ 0
         table.add_digram(1, s_nt1, s_nt2, true); // R100(+)-R101(-) @ 1
 
-        let key_a_nt1 = ((SymbolType::Terminal(b'A'), '+'), (SymbolType::NonTerminal(100), '+'));
-        let key_nt1_nt2 = ((SymbolType::NonTerminal(100), '+'), (SymbolType::NonTerminal(101), '-'));
+        let key_a_nt1 = ((SymbolType::Terminal(EncodedBase(0)), Direction::Forward), (SymbolType::NonTerminal(100), Direction::Forward));
+        let key_nt1_nt2 = ((SymbolType::NonTerminal(100), Direction::Forward), (SymbolType::NonTerminal(101), Direction::Reverse));
 
         assert_eq!(table.occurrences.len(), 2);
         assert!(table.occurrences.contains_key(&key_a_nt1));

@@ -521,6 +521,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ef8ae57c4978a2acd8b869ce6b9ca1dfe817bff704c220209fdef2c0b75a01b9"
 
 [[package]]
+name = "dashmap"
+version = "5.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "978747c1d849a7d2ee5e8adc0159961c48fb7e5db2f06af6723b80123bb53856"
+dependencies = [
+ "cfg-if",
+ "hashbrown 0.14.5",
+ "lock_api",
+ "once_cell",
+ "parking_lot_core",
+]
+
+[[package]]
 name = "deadpool"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -914,6 +927,12 @@ dependencies = [
 
 [[package]]
 name = "hashbrown"
+version = "0.14.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e5274423e17b7c9fc20b6e7e208532f9b19825d82dfd615708b70edd83df41f1"
+
+[[package]]
+name = "hashbrown"
 version = "0.15.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "84b26c544d002229e640969970a2e74021aadf6e2f96372b9c58eff97de08eb3"
@@ -1200,7 +1219,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cea70ddb795996207ad57735b50c5982d8844f38ba9ee5f1aedcfb708a2aa11e"
 dependencies = [
  "equivalent",
- "hashbrown",
+ "hashbrown 0.15.3",
 ]
 
 [[package]]
@@ -1697,12 +1716,14 @@ dependencies = [
  "clap",
  "crossbeam-channel",
  "csv",
+ "dashmap",
  "dotenv",
  "env_logger",
  "glob",
  "log",
  "memmap2 0.9.5",
  "neo4rs",
+ "num_cpus",
  "petgraph 0.8.1",
  "pprof",
  "predicates",
@@ -1719,6 +1740,8 @@ dependencies = [
  "tikv-jemallocator",
  "tokio",
  "twox-hash",
+ "union-find",
+ "uuid",
  "vbinseq",
 ]
 
@@ -1792,7 +1815,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7a98c6720655620a521dcc722d0ad66cd8afd5d86e34a89ef691c50b7b24de06"
 dependencies = [
  "fixedbitset 0.5.7",
- "hashbrown",
+ "hashbrown 0.15.3",
  "indexmap",
  "serde",
 ]
@@ -2853,6 +2876,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5a5f39404a5da50712a4c1eecf25e90dd62b613502b7e925fd4e4d19b5c96512"
 
 [[package]]
+name = "union-find"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "039142448432983c34b64739f8526f8f233a1eec7a66e61b6ab29acfa781194e"
+
+[[package]]
 name = "untrusted"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2892,6 +2921,9 @@ name = "uuid"
 version = "1.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "458f7a779bf54acc9f347480ac654f68407d3aab21269a6e3c9f922acd9e2da9"
+dependencies = [
+ "getrandom 0.3.2",
+]
 
 [[package]]
 name = "vbinseq"

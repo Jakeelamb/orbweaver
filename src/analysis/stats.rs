@@ -1,6 +1,6 @@
-use crate::grammar::builder::GrammarBuilder;
-use crate::grammar::rule::Rule;
 use crate::grammar::symbol::SymbolType;
+use crate::grammar::rule::Rule;
+use crate::grammar::engine::Grammar;
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 
@@ -56,53 +56,81 @@ fn get_rule_definition_length(rule_id: usize, all_rules: &HashMap<usize, Rule>) 
     all_rules.get(&rule_id).map_or(0, |r| r.symbols.len())
 }
 
-/// Calculates and prints statistics about the generated grammar.
-pub fn calculate_and_print_stats(
-    grammar_builder: &GrammarBuilder,
-    initial_sequence_len: usize,
-) -> Result<()> {
-    println!("Calculating Grammar Statistics...");
-
-    let (final_sequence, rules) = grammar_builder.get_grammar();
-    let num_rules = rules.len();
-    let final_seq_len = final_sequence.len();
-
-    // Calculate Max Rule Depth
-    let mut max_depth = 0;
-    let mut depth_cache: HashMap<usize, Option<usize>> = HashMap::new();
-    for rule_id in rules.keys() {
-        let mut visited_stack = HashSet::new();
-        match get_rule_depth(*rule_id, rules, &mut depth_cache, &mut visited_stack) {
-            Ok(depth) => max_depth = max_depth.max(depth),
-            Err(e) => {
-                // Report cycle and continue, max_depth will be based on non-cyclic paths
-                eprintln!("Warning calculating depth: {}", e);
-            }
+/// Calculate and print statistics about the generated grammar
+pub fn calculate_and_print_stats(grammar: &Grammar) -> Result<()> {
+    let (sequence, rules) = (&grammar.sequence, &grammar.rules);
+    
+    // Initialize counters
+    let mut total_terminals = 0;
+    let mut total_non_terminals = 0;
+    let mut rule_usage_stats = HashMap::new();
+    let mut rule_depths = HashMap::new();
+    let mut rule_lengths = HashMap::new();
+    
+    // Count terminal and non-terminal symbols in the final sequence
+    for symbol in sequence {
+        match symbol.symbol_type {
+            SymbolType::Terminal(_) => total_terminals += 1,
+            SymbolType::NonTerminal(_) => total_non_terminals += 1,
         }
     }
-
-    // Calculate Compression Ratio Component: Sum of Rule Definition Lengths
-    let total_rule_def_len: usize = rules.keys().map(|&id| get_rule_definition_length(id, rules)).sum();
     
-    // Size of compressed representation = final sequence + rule definitions
-    let compressed_size = final_seq_len + total_rule_def_len;
-    let compression_ratio = if initial_sequence_len > 0 {
-        compressed_size as f64 / initial_sequence_len as f64
+    // Analyze rules
+    let mut total_rule_size = 0;
+    for (rule_id, rule) in rules {
+        // Count usage
+        rule_usage_stats.insert(*rule_id, rule.usage_count);
+        
+        // Count rule length (number of symbols)
+        let rule_len = rule.symbols.len();
+        rule_lengths.insert(*rule_id, rule_len);
+        total_rule_size += rule_len;
+        
+        // Get rule depth
+        rule_depths.insert(*rule_id, rule.depth.unwrap_or(0));
+    }
+    
+    // Calculate some derived statistics
+    let total_rules = rules.len();
+    let avg_rule_length = if total_rules > 0 {
+        total_rule_size as f64 / total_rules as f64
     } else {
-        0.0 // Avoid division by zero
+        0.0
     };
-
-    // --- Print Stats --- 
-    println!("----------------------------------------");
-    println!("Grammar Statistics:");
-    println!("  Initial Sequence Length: {}", initial_sequence_len);
-    println!("  Final Sequence Length:   {}", final_seq_len);
-    println!("  Number of Rules:         {}", num_rules);
-    println!("  Max Rule Depth:          {}", max_depth);
-    println!("  Sum Rule Def Lengths:  {}", total_rule_def_len);
-    println!("  Compressed Size:       {}", compressed_size);
-    println!("  Compression Ratio:     {}", compression_ratio);
-    println!("----------------------------------------");
-
+    
+    let avg_rule_usage = if total_rules > 0 {
+        rule_usage_stats.values().sum::<usize>() as f64 / total_rules as f64
+    } else {
+        0.0
+    };
+    
+    let max_depth = grammar.max_depth;
+    
+    // Print statistics
+    println!("\n--- Grammar Statistics ---");
+    println!("Total number of rules: {}", total_rules);
+    println!("Final sequence statistics:");
+    println!("  Terminal symbols: {}", total_terminals);
+    println!("  Non-terminal symbols (rule references): {}", total_non_terminals);
+    println!("  Total length: {}", total_terminals + total_non_terminals);
+    println!("Rule statistics:");
+    println!("  Average rule length: {:.2} symbols", avg_rule_length);
+    println!("  Average rule usage: {:.2} times", avg_rule_usage);
+    println!("  Maximum rule depth: {}", max_depth);
+    
+    // Find most frequently used rules
+    if !rule_usage_stats.is_empty() {
+        let mut usage_vec: Vec<(&usize, &usize)> = rule_usage_stats.iter().collect();
+        usage_vec.sort_by(|a, b| b.1.cmp(a.1));
+        
+        println!("\nTop 5 most frequently used rules:");
+        for (i, (rule_id, usage)) in usage_vec.iter().take(5).enumerate() {
+            println!("  {}. Rule {} - used {} times, depth {}, length {} symbols",
+                i + 1, rule_id, usage, 
+                rule_depths.get(rule_id).unwrap_or(&0),
+                rule_lengths.get(rule_id).unwrap_or(&0));
+        }
+    }
+    
     Ok(())
 } 
