@@ -28,6 +28,8 @@
 *.svg
 *out
 *err
+*.data 
+*.data.old
 # Environment variables
 .env
 

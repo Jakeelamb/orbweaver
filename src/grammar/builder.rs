@@ -1071,35 +1071,46 @@ impl GrammarBuilder {
     fn replace_digram_occurrences(
         &mut self,
         rule_id: usize,
-        canonical_key: DigramKey,
+        _canonical_key: DigramKey, // This parameter is no longer needed but kept for signature compatibility
         occurrences: &[(usize, (Symbol, Symbol))]
     ) -> Result<()> {
-        if occurrences.is_empty() {
+        if occurrences.is_empty() || self.sequence.is_empty() {
             return Ok(());
         }
-        
-        // Sort occurrences by position (in descending order)
-        // This ensures that replacements don't invalidate later positions
-        let mut sorted_occurrences = occurrences.to_vec();
-        sorted_occurrences.sort_by(|a, b| b.0.cmp(&a.0));
-        
-        // Process each occurrence and replace it with a non-terminal
-        for (pos, original_digram) in &sorted_occurrences {
-            if *pos + 1 >= self.sequence.len() {
-                continue; // Skip invalid positions
-            }
-            
-            // Determine the strand from the first symbol of the original digram
-            let first_symbol_strand = original_digram.0.strand;
 
-            // Create a new non-terminal symbol using the determined strand
-            let non_terminal = Symbol::non_terminal(*pos, rule_id, first_symbol_strand);
-            
-            // Replace the two symbols with one non-terminal
-            self.sequence.remove(*pos + 1);
-            self.sequence[*pos] = non_terminal;
+        // 1. Create a map of positions to replace and the required strand for the new symbol.
+        //    We only need the position and the strand of the first symbol in the original digram.
+        let replacement_info: std::collections::HashMap<usize, Direction> = occurrences.iter()
+            .map(|(pos, original_digram)| (*pos, original_digram.0.strand))
+            .collect();
+
+        // 2. Build the new sequence.
+        let mut new_sequence = Vec::with_capacity(self.sequence.len().saturating_sub(occurrences.len()));
+        let mut i = 0;
+        let old_len = self.sequence.len();
+
+        while i < old_len {
+            // Check if the current position is marked for replacement.
+            if let Some(&strand) = replacement_info.get(&i) {
+                // It's a replacement site. Add the new non-terminal symbol.
+                // Use the original position 'i' as the ID for the new symbol, consistent with previous logic.
+                let non_terminal = Symbol::non_terminal(i, rule_id, strand);
+                new_sequence.push(non_terminal);
+                // Skip the next symbol as well, since we replaced a digram (two symbols).
+                i += 2;
+            } else {
+                // Not a replacement site. Copy the existing symbol.
+                // Check bounds just in case, although `i < old_len` should guarantee this.
+                if i < self.sequence.len() {
+                     new_sequence.push(self.sequence[i]);
+                }
+                i += 1;
+            }
         }
-        
+
+        // 3. Replace the old sequence with the new one.
+        self.sequence = new_sequence;
+
         Ok(())
     }
 }
