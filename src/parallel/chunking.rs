@@ -6,6 +6,7 @@ use rayon::prelude::*;
 use log::debug;
 use std::hash::{Hash, Hasher};
 use std::collections::hash_map::DefaultHasher;
+use sysinfo::{System, SystemExt};
 
 /// Configuration for chunking a sequence
 #[derive(Debug, Clone)]
@@ -26,6 +27,8 @@ pub struct ChunkingConfig {
     pub adaptive_chunking: bool,
     /// Maximum memory usage per chunk (bytes)
     pub max_memory_per_chunk: Option<usize>,
+    /// Whether to use GPU acceleration
+    pub use_gpu: bool,
 }
 
 impl Default for ChunkingConfig {
@@ -39,6 +42,7 @@ impl Default for ChunkingConfig {
             show_progress: true,
             adaptive_chunking: false,
             max_memory_per_chunk: None,
+            use_gpu: false,
         }
     }
 }
@@ -162,9 +166,17 @@ pub fn split_into_chunks(
     // Determine the chunk size to use
     let chunk_size = if config.adaptive_chunking {
         // Get available memory (fallback to a reasonable default if sysinfo fails)
-        let mut sys = sysinfo::System::new_all();
-        sys.refresh_memory();
-        let available_memory = sys.available_memory() as usize;
+        let available_memory = match {
+            let mut sys = System::new_all();
+            sys.refresh_memory();
+            sys.available_memory() as usize
+        } {
+            available_memory => available_memory,
+            _ => {
+                println!("Warning: Could not get available memory, using default memory value");
+                1024 * 1024 * 1024 // Default to 1GB as a reasonable fallback
+            }
+        };
         
         calculate_adaptive_chunk_size(sequence, config, available_memory)
     } else {

@@ -14,6 +14,7 @@ This document outlines the module structure, data flow, algorithms, and design d
 8. [Error Handling](#error-handling)
 9. [Testing Strategy](#testing-strategy)
 10. [Future Design Considerations](#future-design-considerations)
+11. [GPU Acceleration](#gpu-acceleration)
 
 ## Module Structure
 
@@ -419,3 +420,78 @@ The codebase employs a multi-level testing approach:
 5. **GPU Acceleration**:
    - Explore GPU-based acceleration for digram finding
    - Optimize suffix array construction for GPUs 
+
+## GPU Acceleration
+
+Orbweaver implements GPU acceleration for computationally intensive operations using OpenCL, significantly improving performance for large genome sequences.
+
+### GPU Module Structure
+
+```
+orbweaver/
+├── src/
+│   ├── gpu/                    # GPU acceleration module
+│   │   ├── mod.rs              # Core GPU context handling
+│   │   ├── digram.rs           # Digram finding on GPU
+│   │   └── suffix_array.rs     # Suffix array construction on GPU
+├── orbweaver-kernels/          # OpenCL kernel code
+│   ├── src/
+│   │   └── lib.rs              # Embedded kernel source code
+```
+
+### Implementation Details
+
+#### OpenCL Kernels
+
+1. **Digram Finding Kernel**: 
+   - Processes DNA sequences in parallel to identify and count adjacent symbol pairs
+   - Uses atomic operations for thread-safe counting
+   - Implements reverse complement canonicalization directly on the GPU
+   - Handles 2-bit encoded sequence data for memory efficiency
+
+2. **Suffix Array Construction Kernel**:
+   - Implements prefix doubling algorithm for efficient suffix array construction
+   - Uses a multi-stage approach with host-side sorting coordination
+   - Initializes, sorts, and updates rank information in parallel
+
+#### GPU Context Management
+
+The `GpuContext` struct encapsulates an OpenCL environment:
+
+```rust
+pub struct GpuContext {
+    pub platform: Platform,
+    pub device: Device,
+    pub context: Context,
+    pub queue: Queue,
+    pub program: Option<Program>,
+}
+```
+
+- Automatically handles device selection and fallback to CPU if no GPU is available
+- Manages OpenCL program compilation and kernel execution
+- Provides memory management for device buffers
+
+#### Integration with Grammar Construction
+
+The GPU-accelerated workflow integrates with the core grammar construction:
+
+1. Sequence data is uploaded to GPU memory once
+2. Iterative digram finding is performed on the GPU
+3. Results are transferred back to host memory for rule creation
+4. The process continues until no more frequent patterns are found
+5. Final grammar is constructed from the discovered rules
+
+### Performance Considerations
+
+- **Memory Transfer Overhead**: Data transfer between host and GPU memory can become a bottleneck for smaller sequences
+- **Batch Processing**: Operations are batched to minimize PCIe bus transfers
+- **Kernel Fusion**: Multiple operations are combined in a single kernel where possible
+- **Fallback Mechanisms**: Automatic fallback to CPU implementation if GPU operations fail
+
+### Future Enhancements
+
+- **Streaming Processing**: Support for processing sequences larger than GPU memory
+- **Multi-GPU Support**: Distribution of work across multiple GPUs
+- **Advanced Algorithms**: Implementation of more specialized algorithms like skew algorithm for suffix array construction
+- **Compressed Data Structures**: Keeping data compressed in GPU memory 

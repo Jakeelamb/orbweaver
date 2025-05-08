@@ -1,343 +1,239 @@
 #!/bin/bash
 # ======================================================
-# Orbweaver Benchmark Script
+# Orbweaver Performance Benchmark Script
 # ======================================================
-# This script runs benchmarks and profiling for Orbweaver.
-# It tests different thread counts, algorithms, and configurations to find optimal settings.
-#
-# Usage:
-#   ./scripts/benchmark.sh [input_fasta] [options]
-#
-# Options:
-#   --threads=N,M,P  - Test with N, M, and P threads (default: 1,2,4,8)
-#   --profile        - Enable profiling (requires compilation with --features=profiling)
-#   --build          - Build with profiling before running benchmarks
-#   --algorithms     - Test different algorithm combinations
-#   --memory         - Test memory optimization algorithms
-#   --help           - Show this help message
-# ======================================================
+# Runs a series of tests to benchmark Orbweaver's performance
+# and memory usage against various input sizes and configurations.
+# Each test is limited to a 5-minute timeout.
 
-set -e  # Exit on error
+set -e # Exit on error
+# set -x # Uncomment for debug mode
 
 # --- Configuration ---
-INPUT_FASTA=""
-THREAD_COUNTS="1,2,4,8"
-PROFILE=false
-BUILD=false
-TEST_ALGORITHMS=false
-TEST_MEMORY=false
-MIN_RULE_USAGE=2
-ITERATIONS=3
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+ROOT_DIR="$(dirname "$SCRIPT_DIR")"
+ORBWEAVER_BIN="$ROOT_DIR/target/release/orbweaver"
+RESULTS_DIR="$ROOT_DIR/benchmark_results"
+SUMMARY_FILE="$RESULTS_DIR/summary.txt"
+TIMEOUT_DURATION="300s" # 5 minutes
 
-# --- Parse arguments ---
-for arg in "$@"; do
-  case $arg in
-    --threads=*)
-      THREAD_COUNTS="${arg#*=}"
-      ;;
-    --profile)
-      PROFILE=true
-      ;;
-    --build)
-      BUILD=true
-      ;;
-    --algorithms)
-      TEST_ALGORITHMS=true
-      ;;
-    --memory)
-      TEST_MEMORY=true
-      ;;
-    --help)
-      echo "Orbweaver Benchmark Script"
-      echo "Usage: ./scripts/benchmark.sh [input_fasta] [options]"
-      echo ""
-      echo "Options:"
-      echo "  --threads=N,M,P  - Test with N, M, and P threads (default: 1,2,4,8)"
-      echo "  --profile        - Enable profiling (requires compilation with --features=profiling)"
-      echo "  --build          - Build with profiling before running benchmarks"
-      echo "  --algorithms     - Test different algorithm combinations"
-      echo "  --memory         - Test memory optimization algorithms"
-      echo "  --help           - Show this help message"
-      echo ""
-      echo "Examples:"
-      echo "  ./scripts/benchmark.sh test.fasta"
-      echo "  ./scripts/benchmark.sh test.fasta --threads=1,4,8,16 --profile"
-      echo "  ./scripts/benchmark.sh test.fasta --algorithms --memory"
-      exit 0
-      ;;
-    *)
-      if [[ "$arg" == --* ]]; then
-        echo "Unknown option: $arg"
-        echo "Run ./scripts/benchmark.sh --help for usage information"
+# --- Source Genome Configuration ---
+# Define the path to the original source genome
+SOURCE_GENOME_PATH="genomes/GCF_002237135.1_genome/ncbi_dataset/data/GCF_002237135.1/GCF_002237135.1_ASM223713v2_genomic.fna"
+
+# Define the directory to store prepared (cleaned) data
+PREPARED_DATA_DIR="$ROOT_DIR/test_data/prepared_benchmark"
+
+# Define the desired sizes for testing (in bases)
+SIZE_1MB=$((1 * 1024 * 1024))
+SIZE_10MB=$((10 * 1024 * 1024))
+SIZE_50MB=$((50 * 1024 * 1024))
+# SIZE_100MB=$((100 * 1024 * 1024)) # Uncomment if needed
+
+# Check if the source genome exists
+if [ ! -f "$SOURCE_GENOME_PATH" ]; then
+    echo "Error: Source genome file not found at $SOURCE_GENOME_PATH" >&2
+    echo "Please download or place the genome file correctly." >&2
+    exit 1
+fi
+
+# Ensure Orbweaver is built in release mode
+if [ ! -f "$ORBWEAVER_BIN" ]; then
+    echo "Orbweaver release binary not found. Building..." >&2
+    (cd "$ROOT_DIR" && ./scripts/build.sh)
+    if [ ! -f "$ORBWEAVER_BIN" ]; then
+        echo "Error: Orbweaver binary still not found after build attempt." >&2
         exit 1
-      else
-        INPUT_FASTA="$arg"
-      fi
-      ;;
-  esac
-done
-
-# Check for input file
-if [ -z "$INPUT_FASTA" ]; then
-  echo "Error: No input FASTA file specified"
-  echo "Run ./scripts/benchmark.sh --help for usage information"
-  exit 1
-fi
-
-if [ ! -f "$INPUT_FASTA" ]; then
-  echo "Error: Input file not found: $INPUT_FASTA"
-  exit 1
-fi
-
-# --- Build with profiling if requested ---
-if [ "$BUILD" = true ]; then
-  echo "Building Orbweaver with profiling support..."
-  if [ "$PROFILE" = true ]; then
-    cargo build --release --features profiling
-  else
-    cargo build --release
-  fi
-  echo "Build complete."
-fi
-
-# --- Locate binary ---
-BINARY_PATH="./target/release/orbweaver"
-if [ ! -f "$BINARY_PATH" ]; then
-    BINARY_PATH="./target/debug/orbweaver"
-    if [ ! -f "$BINARY_PATH" ]; then
-        echo "Error: Orbweaver binary not found!"
-        echo "Please build the project first:"
-        echo "  cargo build --release"
-        echo "  or use --build option"
-        exit 1
-    else
-        echo "Notice: Using debug build. For accurate benchmarks, use release build."
     fi
 fi
 
-# --- Create results directory ---
-RESULTS_DIR="benchmark_results"
+# Ensure necessary directories exist
+mkdir -p "$PREPARED_DATA_DIR"
 mkdir -p "$RESULTS_DIR"
 
-# Get file basename for results
-BASENAME=$(basename "$INPUT_FASTA" | sed 's/\.[^.]*$//')
-TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
-RESULTS_FILE="$RESULTS_DIR/${BASENAME}_benchmark_${TIMESTAMP}.csv"
+# --- Helper Functions ---
 
-# Write CSV header with added fields for new metrics
-echo "config,threads,iteration,runtime_seconds,rules_count,final_sequence_length,compression_ratio,digram_table_time,replacement_time,replacements,inlining_time,max_memory_mb,algorithm,chunk_size" > "$RESULTS_FILE"
+# Function to run a single benchmark test
+# Usage: run_benchmark <test_name> <orbweaver_args_string> <input_fasta_path> <profile_this_test (true/false)>
+run_benchmark() {
+    local test_name=$1
+    local orbweaver_args_param=$2 # Renamed to avoid conflict
+    local input_fasta=$3
+    local profile_this_test=${4:-false} # Default to false if not provided
 
-# Get initial filesize for calculations
-FILESIZE=$(stat -c%s "$INPUT_FASTA" 2>/dev/null || stat -f%z "$INPUT_FASTA")
-echo "Input file size: $(numfmt --to=iec-i --suffix=B $FILESIZE 2>/dev/null || echo "$FILESIZE bytes")"
+    local result_file_base="$RESULTS_DIR/${test_name}"
+    local result_stdout="${result_file_base}.stdout"
+    local result_stderr="${result_file_base}.stderr" # time output goes here
+    local output_json="${result_file_base}_grammar.json"
+    local output_flamegraph="${result_file_base}_flamegraph.svg"
 
-# Define test configurations
-if [ "$TEST_ALGORITHMS" = true ]; then
-  # Testing different algorithm combinations
-  CONFIGS=(
-    "baseline:--min-rule-usage=$MIN_RULE_USAGE"
-    "suffix_array:--min-rule-usage=$MIN_RULE_USAGE"
-    "parallel_digram:--min-rule-usage=$MIN_RULE_USAGE --chunk-size=100000"
-    "optimized:--min-rule-usage=$MIN_RULE_USAGE --chunk-size=100000 --adaptive-chunking"
-  )
-elif [ "$TEST_MEMORY" = true ]; then
-  # Testing memory optimization configurations
-  CONFIGS=(
-    "no_encoding:--min-rule-usage=$MIN_RULE_USAGE --use-encoding=false"
-    "encoding:--min-rule-usage=$MIN_RULE_USAGE --use-encoding=true"
-    "rule_eviction:--min-rule-usage=$MIN_RULE_USAGE --use-encoding=true --max-rule-count=5000"
-    "streaming:--min-rule-usage=$MIN_RULE_USAGE --use-encoding=true --streaming"
-  )
-else
-  # Default - just test with threads
-  CONFIGS=("default:--min-rule-usage=$MIN_RULE_USAGE")
-fi
+    # Clean previous output files for this test
+    rm -f "$result_stdout" "$result_stderr" "$output_json" "$output_flamegraph"
+    # Clean up any previous global profile output
+    rm -rf "$ROOT_DIR/profile"
 
-# Print benchmark info
-echo "=========================================================="
-echo "Running Orbweaver Benchmarks"
-echo "Input file: $INPUT_FASTA"
-echo "Thread counts: $THREAD_COUNTS"
-if [ "$TEST_ALGORITHMS" = true ]; then
-  echo "Testing algorithm variants"
-elif [ "$TEST_MEMORY" = true ]; then
-  echo "Testing memory optimization variants"
-fi
-echo "Iterations per config: $ITERATIONS"
-echo "Profiling: $PROFILE"
-echo "Results will be written to: $RESULTS_FILE"
-echo "=========================================================="
 
-# Convert comma-separated thread counts to array
-IFS=',' read -ra THREAD_ARRAY <<< "$THREAD_COUNTS"
+    local current_orbweaver_args="$orbweaver_args_param"
+    if [ "$profile_this_test" = true ]; then
+        echo "INFO: Profiling enabled for $test_name. Flamegraph will be saved to $output_flamegraph"
+        # The --profile flag tells orbweaver to generate the flamegraph.
+        # We no longer need separate flamegraph command logic here.
+        current_orbweaver_args="$current_orbweaver_args --profile"
+    fi
 
-# Run benchmark
-for config in "${CONFIGS[@]}"; do
-  CONFIG_NAME="${config%%:*}"
-  CONFIG_ARGS="${config#*:}"
-  
-  echo ""
-  echo "Testing configuration: $CONFIG_NAME"
-  echo "Args: $CONFIG_ARGS"
-  
-  for threads in "${THREAD_ARRAY[@]}"; do
-    echo ""
-    echo "  With $threads thread(s)..."
+    echo "----------------------------------------------------------------------"
+    echo "Running Benchmark: $test_name"
+    # Get input file size for display
+    input_size=$(stat -c%s "$input_fasta" 2>/dev/null || stat -f%z "$input_fasta")
+    input_size_human=$(numfmt --to=iec-i --suffix=B $input_size 2>/dev/null || echo "unknown size")
+    echo "Input: $(basename "$input_fasta") ($input_size_human)"
+    echo "Arguments: $current_orbweaver_args"
+    echo "Timeout: $TIMEOUT_DURATION"
+    echo "Stdout Log: $result_stdout"
+    echo "Stderr (Time) Log: $result_stderr"
+    echo "----------------------------------------------------------------------"
+
+    # Command to execute using /usr/bin/time -v and timeout
+    # Correct structure: /usr/bin/time [time_opts] timeout [timeout_opts] command [command_opts]
+    # Note: We execute the whole timeout command within a subshell `sh -c '...'` to handle arguments and redirections correctly, especially with profiling.
+    # The final orbweaver command with its args needs careful quoting.
+    local orbweaver_cmd_part="\"$ORBWEAVER_BIN\" $current_orbweaver_args -i \"$input_fasta\" -j \"$output_json\""
+    local timeout_cmd_part="timeout \"$TIMEOUT_DURATION\" $orbweaver_cmd_part"
     
-    for i in $(seq 1 $ITERATIONS); do
-      echo "    Iteration $i/$ITERATIONS..."
-      
-      # Clear caches for more consistent results (requires sudo)
-      # if command -v sudo &> /dev/null; then
-      #   sudo sh -c "echo 3 > /proc/sys/vm/drop_caches" 2>/dev/null || true
-      # fi
-      
-      # Build command with configuration
-      CMD=("$BINARY_PATH" 
-           "-i" "$INPUT_FASTA" 
-           "-j" "$RESULTS_DIR/${BASENAME}_${CONFIG_NAME}_${threads}threads_${i}.json" 
-           "--threads" "$threads")
-      
-      # Add configuration arguments
-      for arg in $CONFIG_ARGS; do
-        CMD+=("$arg")
-      done
-      
-      # Add profiling if enabled
-      if [ "$PROFILE" = true ]; then
-          CMD+=("--profile")
-      fi
-      
-      # Extract chunk size for reporting
-      chunk_size="N/A"
-      if [[ "$CONFIG_ARGS" == *"--chunk-size="* ]]; then
-        chunk_size=$(echo "$CONFIG_ARGS" | grep -oE -- "--chunk-size=[0-9]+" | cut -d= -f2)
-      fi
-      
-      # Run the command and parse output
-      echo "    Running: ${CMD[*]}"
-      output=$("${CMD[@]}" 2>&1)
-      
-      # Extract metrics from the output
-      runtime=$(echo "$output" | grep "Grammar construction complete" | grep -oE 'in [0-9]+\.[0-9]+s' | grep -oE '[0-9]+\.[0-9]+' | head -1)
-      rules_count=$(echo "$output" | grep "Rules:" | grep -oE '[0-9]+\.$' | grep -oE '[0-9]+' | head -1)
-      final_length=$(echo "$output" | grep "Sequence compressed from" | awk '{print $5}' | head -1)
-      compression=$(echo "$output" | grep "compression ratio" | grep -oE '[0-9]+\.[0-9]+x' | sed 's/x//' | head -1)
-      
-      # Extract detailed metrics
-      digram_time=$(echo "$output" | grep "Digram table rebuilding:" | grep -oE '[0-9]+\.[0-9]+s' | head -1 | sed 's/s//')
-      replacement_time=$(echo "$output" | grep "Replacement time:" | grep -oE '[0-9]+\.[0-9]+s' | head -1 | sed 's/s//')
-      replacements=$(echo "$output" | grep "Total replacements:" | grep -oE '[0-9]+' | head -1)
-      inlining_time=$(echo "$output" | grep "Rule inlining:" | grep -oE '[0-9]+\.[0-9]+s' | head -1 | sed 's/s//')
-      
-      # Attempt to get memory usage
-      max_memory_mb=0
-      if command -v ps &> /dev/null; then
-        max_memory_mb=$(echo "$output" | grep "Memory usage" | grep -oE 'allocated=[0-9]+MB' | sed 's/allocated=//' | sed 's/MB//' | sort -n | tail -1)
-        if [ -z "$max_memory_mb" ]; then
-          max_memory_mb="N/A"
+    # Use sh -c to properly handle the command string with spaces and quotes
+    local cmd_to_run="/usr/bin/time -v -o \"$result_stderr\" sh -c '${timeout_cmd_part} > \"$result_stdout\"'"
+
+    # Execute and capture the exit code of the `time` command itself.
+    # `eval` is needed here to handle the nested quoting and redirections within cmd_to_run correctly.
+    eval "$cmd_to_run"
+    local exit_code=$?
+
+
+    # Check exit code
+    if [ $exit_code -eq 0 ]; then
+        echo "✅ $test_name PASSED"
+        # Try to parse memory and time from time's output
+        local peak_mem=$(grep "Maximum resident set size" "$result_stderr" | awk '{print $6}')
+        local user_time=$(grep "User time" "$result_stderr" | awk '{print $4}')
+        local sys_time=$(grep "System time" "$result_stderr" | awk '{print $4}')
+        echo "$test_name,PASS,$user_time,$sys_time,$peak_mem,$(basename "$input_fasta")" >> "$SUMMARY_FILE"
+    elif [ $exit_code -eq 124 ]; then
+        echo "⚠️ $test_name TIMED OUT (after $TIMEOUT_DURATION)"
+        echo "$test_name,TIMEOUT,-,-,-,$(basename "$input_fasta")" >> "$SUMMARY_FILE"
+    else
+        echo "❌ $test_name FAILED (Exit Code: $exit_code)"
+        echo "$test_name,FAIL,$exit_code,-,-,$(basename "$input_fasta")" >> "$SUMMARY_FILE"
+        # Optionally, display some of the stdout/stderr from the failed command
+        echo "--- STDOUT ($result_stdout) ---"
+        tail -n 10 "$result_stdout"
+        echo "--- STDERR (Time) ($result_stderr) ---"
+        tail -n 10 "$result_stderr"
+    fi
+
+    if [ "$profile_this_test" = true ]; then
+        if [ -f "$ROOT_DIR/profile/flamegraph.svg" ]; then
+            mkdir -p "$(dirname "$output_flamegraph")" # Ensure results dir exists
+            mv "$ROOT_DIR/profile/flamegraph.svg" "$output_flamegraph"
+            echo "Flamegraph moved to $output_flamegraph"
+            rm -rf "$ROOT_DIR/profile" # Clean up the profile directory
+        else
+            echo "Warning: Profiling was enabled for $test_name, but no flamegraph was found at $ROOT_DIR/profile/flamegraph.svg"
         fi
-      fi
-      
-      # Identify algorithm used (from log messages)
-      algorithm="sequential"
-      if echo "$output" | grep -q "Using suffix array optimization"; then
-        algorithm="suffix_array"
-      elif echo "$output" | grep -q "Using parallel hash map for digram table"; then
-        algorithm="parallel_hashmap"
-      fi
-      
-      # Write to CSV
-      echo "$CONFIG_NAME,$threads,$i,$runtime,$rules_count,$final_length,$compression,$digram_time,$replacement_time,$replacements,$inlining_time,$max_memory_mb,$algorithm,$chunk_size" >> "$RESULTS_FILE"
-      
-      echo "    Results: time=${runtime}s, rules=${rules_count}, compression=${compression}"
-      
-      # Sleep a bit to let system stabilize
-      sleep 2
-    done
-  done
-done
+    fi
+    echo "" # Newline for readability
+}
 
+# --- Prepare Test Data from Source Genome ---
+
+echo "--- Preparing Test Data from Source Genome ($SOURCE_GENOME_PATH) ---"
+
+# Prepare cleaned files of different sizes
+PREP_SCRIPT="$SCRIPT_DIR/prepare_benchmark_data.sh"
+
+# Define output file paths
+FASTA_REAL_1MB="$PREPARED_DATA_DIR/real_genome_1MB.fasta"
+FASTA_REAL_10MB="$PREPARED_DATA_DIR/real_genome_10MB.fasta"
+FASTA_REAL_50MB="$PREPARED_DATA_DIR/real_genome_50MB.fasta"
+FASTA_REAL_FULL="$PREPARED_DATA_DIR/real_genome_full.fasta"
+
+# Run preparation script for each size
+if ! bash "$PREP_SCRIPT" "$SOURCE_GENOME_PATH" "$FASTA_REAL_1MB" $SIZE_1MB; then exit 1; fi
+if ! bash "$PREP_SCRIPT" "$SOURCE_GENOME_PATH" "$FASTA_REAL_10MB" $SIZE_10MB; then exit 1; fi
+if ! bash "$PREP_SCRIPT" "$SOURCE_GENOME_PATH" "$FASTA_REAL_50MB" $SIZE_50MB; then exit 1; fi
+if ! bash "$PREP_SCRIPT" "$SOURCE_GENOME_PATH" "$FASTA_REAL_FULL" 0; then exit 1; fi # 0 means full size
+
+# Optional: Prepare 100MB if needed
+# FASTA_REAL_100MB="$PREPARED_DATA_DIR/real_genome_100MB.fasta"
+# if ! bash "$PREP_SCRIPT" "$SOURCE_GENOME_PATH" "$FASTA_REAL_100MB" $SIZE_100MB; then exit 1; fi
+
+echo "--- Test Data Preparation Complete ---"
 echo ""
-echo "=========================================================="
-echo "Benchmark complete!"
-echo "Results saved to: $RESULTS_FILE"
-echo ""
 
-# Calculate and show averages
-echo "Summary of results (averages):"
-echo "Config,Threads,Avg Time(s),Rules,Final Length,Compression Ratio,Digram Table Time(s),Replacement Time(s)"
+# --- Clear previous summary ---
+echo "TestName,Status,UserTime(s),SystemTime(s),PeakMemory(KB),Input" > "$SUMMARY_FILE"
 
-for config in "${CONFIGS[@]}"; do
-  CONFIG_NAME="${config%%:*}"
-  
-  for threads in "${THREAD_ARRAY[@]}"; do
-    # Calculate averages using awk
-    avg=$(awk -F, -v c="$CONFIG_NAME" -v t="$threads" '$1==c && $2==t {sum+=$4; count++} END {print sum/count}' "$RESULTS_FILE")
-    rules=$(awk -F, -v c="$CONFIG_NAME" -v t="$threads" '$1==c && $2==t {sum+=$5; count++} END {print sum/count}' "$RESULTS_FILE")
-    length=$(awk -F, -v c="$CONFIG_NAME" -v t="$threads" '$1==c && $2==t {sum+=$6; count++} END {print sum/count}' "$RESULTS_FILE")
-    comp=$(awk -F, -v c="$CONFIG_NAME" -v t="$threads" '$1==c && $2==t {sum+=$7; count++} END {print sum/count}' "$RESULTS_FILE")
-    digram_time=$(awk -F, -v c="$CONFIG_NAME" -v t="$threads" '$1==c && $2==t {sum+=$8; count++} END {print sum/count}' "$RESULTS_FILE")
-    repl_time=$(awk -F, -v c="$CONFIG_NAME" -v t="$threads" '$1==c && $2==t {sum+=$9; count++} END {print sum/count}' "$RESULTS_FILE")
-    
-    printf "%s,%s,%0.2f,%0.0f,%0.0f,%0.4f,%0.2f,%0.2f\n" "$CONFIG_NAME" "$threads" "$avg" "$rules" "$length" "$comp" "$digram_time" "$repl_time"
-  done
-done
+# --- Benchmark Tests ---
 
-# If profiling was enabled, point to the profiling results
-if [ "$PROFILE" = true ]; then
-  echo ""
-  echo "Profiling results available in the 'profiles' directory."
-  if command -v find &> /dev/null; then
-    echo "Latest flamegraph: $(find profiles -name "*flamegraph.svg" -type f -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1 | cut -f2- -d" ")"
-  fi
+echo "*** Running Section 1: Standard Mode (Full Load) ***"
+echo "### Section 1: Standard Mode (Full Load) ###" >> "$SUMMARY_FILE"
+run_benchmark "Std_Real_1MB" "" "$FASTA_REAL_1MB" true
+run_benchmark "Std_Real_10MB" "" "$FASTA_REAL_10MB" false
+# run_benchmark "Std_Real_50MB" "" "$FASTA_REAL_50MB" false # Likely to timeout
+# run_benchmark "Std_Real_Full" "" "$FASTA_REAL_FULL" false # Likely to timeout
+
+echo "*** Running Section 2: Streaming Mode ***"
+echo "### Section 2: Streaming Mode ###" >> "$SUMMARY_FILE"
+run_benchmark "Stream_Real_10MB" "--streaming" "$FASTA_REAL_10MB" false
+run_benchmark "Stream_Real_50MB" "--streaming" "$FASTA_REAL_50MB" false
+run_benchmark "Stream_Real_Full" "--streaming" "$FASTA_REAL_FULL" false
+
+echo "*** Running Section 3: Chunked Processing (Orbweaver Internal Parallel) ***"
+echo "### Section 3: Chunked Processing (Orbweaver Internal) ###" >> "$SUMMARY_FILE"
+run_benchmark "Chunked_Real_10MB" "--chunk-size 1048576 --chunk-overlap 10240" "$FASTA_REAL_10MB" false
+run_benchmark "Chunked_Real_50MB" "--chunk-size 5242880 --chunk-overlap 51200" "$FASTA_REAL_50MB" false
+run_benchmark "Chunked_Real_Full" "--chunk-size 10485760 --chunk-overlap 102400" "$FASTA_REAL_FULL" false
+
+echo "*** Running Section 4: GPU Acceleration vs CPU ***"
+echo "### Section 4: GPU vs CPU ###" >> "$SUMMARY_FILE"
+# Check for GPU capability (basic check using clinfo)
+if command -v clinfo &> /dev/null && clinfo | grep -q "Device Type.*GPU"; then
+    echo "GPU detected via clinfo. Running GPU comparison tests."
+    # Standard Mode Comparison (Smaller size)
+    run_benchmark "GPU_Std_10MB_Real" "--use-gpu" "$FASTA_REAL_10MB" false
+    run_benchmark "CPU_Std_10MB_Real" "--no-gpu" "$FASTA_REAL_10MB" false
+
+    # Streaming Mode Comparison (Larger size)
+    run_benchmark "GPU_Stream_50MB_Real" "--use-gpu --streaming" "$FASTA_REAL_50MB" false
+    run_benchmark "CPU_Stream_50MB_Real" "--streaming --no-gpu" "$FASTA_REAL_50MB" false
+
+    # Chunked Mode Comparison (Largest size)
+    run_benchmark "GPU_Chunked_Full_Real_cs10M" "--use-gpu --chunk-size 10000000 --chunk-overlap 100000" "$FASTA_REAL_FULL" false
+    run_benchmark "CPU_Chunked_Full_Real_cs10M" "--chunk-size 10000000 --chunk-overlap 100000 --no-gpu" "$FASTA_REAL_FULL" false
+else
+    echo "No GPU detected or clinfo not available. Skipping GPU comparison tests."
+    echo "(Skipped GPU Tests - No compatible GPU detected or clinfo missing)" >> "$SUMMARY_FILE"
 fi
 
-echo "=========================================================="
+echo "*** Running Section 5: Memory Optimization Features ***"
+echo "### Section 5: Memory Optimizations ###" >> "$SUMMARY_FILE"
+run_benchmark "Stream_Real_50MB_Evict10k" "--streaming --max-rule-count 10000" "$FASTA_REAL_50MB" false
+run_benchmark "Stream_Real_Full_Evict50k" "--streaming --max-rule-count 50000" "$FASTA_REAL_FULL" false
+# Compare baseline streaming with eviction on memory and time
+run_benchmark "Stream_Real_50MB_MinUse5" "--streaming --min-rule-usage 5" "$FASTA_REAL_50MB" false
+run_benchmark "Stream_Real_Full_MinUse10" "--streaming --min-rule-usage 10" "$FASTA_REAL_FULL" false
 
-# Generate plots with gnuplot if available
-if command -v gnuplot &> /dev/null; then
-  echo "Generating performance plots..."
-  
-  # Plot 1: Runtime by thread count and config
-  PLOT_FILE="$RESULTS_DIR/${BASENAME}_runtime_${TIMESTAMP}.png"
-  gnuplot << EOF
-set terminal pngcairo enhanced size 1200,800
-set output "$PLOT_FILE"
-set title "Orbweaver Runtime by Configuration and Thread Count"
-set xlabel "Threads"
-set ylabel "Runtime (seconds)"
-set grid
-set key outside right top
-set style data linespoints
-set pointsize 1.5
-set style line 1 lc rgb '#1B9E77' pt 7
-set style line 2 lc rgb '#D95F02' pt 9
-set style line 3 lc rgb '#7570B3' pt 5
-set style line 4 lc rgb '#E7298A' pt 13
-plot "$RESULTS_FILE" using 2:4:(strcol(1)) title "Runtime" with linespoints lw 2 pt 7
-EOF
-  echo "Runtime plot saved to: $PLOT_FILE"
-  
-  # Plot 2: Digram table time vs replacement time
-  if [ "$TEST_ALGORITHMS" = true ]; then
-    PLOT_FILE2="$RESULTS_DIR/${BASENAME}_components_${TIMESTAMP}.png"
-    gnuplot << EOF
-set terminal pngcairo enhanced size 1200,800
-set output "$PLOT_FILE2"
-set title "Performance Breakdown by Algorithm"
-set xlabel "Algorithm"
-set ylabel "Time (seconds)"
-set grid
-set key outside right top
-set style data histogram
-set style histogram cluster gap 1
-set style fill solid 0.7
-set boxwidth 0.9
-set xtic rotate by -45 scale 0
-plot "$RESULTS_FILE" using 8:xtic(1) title "Digram Table Time" lc rgb '#1B9E77', \
-     "" using 9 title "Replacement Time" lc rgb '#D95F02'
-EOF
-    echo "Component time plot saved to: $PLOT_FILE2"
-  fi
-fi 
+echo "*** Running Section 6: Adaptive Chunking ***"
+echo "### Section 6: Adaptive Chunking ###" >> "$SUMMARY_FILE"
+run_benchmark "AdaptChunk_Real_50MB" "--adaptive-chunking" "$FASTA_REAL_50MB" false
+run_benchmark "AdaptChunk_Real_Full" "--adaptive-chunking" "$FASTA_REAL_FULL" false
+# Test with memory constraint
+run_benchmark "AdaptChunk_Real_Full_Mem500M" "--adaptive-chunking --max-memory-per-chunk-mb 500" "$FASTA_REAL_FULL" false
+
+
+# --- End of Tests ---
+echo ""
+echo "========================================"
+echo "Benchmark script finished."
+echo "Summary report written to: $SUMMARY_FILE"
+echo "Detailed logs are in: $RESULTS_DIR/"
+echo "========================================" 

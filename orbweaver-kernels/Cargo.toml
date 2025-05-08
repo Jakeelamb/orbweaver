@@ -1,0 +1,13 @@
+[package]
+name = "orbweaver-kernels"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# cuda_std = "0.2.2" # Using the same version as in the main crate for consistency
+ocl = "0.19.5"  # OpenCL for GPU acceleration
+
+[build-dependencies] 

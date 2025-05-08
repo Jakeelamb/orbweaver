@@ -10,11 +10,12 @@ use crate::parallel::chunking::{ChunkingConfig, split_into_chunks, Chunk};
 use crate::grammar::builder::GrammarBuilder;
 use anyhow::{Result, Context};
 use rayon::prelude::*;
-use std::collections::{HashMap, BTreeMap};
+use std::collections::HashMap;
 use std::time::Instant;
 use union_find::UnionFind;
 use union_find::QuickUnionUf;
 use union_find::UnionBySize;
+use crate::gpu::GpuContext; // Import GpuContext
 
 /// Metrics for the parallel Sequitur algorithm
 #[derive(Debug, Default)]
@@ -39,16 +40,21 @@ pub struct ParallelMetrics {
 pub fn parallel_sequitur(
     sequence: &[EncodedBase],
     config: ChunkingConfig,
+    gpu_context_param: Option<&GpuContext> 
 ) -> Result<(Grammar, ParallelMetrics)> {
     let total_start = Instant::now();
     let mut metrics: ParallelMetrics = ParallelMetrics::default();
 
-    // Configure Rayon thread pool
-    rayon::ThreadPoolBuilder::new()
+    // Configure Rayon thread pool, ignore error if already initialized
+    let _ = rayon::ThreadPoolBuilder::new()
         .num_threads(config.num_threads)
-        .build_global()?;
+        .build_global();
 
     println!("Using {} threads for parallel processing.", config.num_threads);
+    
+    if config.use_gpu {
+        println!("GPU acceleration enabled for chunk processing");
+    }
 
     // --- Step 1: Split sequence into chunks ---
     // Assuming split_into_chunks is defined elsewhere and returns Vec<Chunk>
@@ -63,10 +69,32 @@ pub fn parallel_sequitur(
         .into_par_iter()
         .map(|chunk| {
              let mut builder = GrammarBuilder::new(config.min_rule_usage, config.reverse_aware);
-             builder.build_grammar(&chunk.data)?; // Pass chunk data to builder
+             
+             // Configure the builder
+             if let Some(max_rules) = config.max_memory_per_chunk {
+                 builder = builder.with_max_rules(max_rules / 100); 
+             }
+             
+             // Build grammar using GPU or CPU based on config and context availability
+             if config.use_gpu && gpu_context_param.is_some() {
+                 builder = builder.with_gpu(gpu_context_param);
+                 builder.build_grammar_with_gpu(&chunk.data)?;
+             } else {
+                 if config.use_gpu && gpu_context_param.is_none() {
+                     // Print warning only once or use logging if available
+                     // For now, skipping the print to avoid excessive output
+                 }
+                 builder.build_grammar(&chunk.data)?;
+             }
+             
              let (seq, rules) = builder.get_grammar();
              let depth = builder.get_max_rule_depth();
-             Ok(Grammar { sequence: seq.clone(), rules: rules.clone(), max_depth: depth })
+             Ok(Grammar { 
+                 sequence: seq.clone(), 
+                 rules: rules.clone(), 
+                 max_depth: depth,
+                 origins: HashMap::new(), // Initialize origins here
+             })
         })
         .collect();
     metrics.chunk_processing_time = chunk_processing_start.elapsed();
@@ -103,24 +131,27 @@ pub fn merge_grammars(grammars: Vec<Grammar>, config: &ChunkingConfig, total_seq
             sequence: Vec::new(),
             rules: HashMap::new(),
             max_depth: 0,
+            origins: HashMap::new(), // Initialize origins as empty
         };
         return Ok((default_grammar, metrics));
     }
 
-    // Deduplicate rules using the union-find approach
+    // Assign unique IDs to input grammars for tracking origins
+    let grammars_with_ids: Vec<(usize, Grammar)> = grammars.into_iter().enumerate().collect();
+
+    // Deduplicate rules using the union-find approach, passing grammars with IDs
     let deduplication_start = Instant::now();
-    let (rule_map, merged_rules) = deduplicate_rules(&grammars);
+    let (rule_map, merged_rules, rule_origins) = deduplicate_rules(&grammars_with_ids); // Pass grammars with IDs
     metrics.deduplication_time = deduplication_start.elapsed();
     // Calculate rules_before_merge here using input `grammars`
-    metrics.rules_before_merge = grammars.iter().map(|g| g.rules.len()).sum();
+    metrics.rules_before_merge = grammars_with_ids.iter().map(|(_, g)| g.rules.len()).sum(); // Use grammars_with_ids
     metrics.rules_after_merge = merged_rules.len(); // Corrected access
 
     // --- Step 5: Reconstruct the final sequence by stitching chunks ---
     let mut final_sequence = Vec::with_capacity(total_sequence_len); // Estimate capacity
     let mut current_original_pos = 0; // Track position in the original, uncompressed sequence
 
-    for (chunk_index, grammar) in grammars.iter().enumerate() {
-        let grammar_ptr = grammar as *const Grammar;
+    for (chunk_index, (grammar_id, grammar)) in grammars_with_ids.iter().enumerate() { // Iterate with grammar_id
         let chunk_start_in_original = grammar.sequence.first().map_or(current_original_pos, |s| s.id); // Approximate start pos
         let chunk_seq = &grammar.sequence;
 
@@ -147,10 +178,11 @@ pub fn merge_grammars(grammars: Vec<Grammar>, config: &ChunkingConfig, total_seq
             let remapped_symbol = match symbol.symbol_type {
                 SymbolType::Terminal(_) => symbol.clone(),
                 SymbolType::NonTerminal(old_rule_id) => {
-                    if let Some(&new_rule_id) = rule_map.get(&(grammar_ptr, old_rule_id)) {
+                    // Use grammar_id and old_rule_id for lookup
+                    if let Some(&new_rule_id) = rule_map.get(&(*grammar_id, old_rule_id)) {
                         Symbol::non_terminal(symbol.id, new_rule_id, symbol.strand)
                     } else {
-                        eprintln!("Warning: Rule ID {} from grammar {:?} not found in map during sequence reconstruction.", old_rule_id, grammar_ptr);
+                        eprintln!("Warning: Rule ID {} from grammar {} not found in map during sequence reconstruction.", old_rule_id, grammar_id);
                         symbol.clone()
                     }
                 }
@@ -177,34 +209,35 @@ pub fn merge_grammars(grammars: Vec<Grammar>, config: &ChunkingConfig, total_seq
             sequence: final_sequence,
             rules: merged_rules,
             max_depth,
+            origins: rule_origins,
         },
         metrics,
     ))
 }
 
 /// Deduplicate rules across multiple grammars using Union-Find
-fn deduplicate_rules(grammars: &[Grammar]) -> (HashMap<(*const Grammar, usize), usize>, HashMap<usize, Rule>) {
-    // --- Step 1: Collect all rules and map old IDs to a temporary global ID ---\
-    let mut old_to_temp_global = HashMap::new(); // Maps (grammar_ptr, old_rule_id) -> temp_global_id
-    // Stores (rule_hash, grammar_ptr, old_rule_id, symbols_vec) by temp_global_id
-    let mut temp_global_to_info: Vec<(u64, *const Grammar, usize, Vec<Symbol>)> = Vec::new();
+/// Takes Vec<(usize, Grammar)> where usize is the assigned grammar ID
+/// Returns: (map_from_old_to_new_id, map_of_new_rules, map_from_new_id_to_origins)
+fn deduplicate_rules(grammars_with_ids: &[(usize, Grammar)]) 
+    -> (HashMap<(usize, usize), usize>, HashMap<usize, Rule>, HashMap<usize, Vec<(usize, usize)>>) 
+{
+    // --- Step 1: Collect all rules and map old IDs to a temporary global ID ---
+    let mut old_to_temp_global = HashMap::new(); // Maps (grammar_id, old_rule_id) -> temp_global_id
+    let mut temp_global_to_info: Vec<(u64, usize, usize, Vec<Symbol>)> = Vec::new(); // (hash, grammar_id, old_rule_id, symbols)
     let mut temp_global_counter = 0;
 
-    for grammar in grammars {
+    for (grammar_id, grammar) in grammars_with_ids {
         for (old_rule_id, rule) in &grammar.rules {
-            let grammar_ptr = grammar as *const Grammar;
             let rule_hash = canonical_hash_symbols(&rule.symbols);
-
-            old_to_temp_global.insert((grammar_ptr, *old_rule_id), temp_global_counter);
-            // Store symbols instead of the whole rule clone initially
-            temp_global_to_info.push((rule_hash, grammar_ptr, *old_rule_id, rule.symbols.clone()));
+            old_to_temp_global.insert((*grammar_id, *old_rule_id), temp_global_counter);
+            temp_global_to_info.push((rule_hash, *grammar_id, *old_rule_id, rule.symbols.clone()));
             temp_global_counter += 1;
         }
     }
 
     let num_rules = temp_global_counter;
     if num_rules == 0 {
-        return (HashMap::new(), HashMap::new()); // No rules to merge
+        return (HashMap::new(), HashMap::new(), HashMap::new()); 
     }
 
     // --- Step 2: Initialize Union-Find and map rules by hash ---
@@ -213,7 +246,6 @@ fn deduplicate_rules(grammars: &[Grammar]) -> (HashMap<(*const Grammar, usize), 
 
     for temp_global_id in 0..num_rules {
         let (rule_hash, _, _, _) = temp_global_to_info[temp_global_id];
-
         if let Some(representative_temp_id) = hash_to_representative_temp_id.get(&rule_hash) {
             uf.union(temp_global_id, *representative_temp_id);
         } else {
@@ -221,80 +253,91 @@ fn deduplicate_rules(grammars: &[Grammar]) -> (HashMap<(*const Grammar, usize), 
         }
     }
 
-    // --- Step 3: Determine final representative rules and assign new IDs ---
-    let mut final_rule_map = HashMap::new(); // Maps (grammar_ptr, old_rule_id) -> final_new_rule_id
-    let mut final_merged_rules_info = BTreeMap::new(); // Stores (final_new_id) -> (representative_grammar_ptr, representative_old_id, representative_symbols)
-    let mut representative_to_new_id = HashMap::new(); // Maps temp_representative_id -> final_new_rule_id
+    // --- Step 3 (Modified): Determine final representatives, origins, and total usage ---
+    let mut representative_to_final_id: HashMap<usize, usize> = HashMap::new();
+    let mut final_id_to_origins: HashMap<usize, Vec<(usize, usize)>> = HashMap::new(); // (grammar_id, old_rule_id)
+    let mut final_id_to_representative_info: HashMap<usize, (Vec<Symbol>, usize)> = HashMap::new(); // (rep_symbols, total_usage)
     let mut next_final_id_counter = 0;
+
+    // Helper map to quickly find grammar by ID
+    let grammar_map: HashMap<usize, &Grammar> = grammars_with_ids.iter().map(|(id, g)| (*id, g)).collect();
 
     for temp_global_id in 0..num_rules {
         let representative_temp_id = uf.find(temp_global_id);
-        let (_, grammar_ptr, old_rule_id, _) = temp_global_to_info[temp_global_id].clone(); // Don't need symbols here
+        let (_, grammar_id, old_rule_id, _) = temp_global_to_info[temp_global_id]; 
 
-        // Assign a final ID if this representative hasn't been seen yet
-        let final_new_rule_id = *representative_to_new_id.entry(representative_temp_id).or_insert_with(|| {
+        // Safely get usage count from original grammar using grammar_id
+        let usage_count = grammar_map.get(&grammar_id)
+            .and_then(|g| g.rules.get(&old_rule_id))
+            .map_or(0, |r| r.usage_count);
+
+        let final_new_id = *representative_to_final_id.entry(representative_temp_id).or_insert_with(|| {
             let new_id = next_final_id_counter;
             next_final_id_counter += 1;
-
-            // Get the info corresponding to the representative temp ID
-            let (_, rep_grammar_ptr, rep_old_id, rep_symbols) = temp_global_to_info[representative_temp_id].clone();
-
-            // Store the representative's original context and symbols with the new final ID
-            final_merged_rules_info.insert(new_id, (rep_grammar_ptr, rep_old_id, rep_symbols));
-
+            // Get representative info 
+            let (_, _, _, rep_symbols) = temp_global_to_info[representative_temp_id].clone(); 
+            final_id_to_representative_info.insert(new_id, (rep_symbols, 0)); 
             new_id
         });
 
-        // Map the original rule to its final new representative ID
-        final_rule_map.insert((grammar_ptr, old_rule_id), final_new_rule_id);
+        // Add origin
+        final_id_to_origins.entry(final_new_id).or_default().push((grammar_id, old_rule_id));
+        // Add usage count
+        if let Some((_, total_usage)) = final_id_to_representative_info.get_mut(&final_new_id) {
+            *total_usage += usage_count;
+        }
+    }
+    
+    // Create final_rule_map (old -> new)
+    let mut final_rule_map = HashMap::new(); // Maps (grammar_id, old_rule_id) -> final_new_id
+    for (final_id, origins) in &final_id_to_origins {
+        for (grammar_id, old_rule_id) in origins {
+             final_rule_map.insert((*grammar_id, *old_rule_id), *final_id);
+        }
     }
 
-    // --- Step 4: Create final rules and update non-terminal references ---
+    // --- Step 4 (Modified): Create final rules with remapped symbols and total usage ---
     let mut final_merged_rules_map: HashMap<usize, Rule> = HashMap::new();
-
-    for (final_id, (rep_grammar_ptr, _rep_old_id, rep_symbols)) in final_merged_rules_info {
+    for (final_id, (rep_symbols, total_usage_count)) in final_id_to_representative_info {
         let mut final_symbols = Vec::with_capacity(rep_symbols.len());
-        let mut needs_update = false; // Track if any symbol was updated
 
+        // Remap non-terminals within the representative symbols
         for original_symbol in rep_symbols {
             if let SymbolType::NonTerminal(old_child_id) = original_symbol.symbol_type {
-                // Use the representative's context (rep_grammar_ptr) and the child's old ID
-                // to find the final ID in the map.
-                if let Some(final_new_child_id) = final_rule_map.get(&(rep_grammar_ptr, old_child_id)) {
-                    if *final_new_child_id != old_child_id { // Avoid redundant clones if ID is same
-                         // Create a new symbol with the updated ID
-                         final_symbols.push(Symbol {
-                            id: original_symbol.id, // Keep original instance ID? Or update? Let's keep for now.
-                            symbol_type: SymbolType::NonTerminal(*final_new_child_id),
-                            strand: original_symbol.strand,
-                         });
-                         needs_update = true;
-                    } else {
-                        final_symbols.push(original_symbol); // No change needed
-                    }
+                // Find the grammar_id associated with the *representative* rule
+                // This requires finding an origin for this final_id
+                let (origin_grammar_id, _) = final_id_to_origins.get(&final_id)
+                                                .and_then(|origins| origins.first()) // Take the first origin as the context for remapping children
+                                                .cloned()
+                                                .ok_or_else(|| anyhow::anyhow!("No origin found for final rule ID {}", final_id)).unwrap(); 
+                                                
+                // Lookup using the representative's original grammar_id and the old_child_id
+                if let Some(final_new_child_id) = final_rule_map.get(&(origin_grammar_id, old_child_id)) {
+                    final_symbols.push(Symbol {
+                        id: original_symbol.id, 
+                        symbol_type: SymbolType::NonTerminal(*final_new_child_id),
+                        strand: original_symbol.strand,
+                    });
                 } else {
-                    // Child ID not found in map - should not happen in a consistent grammar merge.
-                    eprintln!("Warning: Could not remap non-terminal ID {} (from grammar {:?}) in rule {}", old_child_id, rep_grammar_ptr, final_id);
-                    final_symbols.push(original_symbol); // Keep original symbol
+                    eprintln!("Warning: Could not remap non-terminal ID {} (from grammar {}) in rule {}", old_child_id, origin_grammar_id, final_id);
+                    final_symbols.push(original_symbol); // Keep original
                 }
             } else {
-                // Terminal symbol, add as is
-                final_symbols.push(original_symbol);
+                final_symbols.push(original_symbol); // Terminal
             }
         }
 
-        // Create the final rule object
-        // TODO: Recalculate usage_count and positions based on merging if needed
+        // Create the final rule
         final_merged_rules_map.insert(final_id, Rule {
             id: final_id,
             symbols: final_symbols,
-            usage_count: 0, // Placeholder - usage needs recalculation
-            positions: Vec::new(), // Placeholder - positions need recalculation/merging
-            depth: None, // Placeholder - depth needs recalculation
+            usage_count: total_usage_count, // Use summed usage count
+            positions: Vec::new(),     // Positions are lost/invalid after merge
+            depth: None,               // Depth needs recalculation
         });
     }
 
-    (final_rule_map, final_merged_rules_map)
+    (final_rule_map, final_merged_rules_map, final_id_to_origins)
 }
 
 /// Calculate the maximum rule depth in a grammar
@@ -456,14 +499,15 @@ mod tests {
             chunk_size: 5,
             overlap_size: 2,
             min_rule_usage: 2,
-            reverse_aware: false,
+            reverse_aware: true,
             num_threads: 2,
             show_progress: false,
             adaptive_chunking: false,
             max_memory_per_chunk: None,
+            use_gpu: false,
         };
         
-        let (grammar, metrics) = parallel_sequitur(&bases, config)?;
+        let (grammar, metrics) = parallel_sequitur(&bases, config, None)?;
         
         // Simple test to ensure we get a valid grammar
         assert!(!grammar.sequence.is_empty());

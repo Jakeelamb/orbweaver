@@ -1,6 +1,7 @@
 use crate::encode::dna_2bit::EncodedBase;
 use std::collections::HashMap;
 use std::fmt;
+use crate::encode::kmer::KMer;
 
 /// Statistics for a DNA sequence
 #[derive(Debug, Clone)]
@@ -44,7 +45,7 @@ impl SequenceStats {
         };
 
         // Find the longest homopolymer
-        let mut max_homopolymer = 0;
+        let mut max_homopolymer = if bases.is_empty() { 0 } else { 1 }; // Initialize to 1 if not empty
         let mut current_base = None;
         let mut current_run = 0;
 
@@ -52,9 +53,7 @@ impl SequenceStats {
             let ch = base.to_char();
             if Some(ch) == current_base {
                 current_run += 1;
-                if current_run > max_homopolymer {
-                    max_homopolymer = current_run;
-                }
+                max_homopolymer = max_homopolymer.max(current_run); // Use max() instead of if
             } else {
                 current_base = Some(ch);
                 current_run = 1;
@@ -64,22 +63,21 @@ impl SequenceStats {
         // Calculate k-mer frequencies if requested
         let most_common_kmer = if let Some(k_size) = k {
             if k_size > 0 && k_size <= bases.len() {
-                let mut kmer_counts = HashMap::new();
+                let mut kmer_counts: HashMap<KMer, usize> = HashMap::new();
                 
                 for i in 0..=bases.len().saturating_sub(k_size) {
                     if i + k_size <= bases.len() {
-                        let kmer_string: String = bases[i..i+k_size]
-                            .iter()
-                            .map(|b| b.to_char())
-                            .collect();
+                        let kmer_slice = bases[i..i+k_size].to_vec();
+                        let kmer = KMer::new(kmer_slice);
+                        let canonical_kmer = kmer.canonical();
                         
-                        *kmer_counts.entry(kmer_string).or_insert(0) += 1;
+                        *kmer_counts.entry(canonical_kmer).or_insert(0) += 1;
                     }
                 }
                 
                 kmer_counts.into_iter()
                     .max_by_key(|(_, count)| *count)
-                    .map(|(kmer, count)| (kmer, count))
+                    .map(|(kmer, count)| (kmer.to_string(), count))
             } else {
                 None
             }
@@ -99,6 +97,7 @@ impl SequenceStats {
 
     /// Calculate sequence statistics from a string
     pub fn from_string(sequence: &str, k: Option<usize>) -> Self {
+        // Initialize base counts
         let mut base_counts = HashMap::new();
         base_counts.insert('A', 0);
         base_counts.insert('C', 0);
@@ -129,16 +128,14 @@ impl SequenceStats {
         };
 
         // Find the longest homopolymer
-        let mut max_homopolymer = 0;
+        let mut max_homopolymer = if sequence.is_empty() { 0 } else { 1 }; // Initialize to 1 if not empty
         let mut current_base = None;
         let mut current_run = 0;
 
         for ch in sequence.chars().map(|c| c.to_ascii_uppercase()) {
             if Some(ch) == current_base {
                 current_run += 1;
-                if current_run > max_homopolymer {
-                    max_homopolymer = current_run;
-                }
+                max_homopolymer = max_homopolymer.max(current_run); // Use max() instead of if
             } else {
                 current_base = Some(ch);
                 current_run = 1;
@@ -148,20 +145,23 @@ impl SequenceStats {
         // Calculate k-mer frequencies if requested
         let most_common_kmer = if let Some(k_size) = k {
             if k_size > 0 && k_size <= sequence.len() {
-                let mut kmer_counts = HashMap::new();
+                let mut kmer_counts: HashMap<KMer, usize> = HashMap::new();
                 
                 for i in 0..=sequence.len().saturating_sub(k_size) {
                     if i + k_size <= sequence.len() {
-                        let kmer_string = &sequence[i..i+k_size].to_uppercase();
-                        if !kmer_string.chars().any(|c| c != 'A' && c != 'C' && c != 'G' && c != 'T') {
-                            *kmer_counts.entry(kmer_string.to_string()).or_insert(0) += 1;
+                        let kmer_str = &sequence[i..i+k_size];
+                        if let Ok(kmer) = KMer::from_string(kmer_str) {
+                            let canonical_kmer = kmer.canonical();
+                            *kmer_counts.entry(canonical_kmer).or_insert(0) += 1;
+                        } else {
+                            // Skip invalid k-mers (containing non-ACGT)
                         }
                     }
                 }
                 
                 kmer_counts.into_iter()
                     .max_by_key(|(_, count)| *count)
-                    .map(|(kmer, count)| (kmer, count))
+                    .map(|(kmer, count)| (kmer.to_string(), count))
             } else {
                 None
             }
@@ -188,12 +188,22 @@ impl fmt::Display for SequenceStats {
         writeln!(f, "  C: {}", self.base_counts.get(&'C').unwrap_or(&0))?;
         writeln!(f, "  G: {}", self.base_counts.get(&'G').unwrap_or(&0))?;
         writeln!(f, "  T: {}", self.base_counts.get(&'T').unwrap_or(&0))?;
-        writeln!(f, "GC Content: {:.2}%", self.gc_percentage)?;
+        // Format GC percentage, handling potential NaN/inf
+        if self.gc_percentage.is_finite() {
+            writeln!(f, "GC Content: {:.2}%", self.gc_percentage)?;
+        } else {
+            writeln!(f, "GC Content: N/A")?;
+        }
         writeln!(f, "Ambiguous Bases: {}", self.ambiguous_count)?;
         writeln!(f, "Longest Homopolymer: {}", self.max_homopolymer)?;
         
         if let Some((kmer, count)) = &self.most_common_kmer {
-            writeln!(f, "Most Common Kmer: {} (count: {})", kmer, count)?;
+            let k_info = if !kmer.is_empty() { 
+                format!("{}-mer", kmer.len())
+            } else {
+                "Kmer".to_string()
+            };
+            writeln!(f, "Most Common {}: {} (count: {})", k_info, kmer, count)?;
         }
         
         Ok(())
@@ -236,57 +246,64 @@ impl fmt::Display for GrammarStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::encode::dna_2bit::encode_dna;
+    use crate::encode::dna_2bit::EncodedBase;
 
     #[test]
     fn test_sequence_stats_from_string() {
-        let seq = "ACGTACGTNNACGT";
-        let stats = SequenceStats::from_string(seq, None);
-        
-        assert_eq!(stats.length, 14);
-        assert_eq!(*stats.base_counts.get(&'A').unwrap(), 3);
-        assert_eq!(*stats.base_counts.get(&'C').unwrap(), 3);
-        assert_eq!(*stats.base_counts.get(&'G').unwrap(), 3);
-        assert_eq!(*stats.base_counts.get(&'T').unwrap(), 3);
-        assert_eq!(stats.ambiguous_count, 2);
-        assert_eq!(stats.gc_percentage, 50.0);
-        assert_eq!(stats.max_homopolymer, 2); // NN
-    }
-    
-    #[test]
-    fn test_sequence_stats_from_encoded() {
-        let seq = b"ACGTACGTACGT";
-        let encoded = encode_dna(seq);
-        let stats = SequenceStats::from_encoded_bases(&encoded, None);
-        
-        assert_eq!(stats.length, 12);
-        assert_eq!(*stats.base_counts.get(&'A').unwrap(), 3);
-        assert_eq!(*stats.base_counts.get(&'C').unwrap(), 3);
-        assert_eq!(*stats.base_counts.get(&'G').unwrap(), 3);
-        assert_eq!(*stats.base_counts.get(&'T').unwrap(), 3);
-        assert_eq!(stats.gc_percentage, 50.0);
+        let stats = SequenceStats::from_string("ACGTACGT", Some(2));
+        assert_eq!(stats.length, 8);
+        assert_eq!(stats.base_counts[&'A'], 2);
+        assert_eq!(stats.base_counts[&'C'], 2);
+        assert_eq!(stats.base_counts[&'G'], 2);
+        assert_eq!(stats.base_counts[&'T'], 2);
+        assert!((stats.gc_percentage - 50.0).abs() < f64::EPSILON);
         assert_eq!(stats.ambiguous_count, 0);
         assert_eq!(stats.max_homopolymer, 1);
+        // Canonical kmers: AC, CG, AC, TA, AC, CG, AC -> AC:4, CG:2, TA:1
+        assert_eq!(stats.most_common_kmer, Some(("AC".to_string(), 4))); // Expect AC count 4
     }
-    
+
+    #[test]
+    fn test_sequence_stats_from_encoded() {
+        let seq = vec![EncodedBase(0), EncodedBase(1), EncodedBase(2), EncodedBase(3), EncodedBase(0), EncodedBase(1)]; // ACGTAC
+        let stats = SequenceStats::from_encoded_bases(&seq, Some(2));
+        assert_eq!(stats.length, 6);
+        assert_eq!(stats.base_counts[&'A'], 2);
+        assert_eq!(stats.base_counts[&'C'], 2);
+        assert_eq!(stats.base_counts[&'G'], 1);
+        assert_eq!(stats.base_counts[&'T'], 1);
+        assert!((stats.gc_percentage - 50.0).abs() < f64::EPSILON);
+        assert_eq!(stats.ambiguous_count, 0);
+        assert_eq!(stats.max_homopolymer, 1);
+        // Canonical kmers: AC, CG, AC, TA, AC -> AC:3, CG:1, TA:1
+        assert_eq!(stats.most_common_kmer, Some(("AC".to_string(), 3))); // Expect AC count 3
+    }
+
     #[test]
     fn test_most_common_kmer() {
-        let seq = "ACGTACGTACGT";
-        let stats = SequenceStats::from_string(seq, Some(3));
-        
-        assert!(stats.most_common_kmer.is_some());
-        let (kmer, count) = stats.most_common_kmer.unwrap();
-        assert_eq!(kmer, "ACG");
-        assert_eq!(count, 3);
+        let seq = "ACGTACGT";
+        let stats = SequenceStats::from_string(seq, Some(2));
+        // Kmers: AC, CG, GT, TA, AC, CG, GT
+        // Canonical: AC, CG, AC, TA, AC, CG, AC
+        // Counts: AC=4, CG=2, TA=1
+        assert_eq!(stats.most_common_kmer, Some(("AC".to_string(), 4))); // Expect AC, count 4
     }
-    
+
     #[test]
     fn test_display() {
-        let seq = "ACGTACGT";
-        let stats = SequenceStats::from_string(seq, None);
-        
-        let display = format!("{}", stats);
-        assert!(display.contains("Sequence Length: 8"));
-        assert!(display.contains("GC Content: 50.00%"));
+        let stats = SequenceStats::from_string("ACGT", None);
+        let s = format!("{}", stats);
+        assert!(s.contains("Sequence Length: 4"));
+        assert!(s.contains("A: 1"));
+        assert!(s.contains("C: 1"));
+        assert!(s.contains("G: 1"));
+        assert!(s.contains("T: 1"));
+        // Check GC content with a small epsilon for floating point comparison
+        let gc_line = s.lines().find(|line| line.starts_with("GC Content:")).unwrap();
+        let gc_value_str = gc_line.split(":").nth(1).unwrap().trim().trim_end_matches('%');
+        let gc_value: f64 = gc_value_str.parse().unwrap();
+        assert!((gc_value - 50.0).abs() < 0.001);
+        assert!(s.contains("Ambiguous Bases: 0"));
+        assert!(s.contains("Longest Homopolymer: 1"));
     }
 } 

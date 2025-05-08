@@ -4,6 +4,7 @@ pub mod engine;
 pub mod digram;
 pub mod digram_table;
 pub mod builder;
+pub mod kmer_table;
 
 // Export core types for anyone importing the grammar module
 pub use crate::grammar::rule::Rule;

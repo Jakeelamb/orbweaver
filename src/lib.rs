@@ -6,6 +6,7 @@ pub mod grammar;
 pub mod io;
 pub mod utils;
 pub mod parallel;
+pub mod gpu;
 // pub mod tests; // Typically tests are not declared as a library module
 
 // Optional: Re-export key functions/structs if needed for easier access

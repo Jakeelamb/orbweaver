@@ -35,7 +35,7 @@ This document provides comprehensive information about using the Orbweaver comma
 | Option | Description | Default |
 |--------|-------------|---------|
 | `--skip-ns <BOOL>` | Skip N bases in FASTA input | true |
-| `--chunk-size <SIZE>` | Process genome in chunks of this size | No chunking |
+| `--chunk-size <SIZE>` | Process genome in chunks of this size | 0 (auto) |
 | `--chunk-overlap <SIZE>` | Overlap between chunks when chunking is enabled | 1000 |
 | `--streaming` | Process FASTA in streaming mode (low memory usage) | false |
 | `--adaptive-chunking` | Dynamically adjust chunk sizes based on sequence complexity | false |
@@ -43,6 +43,7 @@ This document provides comprehensive information about using the Orbweaver comma
 | `--max-memory-per-chunk-mb <SIZE>` | Maximum memory usage per chunk in MB | System dependent |
 | `--use-encoding <BOOL>` | Use 2-bit encoding to reduce memory usage | true |
 | `--threads <COUNT>` | Number of threads to use for parallel processing | Logical CPU count |
+| `--use-gpu` | Enable GPU acceleration for computation-intensive operations | false |
 
 ### Miscellaneous
 
@@ -223,6 +224,11 @@ orbweaver -i ultra_large_genome.fasta -j grammar.json \
   --min-rule-usage 5
 ```
 
+### GPU-Accelerated Processing
+```bash
+orbweaver -i input.fasta -j grammar.json --use-gpu
+```
+
 ### Using the Run Script for Common Workflows
 ```bash
 # Basic usage
@@ -268,10 +274,43 @@ dot -Tsvg grammar.dot -o grammar.svg
 6. For processing multiple files, start with smaller genomes to tune parameters
 7. Consider using `--adaptive-chunking` when processing genomes with varying complexity
 8. Use `--sequence-indices` to process only the specific sequences you need
+9. Enable GPU acceleration with `--use-gpu` for faster processing of large sequences
 
 ```bash
 ./target/release/orbweaver --help
 ```
+
+### GPU Acceleration
+
+Orbweaver supports GPU acceleration for computationally intensive operations using OpenCL. To enable:
+
+```bash
+orbweaver -i input.fasta -j output.json --use-gpu
+```
+
+#### What's accelerated on the GPU:
+
+1. **Digram Finding**: The most frequent pattern finding process, which is core to grammar construction, is accelerated with parallel digram counting and hash computation.
+   
+2. **Suffix Array Construction**: Suffix arrays are built in parallel using an efficient prefix doubling algorithm, significantly speeding up work on large sequences.
+
+#### Requirements:
+
+- OpenCL-compatible GPU (NVIDIA, AMD, or Intel)
+- Appropriate drivers installed:
+  - NVIDIA: CUDA drivers with OpenCL support
+  - AMD: ROCm or Catalyst/Adrenalin drivers
+  - Intel: Latest graphics drivers
+
+Run `clinfo` to verify your system's OpenCL configuration.
+
+#### Performance Considerations:
+
+- GPU acceleration provides the most benefit for sequences larger than 10MB
+- Small sequences may see minimal or even negative speedup due to data transfer overhead
+- Best results are typically seen with large, complex genomes (100MB+)
+
+If no compatible GPU is detected, Orbweaver will automatically fall back to CPU-based OpenCL or pure CPU processing.
 
 ```text
 Orbweaver: A grammar-based approach to genomic sequence analysis.
@@ -413,6 +452,12 @@ Options:
           
           Limits the memory usage of each chunk when adaptive chunking
           is enabled. Helps prevent out-of-memory errors.
+          
+      --use-gpu
+          Enable GPU acceleration.
+          
+          Use GPU acceleration for computationally intensive operations
+          like suffix array construction and digram counting.
 
   -h, --help
           Print help (see more with '--help')
@@ -443,5 +488,6 @@ Options:
 *   `--sequence-indices <LIST>`: Comma-separated list of indices of sequences to process (0-based).
 *   `--max-memory-per-chunk-mb <SIZE>`: Maximum memory usage per chunk in MB.
 *   `--threads <COUNT>`: Number of threads to use for parallel processing.
+*   `--use-gpu`: If present, enables GPU acceleration for computationally intensive operations.
 *   `-h, --help`: Prints the help message.
 *   `-V, --version`: Prints the version of the tool. 

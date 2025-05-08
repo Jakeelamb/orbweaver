@@ -8,7 +8,7 @@ This format provides a direct serialization of the internal grammar representati
 
 ```json
 {
-  "final_sequence": [
+  "sequence": [
     {
       "id": 10,
       "symbol_type": {
@@ -44,24 +44,50 @@ This format provides a direct serialization of the internal grammar representati
           "strand": "+"
         }
       ],
-      "usage_count": 4
+      "usage_count": 4,
+      "depth": 1
     },
     "1": {
        // ... definition for Rule 1 ...
     }
     // ... more rules 
-  }
+  },
+  "max_depth": 3
 }
 ```
 
-*   `final_sequence`: An array of `Symbol` objects representing the compressed sequence after all rule replacements.
+*   `sequence`: An array of `Symbol` objects representing the compressed sequence after all rule replacements.
 *   `rules`: A map where keys are rule IDs (as strings) and values are `Rule` objects.
 *   `Symbol`: Contains the instance `id` (its original position or ID context), `symbol_type` (`Terminal` with ASCII value or `NonTerminal` with rule ID), and `strand` (`+` or `-`).
-*   `Rule`: Contains the rule `id`, the `symbols` it expands to, and its `usage_count`.
+*   `Rule`: Contains the rule `id`, the `symbols` it expands to, its `usage_count`, and its hierarchical `depth` in the grammar.
+*   `max_depth`: The maximum depth of any rule in the grammar.
 
-## 2. GFAv1 (`--output-gfa <PATH>`)
+**Note on Merged Grammars and Rule Origins:**
+When processing multiple input files, Orbweaver merges the resulting grammars. The internal `Grammar` structure contains an `origins` field (a map from a final merged rule ID to a list of `(source_grammar_id, original_rule_id)` tuples). This field helps trace rules back to their source grammars before merging. Currently, this `origins` field is marked with `#[serde(skip)]` and is not included in the JSON output, but it's an important aspect of how multi-genome comparisons are handled internally.
 
-Graphical Fragment Assembly format, version 1. This output is **experimental** and aims to represent the grammar structure.
+## 2. Tabular Repeat Summary (`--output-repeats <PATH>`)
+
+This option generates a tab-separated values (TSV) file summarizing identified repeats. This format is convenient for quick review and import into spreadsheet software.
+
+```tsv
+RuleID	UsageCount	ExpandedLength	Sequence(Preview)
+R0	5	120	GATTACA...
+R17	3	88	CGCGCGC...
+...
+```
+
+The columns are:
+
+*   **RuleID**: The identifier of the rule (e.g., `R0`, `R17`).
+*   **UsageCount**: The number of times this rule (and thus the repeat it represents) appears in the final compressed sequence(s). A simple heuristic might define a repeat as any rule with `UsageCount >= 2`.
+*   **ExpandedLength**: The total length of the DNA sequence when this rule is fully expanded to its terminal bases.
+*   **Sequence(Preview)**: A short preview of the fully expanded DNA sequence of the rule (e.g., the first 50 bases).
+
+The repeats are typically sorted by `UsageCount` in descending order.
+
+## 3. GFAv1 (`--output-gfa <PATH>`)
+
+Graphical Fragment Assembly format, version 1. This output represents the grammar structure as a graph.
 
 *   **H Line**: Standard GFA header (`H\tVN:Z:1.0`).
 *   **S Lines**: Each rule is represented as a segment (`S`).
@@ -78,9 +104,9 @@ Graphical Fragment Assembly format, version 1. This output is **experimental** a
     *   Example: `L\tR0\t+\tR1\t-\t0M` (Link from rule R0 to rule R1 with opposite strand)
     *   Example: `L\tR0\t+\tT_C+\t+\t0M` (Link from rule R0 to terminal C+)
 
-**Note:** The interpretation of grammar rules in GFA can vary. This representation focuses on showing the components of each rule. Visualizers may or may not display this intuitively as a grammar hierarchy.
+The GFA output can be visualized using tools like Bandage (https://rrwick.github.io/Bandage/).
 
-## 3. Text (`--output-text <PATH>`)
+## 4. Text (`--output-text <PATH>`)
 
 A human-readable text format describing the final sequence and rules.
 
@@ -99,20 +125,65 @@ R1 [Usage=1] -> R0+ G-
     *   `[Usage=<count>]`: The number of times this rule was used (replaced digrams).
     *   `-> Symbol1 Symbol2 ...`: The sequence of symbols the rule expands to.
 
-## 4. FASTA (`--export-blocks <PATH>`)
+## 5. FASTA (`--export-blocks <PATH>`)
 
 Exports the fully expanded DNA sequence for each rule in standard FASTA format.
 
 ```fasta
->Rule_0 [Usage=4]
+>Rule_0 [Usage=4] depth=1
 ACGTACGT
->Rule_1 [Usage=2]
+>Rule_1 [Usage=2] depth=2
 TTGC
 >Rule_2_ERROR [Usage=1]
 Error reconstructing sequence: Cycle detected involving rule 2
 ```
 
 *   Each record corresponds to one rule.
-*   The header line includes `Rule_<id>` and the `Usage=<count>`.
+*   The header line includes `Rule_<id>`, `Usage=<count>`, and `depth=<depth>`.
 *   The sequence is the fully expanded DNA sequence for that rule.
-*   If an error occurs during reconstruction (e.g., a cycle is detected), an error record is written instead. 
+*   If an error occurs during reconstruction (e.g., a cycle is detected), an error record is written instead.
+
+## 6. DOT (`--visualize <PATH>`)
+
+Generates a DOT file for visualization with Graphviz tools.
+
+```dot
+digraph Grammar {
+  rankdir=LR;
+  node [shape=box, style=filled, fillcolor=lightblue];
+  
+  R0 [label="R0 (used: 4)", fillcolor="#9999cc"];
+  R1 [label="R1 (used: 2)", fillcolor="#aaaadd"];
+  
+  R0 -> R1 [label="+"];
+  R0 -> R0_T0 [label="A+"];
+  R0_T0 [label="A+", shape=ellipse, fillcolor=lightgreen];
+  
+  // ... more nodes and edges
+}
+```
+
+The DOT file represents the grammar as a directed graph where:
+- Rules are represented as box-shaped nodes
+- Terminals are represented as ellipse-shaped nodes
+- Edges represent the expansion of rules
+- Colors can represent rule depth (darker colors for deeper rules)
+- Edge labels show strand information
+
+To generate an image from the DOT file:
+
+```bash
+dot -Tpng grammar.dot -o grammar.png
+# or
+dot -Tsvg grammar.dot -o grammar.svg
+```
+
+## Custom Format Extensions
+
+Orbweaver supports custom format extensions through code modifications. The extension points are:
+
+1. Implement a new writer function in the `io/` module
+2. Add a new enum variant to `OutputFormat` in `utils/io.rs`
+3. Update the argument parsing in `main.rs` to accept the new format
+
+The current output formats are all implemented via these extension points, making it straightforward to add new formats as needed. 

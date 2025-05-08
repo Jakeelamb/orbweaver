@@ -1,9 +1,0 @@
-H	VN:Z:1.0
-S	3	ACGTACGT	LN:i:8
-S	0	GT	LN:i:2
-S	2	ACGT	LN:i:4
-S	1	CGT	LN:i:3
-L	2	+	2	+	0M
-L	T_G	+	T_T	+	0M
-L	T_A	+	1	+	0M
-L	T_C	+	0	+	0M

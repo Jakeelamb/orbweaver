@@ -18,6 +18,10 @@ pub struct Grammar {
     
     /// Maximum rule depth (for hierarchy analysis)
     pub max_depth: usize,
+
+    /// Map from final rule ID to list of original (source_grammar_id, old_rule_id) tuples
+    /// This field is populated after merging multiple grammars.
+    pub origins: HashMap<usize, Vec<(usize, usize)>>,
 }
 
 /// Sequitur algorithm implementation for inferring hierarchical structure in sequences
@@ -58,6 +62,7 @@ impl Sequitur {
             sequence: symbols,
             rules: HashMap::new(),
             max_depth: 0,
+            origins: HashMap::new(),
         })
     }
 }

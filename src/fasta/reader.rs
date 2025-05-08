@@ -6,6 +6,7 @@ use std::path::Path;
 use memmap2::Mmap;
 use rayon::prelude::*;
 use std::sync::Arc;
+use std::path::PathBuf;
 
 /// Trait for reading FASTA sequence data in chunks.
 /// Implementations allow memory-efficient access to large sequences.
@@ -584,4 +585,46 @@ impl FastaReader for InMemoryFastaReader {
             Err(anyhow::anyhow!("Sequence ID {} out of range", sequence_id))
         }
     }
+}
+
+/// Reads sequences from multiple FASTA files, optionally skipping 'N' bases.
+pub fn read_sequences_from_multiple_files(fasta_paths: &[PathBuf], skip_ns: bool) -> Result<Vec<(String, Vec<u8>)>> {
+    let mut all_sequences = Vec::new();
+    println!("Reading {} FASTA file(s)...", fasta_paths.len());
+
+    for (file_index, path) in fasta_paths.iter().enumerate() {
+        println!("Processing file {}/{}: {}", file_index + 1, fasta_paths.len(), path.display());
+        let file_sequences = read_fasta_sequences(path, skip_ns)
+            .with_context(|| format!("Failed to read sequences from file: {}", path.display()))?;
+
+        // Prepend filename/index to record ID for uniqueness
+        let filename_prefix = path.file_stem().map_or_else(|| format!("file{}", file_index), |s| s.to_string_lossy().to_string());
+        for (id, seq) in file_sequences {
+            all_sequences.push((format!("{}:{}", filename_prefix, id), seq));
+        }
+    }
+
+    println!("Finished reading all files. Total sequences: {}", all_sequences.len());
+    Ok(all_sequences)
+}
+
+/// Asynchronously reads sequences from multiple FASTA files, optionally skipping 'N' bases.
+pub async fn read_sequences_from_multiple_files_async(fasta_paths: &[PathBuf], skip_ns: bool) -> Result<Vec<(String, Vec<u8>)>> {
+    let mut all_sequences = Vec::new();
+    println!("Reading {} FASTA file(s) asynchronously...", fasta_paths.len());
+
+    for (file_index, path) in fasta_paths.iter().enumerate() {
+        println!("Processing file {}/{}: {}", file_index + 1, fasta_paths.len(), path.display());
+        let file_sequences = read_fasta_sequences_async(path, skip_ns).await
+            .with_context(|| format!("Failed to read sequences asynchronously from file: {}", path.display()))?;
+
+        // Prepend filename/index to record ID for uniqueness
+        let filename_prefix = path.file_stem().map_or_else(|| format!("file{}", file_index), |s| s.to_string_lossy().to_string());
+        for (id, seq) in file_sequences {
+            all_sequences.push((format!("{}:{}", filename_prefix, id), seq));
+        }
+    }
+
+    println!("Finished reading all files asynchronously. Total sequences: {}", all_sequences.len());
+    Ok(all_sequences)
 } 

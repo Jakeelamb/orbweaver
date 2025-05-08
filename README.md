@@ -32,13 +32,14 @@ Orbweaver is a command-line tool written in Rust for building and analyzing cont
   - **GFA**: Graph-based representation (Graphical Fragment Assembly)
   - **DOT**: For visualization using Graphviz
   - **FASTA**: Exports expanded sequences for each rule
+  - **Tabular Repeat Summary**: TSV file with rule ID, usage, length, and sequence preview (`--output-repeats`)
 - **Statistics**: Calculates compression ratio, rule depth, and other metrics
 - **Parallelization**: Configurable multi-threading for parallel chunk processing on large genomes.
+- **GPU Acceleration**: OpenCL-based acceleration for computationally intensive operations. Enabled by default; use `--no-gpu` for CPU fallback.
 - **Advanced Memory Management**:
   - **2-bit Encoding**: Efficient DNA storage using 2 bits per base
   - **Streaming Mode**: Process very large genomes without loading entirely into memory
-  - **Adaptive Chunking**: Dynamically adjusts chunk sizes based on sequence complexity
-  - **Rule Eviction**: Prevents memory growth by removing less useful rules
+  - **Rule Eviction**: Prevents memory growth by removing less useful rules (`--max-rule-count`)
 - **Multi-Sequence Support**: Process selected sequences from multi-FASTA files using sequence indices.
 
 ## Installation
@@ -47,6 +48,7 @@ Orbweaver is a command-line tool written in Rust for building and analyzing cont
 
 - Rust and Cargo (1.70.0+)
 - For visualization: Graphviz (optional)
+- For GPU acceleration: OpenCL-compatible device and drivers (optional)
 
 ### From Source
 
@@ -64,29 +66,28 @@ cargo build --release
 ## Quick Start
 
 ```bash
-# Process a FASTA file and output the grammar as JSON
-./target/release/orbweaver -i input.fasta -j output.json
+# Process a FASTA file using GPU (default) and output the grammar as JSON
+./target/release/orbweaver --input-files input.fasta -j output.json
 
-# Generate all outputs and print statistics
-./target/release/orbweaver -i genome.fna \
+# Process multiple FASTA files using CPU and output a repeat summary table
+./target/release/orbweaver --input-files genome1.fna,genome2.fna --no-gpu --output-repeats repeats_summary.tsv
+
+# Generate all outputs and print statistics (using GPU by default)
+./target/release/orbweaver --input-files genome.fna \
   -j output/grammar.json \
   --output-text output/grammar.txt \
   --output-gfa output/grammar.gfa \
   --visualize output/grammar.dot \
   --export-blocks output/rules.fasta \
+  --output-repeats output/repeats_summary.tsv \
   --stats
 
-# Memory-efficient processing of large genomes with streaming
-./target/release/orbweaver -i large_genome.fasta \
+# Memory-efficient processing of large genomes with streaming (GPU default)
+./target/release/orbweaver --input-files large_genome.fasta \
   -j output/grammar.json \
   --streaming \
-  --max-memory-per-chunk-mb 500 \
+  --max-rule-count 10000 \
   --min-rule-usage 5
-
-# Process only specific sequences from a multi-FASTA file
-./target/release/orbweaver -i multi_genome.fasta \
-  -j output/grammar.json \
-  --sequence-indices 0,2,5
 
 # See all available options
 ./target/release/orbweaver --help
@@ -116,18 +117,19 @@ When "reverse-aware" mode is enabled, digrams that are reverse complements of ea
 ### Basic Usage
 
 ```bash
-orbweaver -i <input_fasta> [options]
+orbweaver --input-files <file1.fa[,file2.fa,...]> [options]
 ```
 
 ### Required Arguments
 
-- `-i, --input <FILE>`: Input FASTA file path (.fa, .fasta, .fna)
+- `-i, --input-files <FILES>`: Comma-separated paths to input FASTA files (.fa, .fasta, .fna).
 
 ### Output Options
 
 - `-j, --output-json <FILE>`: Write grammar to JSON file
 - `--output-text <FILE>`: Write grammar in human-readable text format
 - `--output-gfa <FILE>`: Write grammar in GFA (graph) format
+- `--output-repeats <FILE>`: Write tabular summary of repeats (TSV format)
 - `--visualize <FILE>`: Generate DOT file for visualization
 - `--export-blocks <FILE>`: Export grammar rules as FASTA sequences
 - `--stats`: Print statistics about the generated grammar
@@ -142,13 +144,8 @@ orbweaver -i <input_fasta> [options]
 ### Input Processing Options
 
 - `--skip-ns <BOOL>`: Skip 'N' bases in input (default: true)
-- `--chunk-size <INT>`: Process genome in chunks of this size using parallel processing (optional)
-- `--chunk-overlap <INT>`: Overlap between chunks (default: 1000)
-- `--threads <INT>`: Number of threads to use for parallel processing (default: system's thread count)
 - `--streaming`: Process the FASTA file in streaming mode for lower memory usage
-- `--adaptive-chunking`: Dynamically adjust chunk sizes based on sequence complexity
-- `--sequence-indices <LIST>`: Process only selected sequences from multi-sequence FASTA files
-- `--max-memory-per-chunk-mb <INT>`: Maximum memory usage per chunk in MB (with adaptive chunking)
+- `--no-gpu`: Disable GPU acceleration and use CPU fallback (GPU is enabled by default).
 
 For full details, run `orbweaver --help`.
 
@@ -210,14 +207,14 @@ See [Output Formats Documentation](docs/output_formats.md) for more details.
 ### Basic Grammar Construction
 
 ```bash
-orbweaver -i sample.fasta -j grammar.json --stats
+orbweaver --input-files sample.fasta -j grammar.json --stats
 ```
 
 ### Visualizing the Grammar
 
 ```bash
 # Generate DOT file
-orbweaver -i sample.fasta --visualize grammar.dot
+orbweaver --input-files sample.fasta --visualize grammar.dot
 
 # Convert to PNG using Graphviz
 dot -Tpng grammar.dot -o grammar.png
@@ -226,21 +223,28 @@ dot -Tpng grammar.dot -o grammar.png
 ### Memory-Efficient Processing for Large Genomes
 
 ```bash
-# Use streaming mode with adaptive chunking
-orbweaver -i large_genome.fasta -j grammar.json --streaming --adaptive-chunking
+# Use streaming mode
+orbweaver --input-files large_genome.fasta -j grammar.json --streaming
 
-# Limit memory usage per chunk
-orbweaver -i huge_genome.fasta -j grammar.json --streaming --max-memory-per-chunk-mb 1000
+# Limit memory usage via rule count with streaming
+orbweaver --input-files huge_genome.fasta -j grammar.json --streaming --max-rule-count 10000
 ```
 
-### Processing Multiple Sequences
+### GPU-Accelerated Processing (Default)
 
 ```bash
-# Select specific sequences from a multi-FASTA file by index (0-based)
-orbweaver -i multi.fasta -j grammar.json --sequence-indices 0,2,5
+# GPU acceleration is enabled by default for faster digram finding
+orbweaver --input-files genome.fasta -j grammar.json
 
-# Process all sequences from a multi-FASTA file
-orbweaver -i multi.fasta -j grammar.json
+# To disable GPU and use CPU fallback:
+orbweaver --input-files genome.fasta -j grammar.json --no-gpu
+```
+
+### Processing Multiple Input Files
+
+```bash
+# Provide a comma-separated list of FASTA files
+orbweaver --input-files file1.fasta,file2.fasta,file3.fasta -j grammar.json
 ```
 
 ## Configuration
@@ -280,6 +284,7 @@ Orbweaver follows a modular architecture:
 - **analysis**: Statistical analysis of the grammar
 - **parallel**: Parallelization strategies for large genomes
 - **encode**: Efficient DNA encoding and memory optimization
+- **gpu**: OpenCL-based GPU acceleration
 
 See [Architecture Documentation](docs/architecture.md) for more details.
 
@@ -287,6 +292,7 @@ See [Architecture Documentation](docs/architecture.md) for more details.
 
 - **Performance**: Large genomes may require significant time and memory
 - **GFA Output**: The GFA representation is experimental and may not be optimal for all visualization tools
+- **GPU Acceleration**: Currently requires OpenCL-compatible hardware and drivers
 
 ## Development
 
@@ -342,6 +348,7 @@ Please ensure your code follows the project's coding style and includes appropri
 - [x] Add streaming mode for large genomes
 - [x] Implement adaptive chunking
 - [x] Support multiple sequences in FASTA files
+- [x] Add GPU acceleration support
 - [ ] Improve GFA output format
 - [ ] Add benchmarking tools
 
@@ -351,30 +358,25 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 
 ### Memory Efficiency Improvements
 
-This project implements four major memory efficiency optimizations:
+This project implements three major memory efficiency optimizations:
 
 1. **Streaming Input Processing**: Instead of loading entire FASTA files into memory, sequences can be processed in chunks using a streaming approach, dramatically reducing memory footprint for large genomes.
 
 2. **2-Bit Encoding Optimization**: DNA sequences are efficiently stored using 2-bit encoding (A=00, C=01, G=10, T=11), reducing memory usage by up to 75% compared to ASCII storage.
 
-3. **Rule Eviction Strategy**: A priority queue-based approach tracks usage of grammar rules and can evict least-used rules when memory constraints are reached, ensuring bounded memory usage even for complex sequences.
-
-4. **Adaptive Chunking**: Dynamically adjusts chunk sizes based on sequence complexity and available system memory, optimizing both processing speed and memory usage.
+3. **Rule Eviction Strategy**: A priority queue-based approach tracks usage of grammar rules and can evict least-used rules when memory constraints are reached, ensuring bounded memory usage even for complex sequences (`--max-rule-count`).
 
 To use these memory optimizations:
 
 ```bash
-# Use all memory optimization techniques with adaptive chunking
-orbweaver -i large_genome.fasta --streaming --adaptive-chunking --max-rule-count 5000
+# Use streaming and rule eviction
+orbweaver --input-files large_genome.fasta --streaming --max-rule-count 5000
 
 # Just use streaming mode with default settings
-orbweaver -i large_genome.fasta --streaming
+orbweaver --input-files large_genome.fasta --streaming
 
 # Just use rule eviction with a limit of 10,000 rules
-orbweaver -i large_genome.fasta --max-rule-count 10000
-
-# Set maximum memory per chunk
-orbweaver -i large_genome.fasta --streaming --max-memory-per-chunk-mb 500
+orbweaver --input-files large_genome.fasta --max-rule-count 10000
 ```
 
 These improvements allow processing of large genomes (>10GB) with controlled memory usage. 

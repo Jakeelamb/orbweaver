@@ -4,7 +4,7 @@ use byteorder::{LittleEndian, ReadBytesExt};
 use std::collections::{HashMap, BinaryHeap, HashSet};
 use std::fs::{File};
 use std::path::Path;
-use sysinfo::System;
+use sysinfo::{System, SystemExt};
 // use rayon::prelude::*; // Removed unused rayon
 use crossbeam_channel::{bounded, Receiver, Sender};
 use memmap2::Mmap;

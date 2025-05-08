@@ -41,7 +41,7 @@ pub fn write_grammar_json_from_grammar(path: &Path, grammar: &Grammar) -> Result
 fn grammar_to_json(sequence: &[Symbol], rules: &HashMap<usize, Rule>) -> Value {
     // Create a JSON object for the grammar
     let mut json_grammar = json!({
-        "sequence": serialize_sequence(sequence),
+        "final_sequence": serialize_sequence(sequence),
         "rules": {},
     });
     
@@ -54,6 +54,29 @@ fn grammar_to_json(sequence: &[Symbol], rules: &HashMap<usize, Rule>) -> Value {
             "depth": rule.depth.unwrap_or(0)
         });
         rules_obj.insert(rule_id.to_string(), rule_json);
+    }
+    
+    // Extract and clone the sequence array to avoid borrow issues
+    let sequence_array = json_grammar["final_sequence"].as_array().unwrap().clone();
+    
+    // Validate that all rule IDs in the sequence exist in the rules map
+    // If they don't exist, add placeholder empty rules to avoid broken references
+    let rules_obj = json_grammar["rules"].as_object_mut().unwrap();
+    for symbol in sequence_array {
+        if symbol["type"] == "non_terminal" {
+            if let Some(rule_id) = symbol["rule_id"].as_u64() {
+                let rule_id_str = rule_id.to_string();
+                if !rules_obj.contains_key(&rule_id_str) {
+                    // Add a placeholder rule with empty symbols
+                    rules_obj.insert(rule_id_str, json!({
+                        "symbols": [],
+                        "usage_count": 1,
+                        "depth": 0
+                    }));
+                    eprintln!("Warning: Added placeholder for missing rule ID {} referenced in sequence", rule_id);
+                }
+            }
+        }
     }
     
     json_grammar

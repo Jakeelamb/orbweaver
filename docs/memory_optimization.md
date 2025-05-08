@@ -149,6 +149,30 @@ Process only selected sequences from multi-FASTA files to reduce memory requirem
 orbweaver -i multi_sequences.fasta --sequence-indices 0,2,5
 ```
 
+## 6. GPU-Assisted Processing
+
+Offloads computation-intensive operations to GPU when available.
+
+### Implementation
+
+- OpenCL kernels perform parallel digram counting and analysis
+- Processes sequence data directly on GPU memory
+- Handles 2-bit encoded sequence for maximum efficiency
+- Manages memory transfers to minimize overhead
+
+### Memory Benefits
+
+- Offloads processing from system RAM to GPU memory
+- Allows higher throughput without increasing CPU memory usage
+- Can process larger chunks more efficiently
+
+### Usage
+
+```bash
+# Enable GPU acceleration
+orbweaver -i input.fasta --use-gpu
+```
+
 ## Combined Optimization
 
 For extremely large or complex genomes, all techniques can be combined:
@@ -160,7 +184,8 @@ orbweaver -i huge_genome.fasta \
   --max-memory-per-chunk-mb 1000 \
   --max-rule-count 5000 \
   --min-rule-usage 5 \
-  --use-encoding
+  --use-encoding \
+  --use-gpu
 ```
 
 ## Performance Comparison
@@ -224,6 +249,13 @@ orbweaver -i complex_genome.fasta --min-rule-usage 5 --streaming
 For processing extremely large genomes (100GB+):
 ```bash
 orbweaver -i ultra_large.fasta --streaming --adaptive-chunking --max-memory-per-chunk-mb 500 --min-rule-usage 10
+```
+
+### GPU-Accelerated Processing
+
+For faster processing with compatible hardware:
+```bash
+orbweaver -i genome.fasta --use-gpu --max-rule-count 5000
 ```
 
 ### Low-Memory Systems

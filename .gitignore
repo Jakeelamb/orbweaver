@@ -4,7 +4,7 @@
 # Downloaded data
 /genomes/
 *.zip
-
+/test_data/
 # Generated data files
 *.csv
 *.tsv
@@ -24,6 +24,10 @@
 *.tar.xz
 *.tar.lz
 *.tar.lzma
+*.json
+*.svg
+*out
+*err
 # Environment variables
 .env
 
