@@ -190,7 +190,8 @@ echo "------------------------"
 
 # Execute the command
 # Using eval to handle potential complexities in CMD string, ensure variables are safe.
-eval $CMD
+# Prepending stdbuf -oL -eL to make stdout and stderr line-buffered for live output
+eval stdbuf -oL -eL $CMD
 EXIT_CODE=$?
 
 # --- Completion ---
