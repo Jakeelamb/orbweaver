@@ -4,18 +4,31 @@ use std::path::PathBuf;
 /// Configuration settings derived from CLI arguments.
 #[derive(Debug)]
 pub struct Config {
+    /// Path to the input FASTA or FASTQ file.
     pub input_path: PathBuf,
+    /// Optional path for JSON output of the grammar.
     pub output_json_path: Option<PathBuf>,
+    /// Optional path for plain text output of the grammar.
     pub output_text_path: Option<PathBuf>,
+    /// Optional path for GFA (Graphical Fragment Assembly) output.
     pub output_gfa_path: Option<PathBuf>,
+    /// Optional path for DOT (Graphviz) output for visualization.
     pub output_dot_path: Option<PathBuf>,
+    /// Optional path for FASTA output of reconstructed sequences or blocks.
     pub output_fasta_path: Option<PathBuf>,
+    /// The k-mer size to be used for analysis.
     pub kmer_size: usize,
+    /// Minimum number of times a rule must be used to be kept.
     pub min_rule_usage: usize,
+    /// Optional maximum number of rules to generate.
     pub max_rule_count: Option<usize>,
+    /// Whether to consider reverse complements of k-mers.
     pub reverse_complement_aware: bool,
+    /// Optional chunk size for processing input files, in bytes.
     pub chunk_size: Option<usize>,
+    /// Whether to skip sequences containing 'N' characters.
     pub skip_ns: bool,
+    /// Whether to output statistics about the compression and grammar.
     pub stats: bool,
 }
 

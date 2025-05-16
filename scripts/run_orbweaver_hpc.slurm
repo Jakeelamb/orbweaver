@@ -21,7 +21,13 @@ ROOT_DIR_HPC="$(dirname "$SCRIPT_DIR_HPC")"
 ORBWEAVER_BIN="$ROOT_DIR_HPC/target/release/orbweaver"
 
 # Input and Output (IMPORTANT: Adjust these paths for your specific run)
-INPUT_FASTA="$ROOT_DIR_HPC/test_data/prepared_benchmark/real_genome_1MB.fasta" # Example: Use a real path to your large input FASTA
+# The input FASTA file is now provided as a command-line argument to this script.
+if [ -z "$1" ]; then
+    echo "Usage: $0 <input_fasta_file>"
+    echo "Error: Input FASTA file path is required as the first argument." >&2
+    exit 1
+fi
+INPUT_FASTA="$1"
 
 # Base directory for all Orbweaver outputs
 BASE_OUTPUT_DIR_HPC="$ROOT_DIR_HPC/orbweaver_runs" # Master output directory
@@ -48,7 +54,7 @@ OUTPUT_TEXT_BASENAME="grammar.txt"  # Basename, actual path determined by Orbwea
 # Add other output files if needed (e.g., --output-gfa, --visualize, --export-blocks)
 
 # Orbweaver parameters (adjust as needed for your specific dataset and goals)
-MIN_RULE_USAGE=5        # Example: Minimum rule usage
+MIN_RULE_USAGE=1000        # Example: Minimum rule usage
 MAX_RULE_COUNT=100000   # Example: Max rule count for large sequences
 THREADS=${SLURM_CPUS_PER_TASK:-4} # Use Slurm allocated CPUs, default to 4 if not set
 
