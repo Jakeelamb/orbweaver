@@ -1,30 +1,28 @@
+#![feature(iter_next_chunk)]
 use anyhow::{Context, Result, bail};
 use clap::{Parser, command};
 use std::path::PathBuf;
-use std::time::Instant;
 use std::fs;
 use chrono::{Utc, DateTime};
 use serde::{Serialize, Deserialize};
-use orbweaver::fasta::reader::{read_sequences_from_multiple_files, read_sequences_from_multiple_files_async};
+use orbweaver::fasta::reader::{read_sequences_from_multiple_files_async};
 use orbweaver::encode::dna_2bit::{EncodedBase};
 use orbweaver::grammar::builder::GrammarBuilder;
 use orbweaver::grammar::engine::{Grammar};
 use orbweaver::analysis::stats::calculate_and_print_stats;
 use orbweaver::utils::visualization::DotOptions;
 use orbweaver::parallel::chunking::ChunkingConfig;
-use orbweaver::parallel::engine::{parallel_sequitur, merge_grammars};
-use rayon::prelude::*;
-use orbweaver::utils;
-use sysinfo::{System, SystemExt};
+use orbweaver::parallel::engine::{merge_grammars};
 use std::sync::Arc;
 use orbweaver::gpu::GpuContext;
 use std::collections::HashMap;
 use std::fs::File;
 use bincode;
-use log::{info, warn};
+use log::{info};
 use orbweaver::utils::export::{write_grammar_text, write_grammar_json as io_write_grammar_json, write_grammar_graphml};
-use orbweaver::utils::visualization::{write_grammar_dot, write_grammar_gfa};
-use std::io::BufWriter;
+use orbweaver::utils::visualization::{write_grammar_gfa, write_grammar_dot};
+use orbweaver::io::output_fasta::write_grammar_fasta;
+use std::fs::write as fs_write;
 
 // Use the configuration module if needed, or args directly
 // use orbweaver::config::Config; 
@@ -36,7 +34,7 @@ use std::io::BufWriter;
 // use orbweaver::analysis; // If motifs analysis is re-integrated later
 
 // Configure jemalloc for better memory management if feature is enabled
-#[cfg(feature = "jemalloc")]
+#[cfg(feature = "profiling")]
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
@@ -63,24 +61,6 @@ struct OrbweaverArgs {
     input_files: Vec<PathBuf>,
 
     // --- Workflow and Output Organization ---
-    /// Base directory for all outputs.
-    ///
-    /// All run-specific outputs will be placed in subdirectories under this path.
-    #[clap(short = 'o', long, value_parser, required = true)]
-    output_dir: PathBuf,
-
-    /// Species identifier (e.g., "homo_sapiens", "drosophila_melanogaster").
-    ///
-    /// Used to organize outputs by species.
-    #[clap(long, value_parser, required = true)]
-    species_id: String,
-
-    /// Assembly identifier (e.g., "GRCh38.p13", "dm6").
-    ///
-    /// Used to organize outputs by a specific genome assembly version.
-    #[clap(long, value_parser, required = true)]
-    assembly_id: String,
-
     /// Custom run identifier (optional).
     ///
     /// If not provided, a timestamp-based ID will be generated.
@@ -133,32 +113,11 @@ struct OrbweaverArgs {
     #[clap(long, value_parser)]
     output_gfa: Option<PathBuf>,
 
-    /// Generate a .dot file for visualizing the grammar.
-    /// 
-    /// Creates a DOT file for visualization with Graphviz tools like dot, neato, etc.
-    /// Example usage: dot -Tpng grammar.dot -o grammar.png
-    #[clap(long, value_parser)]
-    visualize: Option<PathBuf>,
-
-    /// Export grammar rules as sequences in FASTA format.
-    /// 
-    /// Writes each grammar rule as a separate FASTA record, where each record
-    /// contains the fully expanded DNA sequence for that rule.
-    #[clap(long, value_parser)]
-    export_blocks: Option<PathBuf>,
-
     /// Output tabular summary of repeats.
     ///
     /// Writes a text file summarizing identified repeats, sorted by size or frequency.
     #[clap(long, value_parser)]
     output_repeats: Option<PathBuf>,
-
-    /// Output GraphML representation of the grammar.
-    /// 
-    /// Exports the grammar as a graph in GraphML format,
-    /// suitable for import into various graph analysis tools.
-    #[clap(long, value_parser)]
-    output_graphml: Option<PathBuf>,
 
     /// Print statistics about the generated grammar.
     /// 
@@ -179,7 +138,7 @@ struct OrbweaverArgs {
     /// 
     /// A digram must appear at least this many times to be replaced by a rule.
     /// Higher values lead to fewer rules with more usage each.
-    #[clap(long, value_parser, default_value_t = 10)]
+    #[clap(long, value_parser, default_value_t = 100)]
     min_rule_usage: usize,
 
     /// Maximum number of rules allowed (triggers eviction).
@@ -311,7 +270,7 @@ struct OrbweaverArgs {
 
     /// Color nodes by depth and show depth information in graph visualizations.
     #[clap(long, value_parser, default_value_t = true)]
-    graph_show_depth: bool,
+    pub graph_show_depth: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -326,298 +285,222 @@ struct RunMetadata {
     // Potentially add last_checkpoint_path: Option<PathBuf> later for other modes
 }
 
+impl RunMetadata {
+    fn save(&self, path: &PathBuf) -> Result<()> {
+        let json_string = serde_json::to_string_pretty(self)
+            .context("Failed to serialize RunMetadata to JSON")?;
+        fs::write(path, json_string)
+            .context(format!("Failed to write RunMetadata to file: {}", path.display()))
+    }
+
+    fn load(path: &PathBuf) -> Result<Self> {
+        let json_string = fs::read_to_string(path)
+            .context(format!("Failed to read RunMetadata from file: {}", path.display()))?;
+        serde_json::from_str(&json_string)
+            .context(format!("Failed to deserialize RunMetadata from JSON: {}", path.display()))
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // --- Argument Parsing ---
-    let mut current_args = OrbweaverArgs::parse();
+    let current_args = OrbweaverArgs::parse();
+    let mut original_args_for_resume: Option<OrbweaverArgs> = None; // Added for effective_build_args
 
-    // --- Derive species_id from input file ---
-    // This needs to happen early, but run_specific_output_dir for *this* run uses it.
-    // For resume, the resume_run_dir is explicit.
-    let derived_species_id_for_new_run = if let Some(first_input_file) = current_args.input_files.first() {
-        first_input_file.file_stem()
-            .and_then(|stem| stem.to_str())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| {
-                eprintln!("Warning: Could not derive species ID from input file {:?}. Using 'unknown_species'.", first_input_file);
-                "unknown_species".to_string()
-            })
-    } else {
-        eprintln!("Error: No input files provided.");
-        return Err(anyhow::anyhow!("No input files provided to derive species ID for new run."));
-    };
-    // We print this later, after we know if we are resuming or not.
+    // Determine Run ID if not provided
+    let run_id_str = current_args.run_id.clone().unwrap_or_else(|| {
+        let now: DateTime<Utc> = Utc::now();
+        now.format("%Y%m%d_%H%M%S").to_string()
+    });
 
-    // --- Load original arguments if resuming ---
-    let original_args_for_resume: OrbweaverArgs = if current_args.resume {
-        if let Some(resume_dir_path) = &current_args.resume_run_dir { // resume_dir_path is the user-provided absolute path
-            let metadata_path = resume_dir_path.join("run_metadata.json");
-            if metadata_path.exists() {
-                let metadata_str = fs::read_to_string(&metadata_path)
-                    .context(format!("Failed to read metadata from resumed run: {}", metadata_path.display()))?;
-                let loaded_metadata: RunMetadata = serde_json::from_str(&metadata_str)
-                    .context(format!("Failed to parse metadata from resumed run: {}", metadata_path.display()))?;
-                loaded_metadata.args
-            } else {
-                // Construct the path string for the warning message here, as metadata_path is out of scope
-                let non_existent_metadata_path_display = resume_dir_path.join("run_metadata.json").display().to_string();
-                println!("Warning: Could not find run_metadata.json in resume directory: {}. Defaulting behavior for outputs may apply if not specified in current command.", non_existent_metadata_path_display);
-                current_args.clone()
-            }
-        } else {
-            // This case should be prevented by clap's `requires` attribute.
-            println!("Warning: --resume was set but --resume-run-dir was not. This is unexpected.");
-            current_args.clone()
-        }
-    } else {
-        current_args.clone()
-    };
+    // Determine the base name for the output directory from the first input file.
+    let first_input_file = current_args.input_files.get(0).context("No input files provided.")?;
+    let input_file_stem = first_input_file.file_stem()
+        .context("Could not extract file stem from input file.")?
+        .to_string_lossy();
 
-    // --- Determine run-specific output directory for *this* execution ---
-    // If resuming, actual_run_id should ideally come from the resumed run's metadata to ensure consistency,
-    // unless --force-rerun or some other overriding condition is met.
-    // For simplicity now, if current_args.run_id is given, it's used, otherwise a new timestamp.
-    // This means resuming a run and giving a *new* run_id will create a *new* output dir for the resumed data.
-    let actual_run_id = current_args.run_id.clone().unwrap_or_else(|| Utc::now().format("%Y%m%d_%H%M%S").to_string());
-    
-    // The species_id for the output path is based on the *current* command's input files, even if resuming.
-    // This seems logical as the resumed run might be on a *different* (but compatible) input.
-    println!("Derived species ID for this run's output: {}", derived_species_id_for_new_run);
-    let base_output_dir = PathBuf::from(".").join(&derived_species_id_for_new_run);
-    let run_specific_output_dir = base_output_dir.join(&actual_run_id);
+    // Construct the run-specific output directory path in the current working directory
+    // e.g., inputfilename_runid
+    let run_specific_output_dir = PathBuf::from(format!("{}_{}", input_file_stem, run_id_str));
 
-    if !run_specific_output_dir.exists() {
+    // Ensure the run-specific output directory exists
+    // This check and creation should happen *before* attempting to save metadata into it.
+    // It will be created later if resume is not active or if force_rerun is true.
+
+    // Path for the run metadata file
+    let metadata_path = run_specific_output_dir.join("run_metadata.json");
+
+    // If not resuming a *completed* run (or if forcing rerun), save initial metadata.
+    // If resuming an incomplete run, its existing metadata will be loaded and updated.
+    if !current_args.resume && run_specific_output_dir.exists() && !current_args.force_rerun {
+        bail!(
+            "Output directory {:?} already exists. Use --resume to continue or --force-rerun to overwrite.",
+            run_specific_output_dir
+        );
+    } else if run_specific_output_dir.exists() && current_args.force_rerun {
+        info!("Deleting existing output directory due to --force-rerun: {:?}", run_specific_output_dir);
+        fs::remove_dir_all(&run_specific_output_dir)
+            .with_context(|| format!("Failed to delete existing output directory: {:?}", run_specific_output_dir))?;
         fs::create_dir_all(&run_specific_output_dir)
-            .context(format!("Failed to create run-specific output directory: {}", run_specific_output_dir.display()))?;
-    }
-    println!("Run-specific output directory: {}", run_specific_output_dir.display());
-
-    // --- Default Output File Paths ---
-    // These defaults are applied if the user doesn't specify a path,
-    // and intelligently handles resumes (respects original run's choices for specific file outputs).
-
-    // Default .json output
-    if current_args.output_json.is_none() {
-        let skip_defaulting = false;
-        if current_args.resume {
-            // Check if the original run *explicitly specified* an output_json path.
-            // If original_args_for_resume.output_json was Some, it means the user set it.
-            // We don't want to override that with a new default if they are resuming and *didn't* specify one now.
-            // However, if original_args_for_resume.output_json was None, it means it wasn't set in the original run.
-            // In that case, if current_args.output_json is *also* None, it's okay to apply the new default.
-            if original_args_for_resume.output_json.is_some() && current_args.output_json.is_none() {
-                 // User specified it in original, not in current resume command: respect original.
-                 // Effectively, we "copy" the original path if it existed and none is given now.
-                 // But if we are *here*, current_args.output_json IS None.
-                 // The question is if the *original* had a specific one, or if it also defaulted.
-                 // The current logic: if current is None, default it, UNLESS (resume AND original_had_one)
-                 // This needs to be: if current_args.output_json is None, default it,
-                 // UNLESS (current_args.resume AND original_args_for_resume.output_json was Some(...))
-                 // The current skip_defaulting logic seems okay.
-            }
-        }
-        if !skip_defaulting { // skip_defaulting is effectively true if (resume AND original_args_for_resume.output_json.is_some())
-            current_args.output_json = Some(run_specific_output_dir.join("grammar.json"));
-        }
+            .with_context(|| format!("Failed to create run-specific output directory: {:?}", run_specific_output_dir))?;
+    } else if !run_specific_output_dir.exists() {
+        fs::create_dir_all(&run_specific_output_dir)
+            .with_context(|| format!("Failed to create run-specific output directory: {:?}", run_specific_output_dir))?;
     }
 
-    // Default .fasta (blocks) output
-    if current_args.export_blocks.is_none() {
-        let mut skip_defaulting = false;
-        if current_args.resume {
-            if original_args_for_resume.export_blocks.is_some() {
-                skip_defaulting = true;
-            }
-        }
-        if !skip_defaulting {
-            current_args.export_blocks = Some(run_specific_output_dir.join("rules.fasta"));
-        }
-    }
+    info!("Run output will be saved to: {:?}", run_specific_output_dir);
 
-    // Default .tsv (repeats summary) output
-    if current_args.output_repeats.is_none() {
-        let mut skip_defaulting = false;
-        if current_args.resume {
-            if original_args_for_resume.output_repeats.is_some() {
-                skip_defaulting = true;
-            }
-        }
-        if !skip_defaulting {
-            current_args.output_repeats = Some(run_specific_output_dir.join("repeats_summary.tsv"));
-        }
-    }
+    // --- Handle Run Metadata (Save/Load/Update) ---
+    let initial_metadata_start_time = Utc::now(); // Capture start time for initial metadata save
 
-    // Default .dot output
-    if current_args.visualize.is_none() {
-        let mut skip_defaulting = false;
-        if current_args.resume {
-            if original_args_for_resume.visualize.is_some() {
-                 skip_defaulting = true;
-            }
-        }
-        if !skip_defaulting {
-            current_args.visualize = Some(run_specific_output_dir.join("grammar.dot"));
-        }
-    }
-
-    // Default .graphml output
-    if current_args.output_graphml.is_none() {
-        let mut skip_defaulting = false;
-        if current_args.resume {
-            if original_args_for_resume.output_graphml.is_some() {
-                 skip_defaulting = true;
-            }
-        }
-        if !skip_defaulting {
-            current_args.output_graphml = Some(run_specific_output_dir.join("grammar.graphml"));
-        }
-    }
-
-    // --- Save initial/updated metadata for this run attempt ---
-    let run_start_time = Utc::now();
+    // This metadata is saved initially and then updated at the end (or on error).
+    // It needs to be mutable because its status and end_time will be updated.
     let mut metadata_to_save = RunMetadata {
-        args: current_args.clone(), // This will now store args without species_id, assembly_id, output_dir
+        args: current_args.clone(), // Save the *current* command's args
         tool_version: env!("CARGO_PKG_VERSION").to_string(),
-        status: "starting".to_string(), // Will be updated to "completed" or "failed"
-        start_time: run_start_time,
+        status: "starting".to_string(),
+        start_time: initial_metadata_start_time,
         end_time: None,
-        run_id: actual_run_id.clone(), // actual_run_id is already determined
-        processed_sequence_checkpoints: HashMap::new(), // Use initial checkpoints from potential resume
+        run_id: run_id_str.clone(), // Use the determined actual_run_id
+        processed_sequence_checkpoints: HashMap::new(), // Initialize empty for a new run or overwrite for resume
     };
 
-    // The rest of the `main` function will now use `current_args` for all processing decisions
-    // and `run_specific_output_dir` for all output locations.
-    // The `metadata_to_save` variable now holds the metadata struct that needs to be updated upon completion or failure.
+    // If not resuming a *completed* run (or if forcing rerun), save initial metadata.
+    // If resuming an incomplete run, its existing metadata will be loaded and updated.
+    if !metadata_path.exists() || current_args.force_rerun || current_args.resume {
+        if metadata_path.exists() && current_args.resume {
+            // Attempt to load existing metadata if resuming, to preserve checkpoints etc.
+            match RunMetadata::load(&metadata_path) {
+                Ok(loaded_meta) => {
+                    if loaded_meta.status == "completed" && !current_args.force_rerun {
+                        println!("Run {} was already completed. Metadata preserved. Use --force-rerun to overwrite.", loaded_meta.run_id);
+                        // No need to save new initial metadata if we're just exiting.
+                        return Ok(());
+                    } else if loaded_meta.status == "completed" && current_args.force_rerun {
+                         println!("Forcing rerun of completed run {}. Previous metadata will be overwritten.", loaded_meta.run_id);
+                         metadata_to_save.status = "starting (forced rerun)".to_string();
+                         metadata_to_save.start_time = initial_metadata_start_time;
+                         metadata_to_save.end_time = None;
+                         original_args_for_resume = Some(loaded_meta.args.clone()); // Store original args
+                    } else {
+                        println!("Resuming run {}. Loaded previous metadata.", loaded_meta.run_id);
+                        metadata_to_save.processed_sequence_checkpoints = loaded_meta.processed_sequence_checkpoints.clone();
+                        original_args_for_resume = Some(loaded_meta.args.clone()); // Store original args
+                    }
+                }
+                Err(e) => {
+                     eprintln!("Warning: Failed to load existing metadata for resume from {}: {}. Starting with fresh metadata.", metadata_path.display(), e);
+                     // metadata_to_save is already initialized for a new run.
+                }
+            }
+        }
+        metadata_to_save.save(&metadata_path)
+            .context(format!("Failed to save initial run metadata to {}", metadata_path.display()))?;
+    } else {
+        // Metadata exists, not resuming, not forcing. This implies a completed run.
+        let loaded_meta = RunMetadata::load(&metadata_path)
+             .context(format!("Failed to load existing metadata from {}", metadata_path.display()))?;
+        if loaded_meta.status == "completed" {
+            println!("Run {} already completed. Output at: {}. Use --force-rerun to run again.", 
+                loaded_meta.run_id, run_specific_output_dir.display());
+            return Ok(());
+        }
+        // If it's not completed but exists and we're not resuming/forcing, this is an odd state.
+        // For now, we'll proceed as if it's a new run, potentially overwriting.
+        // The initial save handles this by checking `metadata_path.exists()`.
+    }
+
+
+    // --- Set up GPU context ---
+    let gpu_context = if !current_args.no_gpu {
+        match GpuContext::new() {
+            Ok(ctx) => {
+                println!("GPU context initialized successfully.");
+                Some(ctx)
+            }
+            Err(e) => {
+                eprintln!("Failed to initialize GPU context: {}. Falling back to CPU.", e);
+                None
+            }
+        }
+    } else {
+        println!("GPU usage explicitly disabled.");
+        None
+    };
     
-    // --- Main Processing Logic --- 
-    let result: Result<Grammar> = {
-        // Conditional profiling setup
-        #[cfg(feature = "profiling")]
-        let _guard = if current_args.profile {
-            println!("Starting profiling");
-            // Adjust pprof output directory if desired, e.g., to run_specific_output_dir.join("profile")
-            // For now, it uses the default "profile" directory in CWD.
-            let guard = pprof::ProfilerGuardBuilder::default()
-                .frequency(100)
-                // .blocklist(&["libc", "libgcc", "pthread", "vdso"])
-                .build()?;
-            Some(guard)
-        } else {
-            None
-        };
+    // --- Main processing logic ---
+    // Use `original_args_for_resume` for parameters that define the core run (like min_rule_usage),
+    // but `current_args` for things like output paths (which are now relative to run_specific_output_dir)
+    // or flags like `--stats` which might be toggled for a resume.
+    // However, with output_dir, species_id, assembly_id removed, current_args holds most relevant info
+    // for how to *behave* now, while original_args_for_resume might hold parameters of *what* was built.
+    // For simplicity now, most processing will use `current_args`. Checkpoints will use `original_args_for_resume`
+    // to ensure the *same kind of grammar* is being resumed.
 
-        // Configure number of threads for Rayon
-        if let Some(threads) = current_args.threads {
-            rayon::ThreadPoolBuilder::new().num_threads(threads).build_global()?;
-        }
-
-        // Memory usage logging (consider moving to a more central place or a utility function)
-        let mut sys = System::new_all();
-        sys.refresh_all();
-        println!("Total memory: {} MB", sys.total_memory() / 1024 / 1024);
-        println!("Used memory: {} MB", sys.used_memory() / 1024 / 1024);
-
-        let processing_start_time = Instant::now();
-
-        let grammar_result_tuple: Result<(Grammar, HashMap<String, PathBuf>)>;
-        let grammar_result_single: Result<Grammar>;
-
-        let final_grammar: Grammar;
-        let mut temp_checkpoints: Option<HashMap<String, PathBuf>> = None;
-
-        if current_args.chunk_size > 0 || current_args.adaptive_chunking {
-            println!("Processing in chunked mode.");
-            let chunked_result_tuple = process_chunked_mode(&current_args, &run_specific_output_dir, &metadata_to_save.processed_sequence_checkpoints);
-            match chunked_result_tuple {
-                Ok((g, cp)) => {
-                    final_grammar = g;
-                    temp_checkpoints = Some(cp);
-                }
-                Err(e) => return Err(e), 
-            }
-        } else if current_args.streaming {
-            println!("Processing in streaming mode.");
-            // TODO: Implement checkpointing for streaming mode with GrammarBuilder
-            // For now, it will behave like standard mode for checkpointing demonstration
-            grammar_result_tuple = process_standard_mode(&current_args, !current_args.no_gpu, None, &run_specific_output_dir, &metadata_to_save.processed_sequence_checkpoints).await;
-            match grammar_result_tuple {
-                Ok((g, cp)) => {
-                    final_grammar = g;
-                    temp_checkpoints = Some(cp);
-                }
-                Err(e) => return Err(e),
-            }
-        } else {
-            println!("Processing in standard (in-memory) mode.");
-            grammar_result_tuple = process_standard_mode(&current_args, !current_args.no_gpu, None, &run_specific_output_dir, &metadata_to_save.processed_sequence_checkpoints).await;
-            match grammar_result_tuple {
-                Ok((g, cp)) => {
-                    final_grammar = g;
-                    temp_checkpoints = Some(cp);
-                }
-                Err(e) => return Err(e),
-            }
-        };
-
-        // Update metadata with any new checkpoints from standard/streaming (mocked) mode
-        if let Some(checkpoints) = temp_checkpoints {
-            metadata_to_save.processed_sequence_checkpoints = checkpoints;
-            // Optionally, save metadata here if you want to reflect checkpoints immediately 
-            // even if the full run doesn't complete. For now, saved at very end.
-        }
-
-        // At this point, final_grammar is populated. We return it as Ok.
-        Ok(final_grammar) // This makes the block an expression that yields Result<Grammar>
+    // The actual args to use for the core grammar building algorithm:
+    // If resuming, we *must* use the grammar parameters from the original run.
+    // If not resuming, we use the current_args.
+    let effective_build_args = if current_args.resume {
+        original_args_for_resume.as_ref().unwrap_or(&current_args)
+    } else {
+        &current_args
+    };
+    
+    let main_processing_result = if effective_build_args.chunk_size > 0 {
+        process_chunked_mode(effective_build_args, &run_specific_output_dir, &metadata_to_save.processed_sequence_checkpoints)
+    } else if effective_build_args.streaming {
+        process_streaming_mode(effective_build_args, gpu_context.as_ref(), &run_specific_output_dir, &metadata_to_save.processed_sequence_checkpoints).await
+    } else {
+        process_standard_mode(effective_build_args, gpu_context.is_some(), gpu_context.as_ref(), &run_specific_output_dir, &metadata_to_save.processed_sequence_checkpoints).await
     };
 
-    // --- Handle Results and Finalize Metadata ---
-    match result {
-        Ok(grammar) => {
-            println!("Grammar construction successful.");
-            // Use `current_args` (which is `original_args_for_resume`) for stats and outputs
+    match main_processing_result {
+        Ok((grammar, final_checkpoints)) => {
+            println!("Grammar construction completed.");
+            generate_outputs(&grammar, &current_args, &run_specific_output_dir)?; // Pass run_specific_output_dir
+
             if current_args.stats {
-                calculate_and_print_stats(&grammar)?;
+                orbweaver::analysis::stats::calculate_and_print_stats(&grammar)?;
             }
-            // Pass `current_args` (which is `original_args_for_resume`) to generate_outputs
-            generate_outputs(&grammar, &current_args)?;
-            
+
+            // Update and save final metadata
             metadata_to_save.status = "completed".to_string();
             metadata_to_save.end_time = Some(Utc::now());
-            let metadata_path = run_specific_output_dir.join("run_metadata.json");
-            fs::write(
-                &metadata_path,
-                serde_json::to_string_pretty(&metadata_to_save)?
-            ).with_context(|| format!("Failed to write final metadata to {:?}", metadata_path))?;
-            println!("Run {} completed. Metadata updated.", metadata_to_save.run_id);
+            metadata_to_save.processed_sequence_checkpoints = final_checkpoints;
+            metadata_to_save.save(&metadata_path)
+                .context(format!("Failed to save final run metadata to {}", metadata_path.display()))?;
+            println!("Run {} completed successfully. Outputs in {}", run_id_str, run_specific_output_dir.display());
         }
         Err(e) => {
-            eprintln!("Error during grammar construction: {:?}", e);
-            metadata_to_save.status = "failed".to_string();
-            metadata_to_save.end_time = Some(Utc::now());
-            let metadata_path = run_specific_output_dir.join("run_metadata.json");
-            fs::write(
-                &metadata_path,
-                serde_json::to_string_pretty(&metadata_to_save)?
-            ).with_context(|| format!("Failed to write error metadata to {:?}", metadata_path))?;
-            println!("Run {} failed. Metadata updated.", metadata_to_save.run_id);
-            return Err(e); // Propagate the error
-        }
-    }
+            // Error occurred, update metadata to "failed"
+            let mut metadata_to_save_on_error = RunMetadata::load(&metadata_path) // Load existing or initial
+                .unwrap_or_else(|_| {
+                    // Fallback if loading fails (e.g., first time, file corrupt)
+                    // This re-uses the initial metadata constructed earlier, but updates status/time
+                    let current_time = Utc::now();
+                    RunMetadata {
+                        args: current_args.clone(), // current_args were used for *this* attempt
+                        tool_version: env!("CARGO_PKG_VERSION").to_string(),
+                        status: "failed".to_string(),
+                        start_time: initial_metadata_start_time, // Use the start time from the initial save
+                        end_time: Some(current_time),
+                        run_id: run_id_str.clone(), // Use the determined actual_run_id
+                        processed_sequence_checkpoints: HashMap::new(), // Likely no new checkpoints on failure
+                    }
+                });
 
-    // Stop profiling if it was started
-    #[cfg(feature = "profiling")]
-    if let Some(guard) = _guard { // This assumes _guard is in scope
-        println!("Stopping profiling");
-        if let Ok(report) = guard.report().build() {
-            let profile_dir = run_specific_output_dir.join("profile");
-            fs::create_dir_all(&profile_dir).context("Failed to create profile directory")?;
-            // Use `actual_run_id` for the flamegraph name to ensure consistency
-            let flamegraph_path = profile_dir.join(format!("flamegraph_{}.svg", actual_run_id));
-            let file = fs::File::create(&flamegraph_path)
-                .with_context(|| format!("Failed to create flamegraph file: {:?}", flamegraph_path))?;
-            report.flamegraph(file)
-                .with_context(|| format!("Failed to write flamegraph to {:?}", flamegraph_path))?;
-            println!("Flamegraph saved to {:?}", flamegraph_path);
+            metadata_to_save_on_error.status = "failed".to_string();
+            metadata_to_save_on_error.end_time = Some(Utc::now());
+            // Potentially update checkpoints if the error happened *after* some successful chunk processing.
+            // For now, let's assume the 'final_checkpoints' from a failed run might not be reliable or not produced.
+            // If `main_processing_result` could return partial checkpoints on error, we could save them.
+
+            if let Err(save_err) = metadata_to_save_on_error.save(&metadata_path) {
+                 eprintln!("Additionally, failed to save 'failed' status to metadata file {}: {}", metadata_path.display(), save_err);
+            }
+            
+            eprintln!("Error during processing: {}", e); // Print the original error
+            return Err(e); // Propagate the error
         }
     }
 
@@ -625,68 +508,75 @@ async fn main() -> Result<()> {
 }
 
 /// Generates all requested output files from the final grammar.
-fn generate_outputs(grammar: &Grammar, args: &OrbweaverArgs) -> Result<()> {
-    info!("Generating requested output files...");
+fn generate_outputs(grammar: &Grammar, args: &OrbweaverArgs, run_specific_output_dir: &PathBuf) -> Result<()> {
+    info!("Generating outputs in directory: {:?}", run_specific_output_dir);
 
-    if let Some(path) = &args.output_json {
-        info!("Writing grammar to JSON file: {}", path.display());
-        io_write_grammar_json(path, &grammar.sequence, &grammar.rules)
-            .with_context(|| format!("Failed to create JSON grammar file at {:?}", path))?;
-    }
-
-    if let Some(path) = &args.output_text {
-        info!("Writing grammar to text file: {}", path.display());
-        write_grammar_text(path, &grammar.sequence, &grammar.rules)
-            .with_context(|| format!("Failed to create text grammar file at {:?}", path))?;
-    }
-
-    if let Some(path) = &args.output_gfa {
-        info!("Writing grammar to GFA file: {}", path.display());
-        write_grammar_gfa(path, grammar)
-            .with_context(|| format!("Failed to create GFA file at {:?}", path))?;
-    }
-
-    // Common DotOptions for GraphML and DOT, derived from args.graph_*
-    let common_dot_options = DotOptions {
+    let dot_options = DotOptions {
+        engine: args.graph_engine.clone(),
         include_terminals: args.graph_include_terminals,
         max_depth: args.graph_max_depth,
         skip_rules_above_depth: args.graph_skip_rules_above_depth,
         transparent_background: args.graph_transparent_background,
         dark_mode: args.graph_dark_mode,
-        include_usage_counts: args.graph_show_usage_counts,
-        color_by_depth: args.graph_show_depth,
-        engine: args.graph_engine.clone(),
+        include_usage_counts: args.graph_show_usage_counts, // Fixed field name
+        color_by_depth: args.graph_show_depth,             // Fixed field name
     };
 
-    if let Some(graphml_path) = &args.output_graphml {
-        info!("Writing grammar to GraphML file: {}", graphml_path.display());
-        write_grammar_graphml(graphml_path, grammar, &common_dot_options)
-            .with_context(|| format!("Failed to create GraphML file at {:?}", graphml_path))?;
+    // Always generate GraphML output
+    let graphml_path = run_specific_output_dir.join("grammar.graphml");
+    info!("Writing grammar to GraphML: {:?}", graphml_path);
+    write_grammar_graphml(&graphml_path, grammar, &dot_options) // Corrected arguments
+        .with_context(|| format!("Failed to write GraphML to {:?}", graphml_path))?;
+
+    // Always generate FASTA export of grammar rules (blocks)
+    let fasta_export_path = run_specific_output_dir.join("rules.fasta");
+    info!("Exporting grammar blocks to FASTA: {:?}", fasta_export_path);
+    write_grammar_fasta(&fasta_export_path, grammar)
+        .with_context(|| format!("Failed to export rules as FASTA to {:?}", fasta_export_path))?;
+
+    // Always generate DOT file output
+    let dot_path = run_specific_output_dir.join("grammar.dot");
+    info!("Writing grammar to DOT: {:?}", dot_path);
+    // dot_options already created above
+    write_grammar_dot(&dot_path, grammar, &dot_options) // Use write_grammar_dot directly
+        .with_context(|| format!("Failed to write DOT file to {:?}", dot_path))?;
+
+    // Conditional outputs based on remaining arguments
+    if let Some(ref user_path) = args.output_json {
+        let final_path = run_specific_output_dir.join(user_path);
+        info!("Writing grammar to JSON: {:?}", final_path);
+        io_write_grammar_json(&final_path, &grammar.sequence, &grammar.rules)
+            .with_context(|| format!("Failed to write JSON grammar to {:?}", final_path))?;
     }
 
-    if let Some(dot_path) = &args.visualize {
-        info!("Writing grammar visualization to DOT file: {}", dot_path.display());
-        write_grammar_dot(dot_path, grammar, &common_dot_options)
-            .with_context(|| format!("Failed to create DOT file at {:?}", dot_path))?;
+    if let Some(ref user_path) = args.output_text {
+        let final_path = run_specific_output_dir.join(user_path);
+        info!("Writing grammar to text: {:?}", final_path);
+        write_grammar_text(&final_path, &grammar.sequence, &grammar.rules) // Corrected arguments
+            .with_context(|| format!("Failed to write text grammar to {:?}", final_path))?;
+    }
+
+    // Always generate GFA output
+    let gfa_path = match args.output_gfa {
+        Some(ref user_path) => run_specific_output_dir.join(user_path),
+        None => run_specific_output_dir.join("grammar.gfa"),
+    };
+    info!("Writing grammar to GFA: {:?}", gfa_path);
+    write_grammar_gfa(&gfa_path, grammar)
+        .with_context(|| format!("Failed to write GFA to {:?}", gfa_path))?;
+
+    if let Some(ref user_path) = args.output_repeats {
+        let final_path = run_specific_output_dir.join(user_path);
+        info!("Writing repeats summary to: {:?}", final_path);
+        // Placeholder for actual repeat writing logic
+        // grammar.write_repeats_summary(&final_path)?;
+        fs_write(&final_path, "Repeat summary placeholder.") // Replace with actual call
+            .with_context(|| format!("Failed to write repeats summary to {:?}", final_path))?;
     }
 
     if args.stats {
         info!("Calculating and printing statistics...");
         calculate_and_print_stats(grammar)?;
-    }
-
-    if let Some(path) = &args.export_blocks {
-         info!("Exporting grammar blocks to FASTA file: {}", path.display());
-         let file = File::create(path)
-             .with_context(|| format!("Failed to create FASTA export file at {:?}", path))?;
-         let mut writer = BufWriter::new(file);
-         utils::export::export_grammar_fasta(grammar, &mut writer)
-             .with_context(|| format!("Failed to export grammar blocks to FASTA at {:?}", path))?;
-    }
-    
-    if let Some(path) = &args.output_repeats {
-        info!("Writing repeats summary to: {}", path.display());
-        warn!("Repeat summary output is not fully implemented yet for path: {}", path.display());
     }
 
     info!("All requested outputs generated.");
@@ -697,7 +587,7 @@ async fn process_standard_mode(
     args: &OrbweaverArgs, 
     use_gpu: bool, 
     gpu_context: Option<&GpuContext>,
-    run_specific_output_dir: &PathBuf, 
+    run_specific_output_dir: &PathBuf,
     initial_checkpoints: &HashMap<String, PathBuf>
 ) -> Result<(Grammar, HashMap<String, PathBuf>)> { 
     println!("Using standard mode (loading entire sequence asynchronously)");
@@ -870,28 +760,13 @@ async fn process_standard_mode(
     Ok((merged_grammar, current_run_checkpoints))
 }
 
-fn process_chunked_mode(
-    args: &OrbweaverArgs, 
-    run_specific_output_dir: &PathBuf, 
+async fn process_streaming_mode(
+    args: &OrbweaverArgs,
+    gpu_context: Option<&GpuContext>,
+    run_specific_output_dir: &PathBuf,
     initial_checkpoints: &HashMap<String, PathBuf>
 ) -> Result<(Grammar, HashMap<String, PathBuf>)> {
-    let use_gpu = !args.no_gpu;
-    let mut actual_use_gpu = use_gpu;
-    let gpu_context_chunked: Option<GpuContext> = if use_gpu {
-        match GpuContext::new() {
-            Ok(ctx) => {
-                println!("GPU context initialized successfully for chunked mode.");
-                Some(ctx)
-            }
-            Err(e) => {
-                println!("Warning: Failed to initialize GPU context for chunked mode: {}. Falling back to CPU.", e);
-                actual_use_gpu = false;
-                None
-            }
-        }
-    } else {
-        None
-    };
+    println!("Using streaming mode.");
 
     let checkpoints_dir = run_specific_output_dir.join("checkpoints");
     if !checkpoints_dir.exists() {
@@ -900,167 +775,200 @@ fn process_chunked_mode(
     }
     let mut current_run_checkpoints = initial_checkpoints.clone();
 
-    let effective_chunk_size = if args.chunk_size > 0 {
-        println!("Using provided chunk size: {}", args.chunk_size);
-        args.chunk_size
-    } else {
-        // Dynamic chunk sizing based on available memory
-        let mut sys = System::new();
-        sys.refresh_memory(); // Refresh memory information
-        let available_memory = sys.available_memory() as usize; // In bytes
-        
-        // Heuristic: Use 1/4 of available memory, with min/max bounds
-        let calculated_size = (available_memory / 4) as usize;
-        let min_chunk_size = 1_000_000; // 1MB
-        let max_chunk_size = 500_000_000; // 500MB
-        
-        let dynamic_size = calculated_size.clamp(min_chunk_size, max_chunk_size);
-        println!("Dynamically calculated chunk size based on available memory ({:.2} GB): {} bytes", 
-                 available_memory as f64 / 1_000_000_000.0,
-                 dynamic_size);
-        dynamic_size
-    };
+    let mut grammars: Vec<Grammar> = Vec::new();
+    let mut total_bases_processed_estimate: usize = 0;
 
-    println!("Using parallel chunking mode with effective chunk size: {}", effective_chunk_size);
-    
-    // Configure the chunking parameters
-    let max_memory_per_chunk = args.max_memory_per_chunk_mb.map(|mb| mb * 1024 * 1024);
-    
-    let config = ChunkingConfig {
-        chunk_size: effective_chunk_size,
-        overlap_size: args.chunk_overlap,
-        min_rule_usage: args.min_rule_usage,
-        reverse_aware: args.reverse_aware,
-        num_threads: args.threads.unwrap_or_else(num_cpus::get),
-        show_progress: true,
-        adaptive_chunking: args.adaptive_chunking,
-        max_memory_per_chunk,
-        use_gpu: actual_use_gpu, // Use the possibly updated flag
-    };
-    
-    if !args.use_encoding {
-        bail!("Chunked mode requires use_encoding to be enabled for memory efficiency.");
-    }
-    
-    // Read all sequences from the multiple FASTA files
-    let all_sequences = read_sequences_from_multiple_files(&args.input_files, args.skip_ns)
-        .context("Failed to read FASTA sequence(s) for chunked mode")?;
-    
-    if all_sequences.is_empty() {
-        bail!("No sequences found in input files for chunking");
-    }
-    
-    // Filter sequences based on user-provided indices (if any)
-    let selected_sequences = if let Some(ref indices) = args.sequence_indices {
-        println!("Processing selected sequences only: {:?}", indices);
-        
-        let mut filtered = Vec::new();
-        for &idx in indices {
-            if idx < all_sequences.len() {
-                filtered.push(all_sequences[idx].clone());
-            } else {
-                println!("Warning: Sequence index {} is out of range (max: {}), skipping", 
-                         idx, all_sequences.len() - 1);
-            }
-        }
-        
-        if filtered.is_empty() {
-            bail!("No valid sequences selected for processing");
-        }
-        
-        filtered
-    } else {
-        all_sequences
-    };
-    
-    println!("Processing {} sequences in chunked mode", selected_sequences.len());
-    
-    // Calculate total length estimate *before* consuming selected_sequences
-    let total_len_estimate = selected_sequences.iter().map(|(_, b)| b.len()).sum();
-
-    // Process each sequence
-    let mut grammars = Vec::new();
-    let mut total_bases = 0;
-    
-    for (seq_idx, (record_id, bases)) in selected_sequences.iter().enumerate() {
-        let seq_identifier = format!("seq_{}_{}", seq_idx, record_id.replace(|c: char| !c.is_alphanumeric(), "_"));
-        let checkpoint_file_name = format!("{}.bincode", seq_identifier);
+    for (file_idx, input_file_path) in args.input_files.iter().enumerate() {
+        let file_identifier = format!(
+            "file_{}_{}",
+            file_idx,
+            input_file_path.file_stem().unwrap_or_default().to_string_lossy()
+        );
+        let checkpoint_file_name = format!("{}_stream.grammar", file_identifier);
         let checkpoint_path = checkpoints_dir.join(&checkpoint_file_name);
 
-        if let Some(existing_checkpoint_path) = current_run_checkpoints.get(&seq_identifier) {
-            if existing_checkpoint_path.exists() {
-                println!("Loading grammar for chunked sequence {} (ID: {}) from checkpoint {:?}", seq_idx, record_id, existing_checkpoint_path);
+        if let Some(existing_checkpoint_path) = current_run_checkpoints.get(&file_identifier) {
+            if existing_checkpoint_path.exists() && !args.force_rerun {
+                println!("Loading grammar for file {} ({}) from checkpoint {:?}", file_idx, input_file_path.display(), existing_checkpoint_path);
                 match File::open(existing_checkpoint_path) {
-                    Ok(file) => {
-                        match bincode::deserialize_from(file) {
-                            Ok(grammar) => {
-                                grammars.push(grammar);
-                                total_bases += bases.len(); // Still count towards total for merge estimate
-                                continue; 
-                            }
-                            Err(e) => {
-                                println!("Warning: Failed to deserialize checkpoint {:?}: {}. Recomputing.", existing_checkpoint_path, e);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        println!("Warning: Failed to open checkpoint file {:?}: {}. Recomputing.", existing_checkpoint_path, e);
-                    }
+                    Ok(file) => match bincode::deserialize_from(file) {
+                        Ok(grammar) => { grammars.push(grammar); continue; }
+                        Err(e) => println!("Warning: Failed to deserialize checkpoint {:?}: {}. Recomputing.", existing_checkpoint_path, e),
+                    },
+                    Err(e) => println!("Warning: Failed to open checkpoint file {:?}: {}. Recomputing.", existing_checkpoint_path, e),
                 }
-            } else {
-                println!("Warning: Checkpoint file for chunked sequence {} not found at {:?}. Recomputing.", seq_identifier, existing_checkpoint_path);
             }
         }
 
-        println!("Processing sequence {} ({}): {} bases in chunked mode", seq_idx, record_id, bases.len());
-        total_bases += bases.len();
+        println!("Processing file {} ({}) in streaming mode...", file_idx, input_file_path.display());
+
+        let mut grammar_builder = GrammarBuilder::new(args.min_rule_usage, args.reverse_aware).enable_streaming_mode();
+        if let Some(max_rules) = args.max_rule_count {
+            grammar_builder = grammar_builder.with_max_rules(max_rules);
+        }
+        if !args.no_gpu && gpu_context.is_some(){
+            grammar_builder = grammar_builder.with_gpu(gpu_context);
+        }
+
+        let file = File::open(input_file_path)
+            .with_context(|| format!("Failed to open FASTA file: {}", input_file_path.display()))?;
+        let fasta_reader = bio::io::fasta::Reader::new(std::io::BufReader::new(file));
         
-        let encoded_bases = encode_dna(bases);
-        let (grammar_result, metrics) = parallel_sequitur(&encoded_bases, config.clone(), gpu_context_chunked.as_ref())?;
+        let mut record_processed_bases = 0;
+
+        for result in fasta_reader.records() {
+            let record = result.with_context(|| format!("Failed to read FASTA record from {}", input_file_path.display()))?;
+            println!("Processing record: {} from file {}", record.id(), input_file_path.display());
+            
+            let seq_data = record.seq();
+            let mut current_pos = 0;
+            let stream_chunk_size = args.chunk_size_streaming.unwrap_or(1024 * 1024); // Default to 1MB if not set
+
+            while current_pos < seq_data.len() {
+                let end = std::cmp::min(current_pos + stream_chunk_size, seq_data.len());
+                let chunk = &seq_data[current_pos..end];
+                
+                let encoded_chunk_bases: Vec<EncodedBase>;
+                if args.skip_ns {
+                    encoded_chunk_bases = chunk.iter().filter(|&&b| b != b'N' && b != b'n').filter_map(|&b| EncodedBase::from_base(b)).collect();
+                } else {
+                    encoded_chunk_bases = chunk.iter().filter_map(|&b| EncodedBase::from_base(b)).collect();
+                }
+
+                if !encoded_chunk_bases.is_empty() {
+                    grammar_builder.process_sequence_chunk(&encoded_chunk_bases)
+                        .with_context(|| format!("Failed to process sequence chunk for record {} from file {}", record.id(), input_file_path.display()))?;
+                    record_processed_bases += encoded_chunk_bases.len();
+                }
+                current_pos = end;
+            }
+            println!("Finished record: {}. Processed approx. {} bases for this record.", record.id(), record_processed_bases);
+            total_bases_processed_estimate += record_processed_bases;
+            record_processed_bases = 0; // Reset for next record in the same file
+        }
         
-        println!("Parallel execution metrics for sequence {}:", seq_idx);
-        println!("  Chunk count: {}", metrics.chunk_count);
-        println!("  Chunk processing time: {:?}", metrics.chunk_processing_time);
-        println!("  Merge time: {:?}", metrics.merge_time);
-        println!("  Deduplication time: {:?}", metrics.deduplication_time);
-        println!("  Total time: {:?}", metrics.total_time);
-        println!("  Rule count (before merge): {}", metrics.rules_before_merge);
-        println!("  Rule count (after merge): {}", metrics.rules_after_merge);
+        grammar_builder.finalize_grammar()
+            .with_context(|| format!("Failed to finalize grammar for file {}", input_file_path.display()))?;
         
+        let (sequence_ref, rules_ref) = grammar_builder.get_grammar();
+        let max_depth = grammar_builder.get_max_rule_depth();
+        let file_grammar = Grammar { 
+            sequence: sequence_ref.clone(),
+            rules: rules_ref.clone(),
+            max_depth, 
+            origins: HashMap::new() 
+        };
+
+        // Save checkpoint logic (assuming this part is mostly okay for now)
         match File::create(&checkpoint_path) {
             Ok(file_writer) => {
-                if let Err(e) = bincode::serialize_into(file_writer, &grammar_result) {
-                    println!("Warning: Failed to save checkpoint for chunked sequence {}: {}. Proceeding without checkpoint.", seq_identifier, e);
+                if let Err(e) = bincode::serialize_into(file_writer, &file_grammar) {
+                    println!("Warning: Failed to save checkpoint for file {}: {}. Proceeding without checkpoint.", file_identifier, e);
                 } else {
-                    println!("Saved checkpoint for chunked sequence {} to {:?}", seq_identifier, checkpoint_path);
-                    current_run_checkpoints.insert(seq_identifier.clone(), checkpoint_path.clone());
+                    println!("Saved checkpoint for file {} to {:?}", file_identifier, checkpoint_path);
+                    current_run_checkpoints.insert(file_identifier.clone(), checkpoint_path.clone());
                 }
             }
             Err(e) => {
-                println!("Warning: Failed to create checkpoint file {:?}: {}. Proceeding without checkpoint.", checkpoint_path, e);
+                 println!("Warning: Failed to create checkpoint file {:?}: {}. Proceeding without checkpoint.", checkpoint_path, e);
             }
         }
-        grammars.push(grammar_result);
+        grammars.push(file_grammar);
     }
-    
-    if grammars.len() > 1 {
-        println!("Merging {} sequence grammars (chunked mode)...", grammars.len());
-        let merge_start = Instant::now();
-        let (merged_grammar, _merge_metrics) = merge_grammars(grammars, &config, total_len_estimate)?;
-        
-        println!("Multi-sequence merging (chunked mode) complete in {:?}", merge_start.elapsed());
-        println!("Final merged grammar (chunked mode) has {} rules", merged_grammar.rules.len());
-        
-        Ok((merged_grammar, current_run_checkpoints))
-    } else if grammars.len() == 1 {
+
+    if grammars.is_empty() {
+        bail!("No grammars were built. Input files might be empty or failed to process.");
+    }
+
+    if grammars.len() == 1 {
         Ok((grammars.remove(0), current_run_checkpoints))
     } else {
-        if selected_sequences.is_empty() {
-             bail!("No sequences selected for processing in chunked mode.")
-        } else {
-            bail!("No grammars were produced in chunked mode from the provided sequences.")
+        println!("Merging {} grammars from streaming mode...", grammars.len());
+        let dummy_config = ChunkingConfig::default();
+        merge_grammars(grammars, &dummy_config, total_bases_processed_estimate)
+             .map(|(g, _metrics)| (g, current_run_checkpoints))
+            .context("Failed to merge grammars from streaming mode")
+    }
+}
+
+fn process_chunked_mode(
+    args: &OrbweaverArgs, 
+    run_specific_output_dir: &PathBuf,
+    initial_checkpoints: &HashMap<String, PathBuf>
+) -> Result<(Grammar, HashMap<String, PathBuf>)> {
+    if args.input_files.len() > 1 {
+         return Err(anyhow::anyhow!("Chunked mode currently supports only a single input FASTA file. Please provide one file or use standard/streaming mode for multiple files."));
+    }
+    let input_path = args.input_files.first().ok_or_else(|| anyhow::anyhow!("No input file provided for chunked mode."))?;
+    println!("Processing (chunked) input file: {}", input_path.display());
+
+    let seq_id = input_path.file_stem().unwrap_or_default().to_string_lossy().to_string();
+    let checkpoint_filename = format!("{}_chunked_final.grammar", seq_id);
+    let checkpoint_path = run_specific_output_dir.join(&checkpoint_filename);
+
+    if let Some(resumed_grammar_path) = initial_checkpoints.get(&format!("{}_final", seq_id)) { // Check for final checkpoint
+        if resumed_grammar_path.exists() && !args.force_rerun {
+            println!("Chunked mode: Resuming final grammar for {} from checkpoint: {}", seq_id, resumed_grammar_path.display());
+            // TODO: Load the fully merged grammar.
+            // let grammar = ... load from resumed_grammar_path ...
+            // return Ok((grammar, initial_checkpoints.clone()));
+            println!("Skipping {} due to existing final checkpoint (full chunked resume not yet implemented here).", seq_id);
+             return Err(anyhow::anyhow!("Chunked mode final checkpoint exists, resume not fully implemented.")); // Placeholder
         }
     }
+    
+    let sequences = orbweaver::fasta::reader::read_fasta_sequences(input_path, args.skip_ns)?;
+    if sequences.is_empty() {
+        return Err(anyhow::anyhow!("No sequences found in FASTA file: {}", input_path.display()));
+    }
+    
+    // For chunked mode, typically operate on the first sequence if multiple are present,
+    // or concatenate them (concatenation needs careful thought for biological meaning).
+    // Here, we'll use the first sequence.
+    let (_header, sequence_bytes) = &sequences[0];
+    
+    let encoded_sequence = if args.use_encoding {
+        encode_dna(sequence_bytes)
+    } else {
+        // This path is less common as GrammarBuilder expects EncodedBase.
+        // If use_encoding is false, we'd need a different builder path or convert here.
+        // For now, assume use_encoding=true is typical for builder.
+        // If not, `GrammarBuilder::process_bytes_chunk` would be relevant.
+        eprintln!("Warning: Chunked mode typically uses encoded sequences. Behavior with raw bytes might be limited.");
+        // Convert to Vec<EncodedBase> anyway, perhaps with a lossy conversion for non-ACGT.
+        sequence_bytes.iter().filter_map(|b| EncodedBase::from_base(*b)).collect()
+    };
+
+    let num_threads = args.threads.unwrap_or_else(num_cpus::get);
+    let chunking_config = ChunkingConfig {
+        chunk_size: args.chunk_size, // If 0, parallel::engine will use adaptive/default
+        overlap_size: args.chunk_overlap,
+        min_rule_usage: args.min_rule_usage,
+        reverse_aware: args.reverse_aware,
+        num_threads,
+        show_progress: true, // Or make this an arg
+        adaptive_chunking: args.adaptive_chunking,
+        max_memory_per_chunk: args.max_memory_per_chunk_mb.map(|mb| mb * 1024 * 1024),
+        use_gpu: !args.no_gpu, // Assuming ChunkingConfig takes this
+    };
+
+    // `parallel_sequitur` would need to be adapted to save/load chunk-level checkpoints
+    // and a final merged checkpoint, using `run_specific_output_dir`.
+    // It would also need to accept the `initial_checkpoints` and return `current_checkpoints`.
+    // For now, this is a simplified call.
+    let (grammar, _parallel_metrics) = orbweaver::parallel::engine::parallel_sequitur(
+        &encoded_sequence, 
+        chunking_config,
+        None // Pass GpuContext here if available and `parallel_sequitur` supports it
+    )?;
+    
+    // Save final merged grammar checkpoint
+    // utils::export::write_grammar_json(&checkpoint_path, &grammar.sequence, &grammar.rules)?;
+    let final_checkpoints = initial_checkpoints.clone();
+    // final_checkpoints.insert(format!("{}_final", seq_id), checkpoint_path);
+    // println!("Saved final chunked grammar checkpoint for {} to {}", seq_id, checkpoint_filename);
+
+    Ok((grammar, final_checkpoints))
 }
 
 fn encode_dna(bases: &[u8]) -> Vec<EncodedBase> {

@@ -19,17 +19,9 @@ pub struct OrbweaverArgs {
     pub input_files: Vec<PathBuf>,
 
     // --- Workflow and Output Organization ---
-    /// Base directory for all outputs. (Will be derived if not provided if paths are relative, or used as absolute if given)
-    #[clap(short = 'o', long, value_parser)]
-    pub output_dir: Option<PathBuf>,
-
-    /// Species identifier. (Will be derived from the first input file if not provided)
-    #[clap(long, value_parser)]
-    pub species_id: Option<String>,
-
-    /// Assembly identifier. (Optional)
-    #[clap(long, value_parser)]
-    pub assembly_id: Option<String>,
+    // output_dir, species_id, and assembly_id are removed.
+    // The species_id is derived from the first input file.
+    // The output directory is always ./<derived_species_id>/<run_id>/ in the current working directory.
 
     // --- Output Format Options ---
     
@@ -54,13 +46,6 @@ pub struct OrbweaverArgs {
     #[clap(long, value_parser)]
     pub output_gfa: Option<PathBuf>,
 
-    /// Generate a .dot file for visualizing the grammar.
-    /// 
-    /// Creates a DOT file for visualization with Graphviz tools like dot, neato, etc.
-    /// Example usage: dot -Tpng grammar.dot -o grammar.png
-    #[clap(long, value_parser)]
-    pub visualize: Option<PathBuf>,
-
     /// Export grammar rules as sequences in FASTA format.
     /// 
     /// Writes each grammar rule as a separate FASTA record, where each record
@@ -81,10 +66,11 @@ pub struct OrbweaverArgs {
     #[clap(long, value_parser)]
     pub output_graphml: Option<PathBuf>,
 
-    /// Print statistics about the generated grammar.
-    /// 
+    /// Print statistics about the generated grammar. (Enabled by default)
+    ///
     /// Displays metrics about the grammar: rule count, depth, compression ratio, etc.
-    #[clap(long, action = clap::ArgAction::SetTrue)]
+    /// Use --no-stats to disable.
+    #[clap(long, default_value_t = true)]
     pub stats: bool,
 
     // --- Grammar Construction Options ---
@@ -100,7 +86,7 @@ pub struct OrbweaverArgs {
     /// 
     /// A digram must appear at least this many times to be replaced by a rule.
     /// Higher values lead to fewer rules with more usage each.
-    #[clap(long, value_parser, default_value_t = 10)]
+    #[clap(long, value_parser, default_value_t = 100)]
     pub min_rule_usage: usize,
 
     /// Maximum number of rules allowed (triggers eviction).

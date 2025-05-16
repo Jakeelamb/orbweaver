@@ -17,7 +17,6 @@ pub struct Config {
     pub chunk_size: Option<usize>,
     pub skip_ns: bool,
     pub stats: bool,
-    pub visualize: bool,
 }
 
 impl Config {
@@ -37,7 +36,6 @@ impl Config {
         chunk_size: Option<usize>,
         skip_ns: bool,
         stats: bool,
-        visualize: bool,
     ) -> Self {
         Config {
             input_path,
@@ -53,7 +51,6 @@ impl Config {
             chunk_size,
             skip_ns,
             stats,
-            visualize,
         }
     }
 

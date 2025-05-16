@@ -96,7 +96,7 @@ pub fn format_duration(duration: Duration) -> String {
 }
 
 /// Measure memory usage using pprof.
-#[cfg(feature = "jemalloc")]
+#[cfg(feature = "profiling")]
 pub fn measure_memory() -> Result<(usize, usize)> {
     let mut allocated: usize = 0;
     let mut active: usize = 0;
@@ -109,7 +109,7 @@ pub fn measure_memory() -> Result<(usize, usize)> {
 }
 
 /// Print current memory usage.
-#[cfg(feature = "jemalloc")]
+#[cfg(feature = "profiling")]
 pub fn print_memory_usage(label: &str) -> Result<()> {
     let (allocated, active) = measure_memory()?;
     println!(
@@ -121,7 +121,7 @@ pub fn print_memory_usage(label: &str) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(feature = "jemalloc"))]
+#[cfg(not(feature = "profiling"))]
 pub fn print_memory_usage(label: &str) -> Result<()> {
     println!("Memory usage at {} not available (jemalloc not enabled)", label);
     Ok(())

@@ -44,16 +44,12 @@ enum Commands {
         #[arg(long)]
         output_gfa: Option<PathBuf>,
         
-        /// Output DOT file for visualization
-        #[arg(long)]
-        visualize: Option<PathBuf>,
-        
         /// Export rule sequences as FASTA
         #[arg(long)]
         export_blocks: Option<PathBuf>,
 
         /// Minimum number of times a digram must appear to create a rule
-        #[arg(short, long, default_value = "2")]
+        #[arg(short, long, default_value = "100")]
         min_rule_usage: usize,
 
         /// Consider reverse complements as equivalent
@@ -76,8 +72,9 @@ enum Commands {
         #[arg(long, default_value = "1000")]
         chunk_overlap: usize,
         
-        /// Print statistics about the grammar
-        #[arg(long, default_value = "false")]
+        /// Print statistics about the grammar. (Enabled by default)
+        /// Use --no-stats to disable.
+        #[arg(long, default_value_t = true)]
         stats: bool,
         
         /// Skip N bases in the input sequence
@@ -138,7 +135,6 @@ pub fn main() -> Result<()> {
             output,
             output_text,
             output_gfa,
-            visualize,
             export_blocks,
             min_rule_usage,
             reverse_aware,
@@ -155,7 +151,6 @@ pub fn main() -> Result<()> {
                 &output,
                 output_text.as_deref(),
                 output_gfa.as_deref(),
-                visualize.as_deref(),
                 export_blocks.as_deref(),
                 min_rule_usage,
                 reverse_aware,
@@ -192,7 +187,6 @@ fn build_grammar(
     output_path: &Path,
     output_text_path: Option<&Path>,
     output_gfa_path: Option<&Path>,
-    visualize_path: Option<&Path>,
     export_blocks_path: Option<&Path>,
     min_rule_usage: usize,
     reverse_aware: bool,
@@ -288,18 +282,6 @@ fn build_grammar(
     if let Some(gfa_path) = output_gfa_path {
         export_grammar(&grammar, gfa_path, OutputFormat::Gfa)?;
         println!("  GFA graph written to {}", gfa_path.display());
-    }
-    
-    // Optional DOT visualization
-    if let Some(dot_path) = visualize_path {
-        export_grammar(&grammar, dot_path, OutputFormat::Dot)?;
-        println!("  DOT visualization written to {}", dot_path.display());
-        
-        // Try to generate PNG if graphviz is available
-        let png_path = dot_path.with_extension("png");
-        if let Ok(()) = orbweaver::utils::visualization::convert_dot_to_png(dot_path, &png_path) {
-            println!("  PNG visualization written to {}", png_path.display());
-        }
     }
     
     // Optional FASTA output for rule sequences
