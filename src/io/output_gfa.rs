@@ -1,8 +1,10 @@
 use crate::grammar::builder::GrammarBuilder;
 use crate::grammar::rule::Rule;
-use crate::grammar::symbol::{Symbol, SymbolType};
+use crate::grammar::symbol::{Symbol, SymbolType, Direction};
+use crate::grammar::engine::Grammar;
+use crate::utils::export::expand_rule_to_string;
 use anyhow::{Context, Result};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
@@ -29,7 +31,7 @@ pub fn write_grammar_gfa(grammar_builder: &GrammarBuilder, output_path: &Path) -
     // This requires decoding the rule's symbols back into a base sequence.
     for rule in rules.values() {
         let segment_id = rule.id;
-        let sequence = reconstruct_rule_sequence(rule.id, rules)?;
+        let sequence = expand_rule_to_string(rule, &rules, Direction::Forward);
         // S <sid> <sequence> [slen] [tags...]
         // Using rule ID as segment ID. Sequence needs reconstruction.
         // slen tag is optional but recommended if sequence is long.
@@ -97,57 +99,114 @@ fn get_segment_id_and_orientation(symbol: &Symbol) -> (String, char) {
     }
 }
 
-/// Recursively reconstructs the base sequence of a rule.
-/// Needs access to the full rule map.
-fn reconstruct_rule_sequence(rule_id: usize, all_rules: &HashMap<usize, Rule>) -> Result<String> {
-    let rule = all_rules.get(&rule_id)
-        .ok_or_else(|| anyhow::anyhow!("Rule ID {} not found during sequence reconstruction", rule_id))?;
-    
-    let mut sequence = String::new();
-    let mut visited = std::collections::HashSet::new(); // Detect cycles
-    visited.insert(rule_id);
+pub fn write_gfa_top_n_longest_rules(grammar: &Grammar, output_path: &Path, n: usize) -> Result<()> {
+    if n == 0 {
+        // Optionally, create an empty GFA or just print a message and return.
+        // For now, just print and return.
+        println!("Number of rules to keep (n) is 0. No GFA file will be generated for top N rules.");
+        let file = File::create(output_path)
+            .with_context(|| format!("Failed to create empty GFA output file: {}", output_path.display()))?;
+        let mut writer = BufWriter::new(file);
+        writeln!(writer, "H\tVN:Z:1.0").context("Failed to write GFA header for empty file")?;
+        return Ok(());
+    }
 
-    fn append_symbol_sequence(
-        symbol: Symbol,
-        all_rules: &HashMap<usize, Rule>,
-        current_sequence: &mut String,
-        visited_stack: &mut std::collections::HashSet<usize>,
-    ) -> Result<()> {
-        match symbol.symbol_type {
-            SymbolType::Terminal(base) => {
-                current_sequence.push(base.to_char());
-            }
-            SymbolType::NonTerminal(sub_rule_id) => {
-                if !visited_stack.insert(sub_rule_id) {
-                    // Cycle detected
-                    return Err(anyhow::anyhow!(
-                        "Cycle detected during sequence reconstruction involving rule {}",
-                        sub_rule_id
-                    ));
+    println!(
+        "Generating GFA for top {} longest rules (by expanded length) to: {}",
+        n,
+        output_path.display()
+    );
+
+    // 1. Calculate expanded lengths and identify top N rules
+    let mut rule_lengths: Vec<(usize, usize, &Rule)> = Vec::new(); // (rule_id, length, rule_ref)
+    for (id, rule) in &grammar.rules {
+        // Use Direction::Forward for the canonical representation of the rule's sequence
+        let expanded_seq = expand_rule_to_string(rule, &grammar.rules, Direction::Forward);
+        rule_lengths.push((*id, expanded_seq.len(), rule));
+    }
+
+    rule_lengths.sort_by(|a, b| b.1.cmp(&a.1)); // Sort by length descending
+
+    let top_n_rules_info: Vec<&Rule> = rule_lengths.iter().take(n).map(|&(_, _, rule_ref)| rule_ref).collect();
+
+    if top_n_rules_info.is_empty() && !grammar.rules.is_empty() {
+        println!("Top N rules list is empty, but grammar has rules. Check n ({}).", n);
+    } else if grammar.rules.is_empty() {
+        println!("No rules found in the grammar. GFA file will be effectively empty (header only).");
+    }
+
+
+    // 2. Collect all segments (rules and terminals) needed for S-lines
+    let mut needed_rule_segments: HashMap<usize, &Rule> = HashMap::new();
+    let mut needed_terminal_chars: HashSet<char> = HashSet::new(); // Store base char for terminals
+
+    for top_rule in &top_n_rules_info {
+        needed_rule_segments.insert(top_rule.id, top_rule); // The top rule itself
+        for symbol_in_def in &top_rule.symbols {
+            match symbol_in_def.symbol_type {
+                SymbolType::Terminal(base) => {
+                    needed_terminal_chars.insert(base.to_char());
                 }
-                let sub_rule = all_rules.get(&sub_rule_id).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "Rule ID {} (dependency of {}) not found during sequence reconstruction",
-                        sub_rule_id, "current_rule_id" // Need context here
-                    )
-                })?;
-                for &sub_symbol in &sub_rule.symbols {
-                    append_symbol_sequence(sub_symbol, all_rules, current_sequence, visited_stack)?;
+                SymbolType::NonTerminal(sub_rule_id) => {
+                    if let Some(sub_rule) = grammar.rules.get(&sub_rule_id) {
+                        needed_rule_segments.insert(sub_rule_id, sub_rule); // Direct sub-rules
+                    } else {
+                        // This case should ideally not happen if grammar is consistent
+                        eprintln!("Warning: Sub-rule R{} referenced by R{} not found in grammar.rules.", sub_rule_id, top_rule.id);
+                    }
                 }
-                visited_stack.remove(&sub_rule_id); // Remove after successfully processing children
             }
         }
-        Ok(())
     }
 
-    for &symbol in &rule.symbols {
-        // Pass a mutable reference to visited set for cycle detection within the recursive call.
-        append_symbol_sequence(symbol, all_rules, &mut sequence, &mut visited)?;
+    // 3. Write GFA file
+    let file = File::create(output_path)
+        .with_context(|| format!("Failed to create GFA output file: {}", output_path.display()))?;
+    let mut writer = BufWriter::new(file);
+
+    // GFA Header
+    writeln!(writer, "H\tVN:Z:1.0").context("Failed to write GFA header")?;
+
+    // S-Lines for Rules
+    for (id, rule) in &needed_rule_segments {
+        let expanded_seq = expand_rule_to_string(rule, &grammar.rules, Direction::Forward);
+        writeln!(writer, "S\tR{}\t{}\tLN:i:{}", id, expanded_seq, expanded_seq.len())
+            .with_context(|| format!("Failed to write S-line for rule R{}", id))?;
     }
 
-    // TODO: Handle strand properly during reconstruction?
-    // If a symbol has strand '-', should its sequence be reverse complemented?
-    // This adds significant complexity.
+    // S-Lines for Terminals
+    for base_char in &needed_terminal_chars {
+        let terminal_seg_id = format!("T_{}", base_char);
+        // Sequence for terminal S-line is just the base itself
+        writeln!(writer, "S\t{}\t{}\tLN:i:1", terminal_seg_id, base_char)
+            .with_context(|| format!("Failed to write S-line for terminal T_{}", base_char))?;
+    }
 
-    Ok(sequence)
+    // L-Lines (defining the internal structure of the top N rules)
+    for top_rule in &top_n_rules_info {
+        // Rules are R -> S1 S2 ... Sn. Create links S1->S2, S2->S3 ...
+        if top_rule.symbols.len() >= 2 {
+            for i in 0..(top_rule.symbols.len() - 1) {
+                let sym1 = top_rule.symbols[i];
+                let sym2 = top_rule.symbols[i+1];
+
+                // Use the existing helper to get standardized segment names and orientations
+                let (seg1_id_str, seg1_orient_char) = get_segment_id_and_orientation(&sym1);
+                let (seg2_id_str, seg2_orient_char) = get_segment_id_and_orientation(&sym2);
+
+                writeln!(
+                    writer,
+                    "L\t{}\t{}\t{}\t{}\t0M", // 0M for adjacency
+                    seg1_id_str, seg1_orient_char, seg2_id_str, seg2_orient_char
+                ).with_context(|| format!("Failed to write L-line for internal structure of rule R{}", top_rule.id))?;
+            }
+        }
+    }
+
+    println!(
+        "Successfully wrote GFA for top {} longest rules to: {}",
+        top_n_rules_info.len(), // Actual number written, might be less than n if grammar is small
+        output_path.display()
+    );
+    Ok(())
 } 

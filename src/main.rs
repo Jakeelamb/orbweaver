@@ -537,18 +537,19 @@ fn generate_outputs(grammar: &Grammar, args: &OrbweaverArgs, run_specific_output
     // Always generate DOT file output
     let dot_path = run_specific_output_dir.join("grammar.dot");
     info!("Writing grammar to DOT: {:?}", dot_path);
-    // dot_options already created above
     write_grammar_dot(&dot_path, grammar, &dot_options) // Use write_grammar_dot directly
         .with_context(|| format!("Failed to write DOT file to {:?}", dot_path))?;
 
-    // Conditional outputs based on remaining arguments
-    if let Some(ref user_path) = args.output_json {
-        let final_path = run_specific_output_dir.join(user_path);
-        info!("Writing grammar to JSON: {:?}", final_path);
-        io_write_grammar_json(&final_path, &grammar.sequence, &grammar.rules)
-            .with_context(|| format!("Failed to write JSON grammar to {:?}", final_path))?;
-    }
+    // JSON output: Always generate, using specified path or defaulting to grammar.json
+    let json_output_path = match args.output_json {
+        Some(ref user_path) => run_specific_output_dir.join(user_path),
+        None => run_specific_output_dir.join("grammar.json"),
+    };
+    info!("Writing grammar to JSON: {:?}", json_output_path);
+    io_write_grammar_json(&json_output_path, &grammar.sequence, &grammar.rules)
+        .with_context(|| format!("Failed to write JSON grammar to {:?}", json_output_path))?;
 
+    // Text output (conditional based on user argument)
     if let Some(ref user_path) = args.output_text {
         let final_path = run_specific_output_dir.join(user_path);
         info!("Writing grammar to text: {:?}", final_path);

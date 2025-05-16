@@ -1,8 +1,7 @@
-use crate::grammar::symbol::Symbol;
+use crate::grammar::symbol::{Symbol, Direction, SymbolType};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::fmt;
-use crate::grammar::symbol::Direction;
 use crate::encode::dna_2bit::EncodedBase;
 use suffix_array::SuffixArray;
 use crate::grammar::digram_table::DigramKeyTuple;

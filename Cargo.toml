@@ -16,7 +16,7 @@ name = "orbweaver"
 path = "src/main.rs"
 
 [workspace]
-members = ["orbweaver-kernels"]
+members = ["orbweaver-kernels", "orbweaver-utils"]
 
 [dependencies]
 # Core biotechnology libraries

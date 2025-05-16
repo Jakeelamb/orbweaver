@@ -377,6 +377,7 @@ pub fn grammar_to_json(
         id: usize,
         symbols: Vec<SymbolJson>,
         usage_count: usize,
+        depth: Option<usize>,
     }
 
     // Helper function to convert Symbol to SymbolJson
@@ -407,6 +408,7 @@ pub fn grammar_to_json(
             id,
             symbols: rule.symbols.iter().map(symbol_to_json).collect(),
             usage_count: rule.usage_count,
+            depth: rule.depth,
         })
         .collect();
 
