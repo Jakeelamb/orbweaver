@@ -2,6 +2,9 @@
 
 Orbweaver can output the generated grammar in several formats using command-line flags.
 
+**Default Output Behavior:**
+When specific paths are not provided for key output formats (JSON, FASTA rule blocks, Tabular Repeats, DOT, GraphML), Orbweaver will generate them with default names (e.g., `grammar.json`, `rules.fasta`) within a run-specific directory. This directory is typically `./<species_id>/<run_id>/`, where `<species_id>` is derived from the input filename.
+
 ## 1. JSON (`--output-json <PATH>`)
 
 This format provides a direct serialization of the internal grammar representation using `serde_json`.

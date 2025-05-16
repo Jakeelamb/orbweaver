@@ -8,7 +8,7 @@ use std::path::PathBuf;
 /// by identifying repeating patterns. It can output the grammar in various formats and
 /// provide statistics about the compression and structure.
 #[derive(Parser, Debug, Clone, Serialize, Deserialize, Default)]
-#[command(author = "Orbweaver Team", version, about, long_about = None)]
+#[command(author = "Orbweaver Team", version, about = "Orbweaver: Grammar-based genomic sequence analysis tool.\n\nOutputs are saved in ./<species_id>/<run_id>/ where <species_id> is derived from the input filename and <run_id> is a timestamp or user-provided.", long_about = None)]
 #[command(help_template = "\n{before-help}{name} {version}\n{author-with-newline}{about-with-newline}\n{usage-heading} {usage}\n\n{all-args}{after-help}\n")]
 pub struct OrbweaverArgs {
     /// Input FASTA file paths (.fa, .fasta, .fna), comma-separated.
@@ -61,6 +61,13 @@ pub struct OrbweaverArgs {
     #[clap(long, value_parser)]
     pub output_repeats: Option<PathBuf>,
 
+    /// Output GraphML representation of the grammar.
+    /// 
+    /// Exports the grammar as a graph in GraphML format,
+    /// suitable for import into various graph analysis tools.
+    #[clap(long, value_parser)]
+    pub output_graphml: Option<PathBuf>,
+
     /// Print statistics about the generated grammar.
     /// 
     /// Displays metrics about the grammar: rule count, depth, compression ratio, etc.
@@ -80,7 +87,7 @@ pub struct OrbweaverArgs {
     /// 
     /// A digram must appear at least this many times to be replaced by a rule.
     /// Higher values lead to fewer rules with more usage each.
-    #[clap(long, value_parser, default_value_t = 2)]
+    #[clap(long, value_parser, default_value_t = 10)]
     pub min_rule_usage: usize,
 
     /// Maximum number of rules allowed (triggers eviction).
@@ -205,4 +212,36 @@ pub struct OrbweaverArgs {
     /// If omitted but `checkpoint_dir` is specified, a final checkpoint is typically saved upon successful completion.
     #[clap(long, value_parser)]
     pub checkpoint_interval: Option<String>,
+
+    /// Graph-related arguments
+    #[clap(long, value_parser, default_value_t = String::from("sfdp"))]
+    pub graph_engine: String,
+
+    /// Include terminal symbols in graph visualizations.
+    #[clap(long, value_parser, default_value_t = true)]
+    pub graph_include_terminals: bool,
+
+    /// Maximum depth of rules to display in graph visualizations.
+    #[clap(long, value_parser)]
+    pub graph_max_depth: Option<usize>,
+
+    /// Skip rules above this depth in graph visualizations (useful for very deep grammars).
+    #[clap(long, value_parser)]
+    pub graph_skip_rules_above_depth: Option<usize>,
+
+    /// Use a transparent background for graph visualizations (PNG/SVG).
+    #[clap(long, value_parser, default_value_t = false)]
+    pub graph_transparent_background: bool,
+
+    /// Use dark mode styling for graph visualizations.
+    #[clap(long, value_parser, default_value_t = false)]
+    pub graph_dark_mode: bool,
+
+    /// Show usage counts on nodes in graph visualizations.
+    #[clap(long, value_parser, default_value_t = true)]
+    pub graph_show_usage_counts: bool,
+
+    /// Color nodes by depth and show depth information in graph visualizations.
+    #[clap(long, value_parser, default_value_t = true)]
+    pub graph_show_depth: bool,
 } 

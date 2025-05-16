@@ -4,24 +4,43 @@ use crate::grammar::symbol::{SymbolType, Direction};
 use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::fs::File;
+// use std::process::Command; // No longer needed if convert_dot_to_graphml is gone
+// use crate::utils::predictable_random_color; // Commented out due to unresolved import
+use quick_xml::events::{BytesEnd, BytesStart, Event};
+use quick_xml::Writer as XmlWriter; // Renamed to avoid conflict with std::io::Write
 
 /// Options for DOT graph visualization
 #[derive(Debug, Clone)]
 pub struct DotOptions {
     /// Whether to include terminal nodes in the graph
     pub include_terminals: bool,
+    /// Maximum depth of rules to display in graph visualizations.
+    pub max_depth: Option<usize>,
+    /// Skip rules above this depth in graph visualizations.
+    pub skip_rules_above_depth: Option<usize>,
+    /// Use a transparent background for graph visualizations (PNG/SVG).
+    pub transparent_background: bool,
+    /// Use dark mode styling for graph visualizations.
+    pub dark_mode: bool,
     /// Whether to include rule usage counts
     pub include_usage_counts: bool,
     /// Whether to color-code nodes by rule depth
     pub color_by_depth: bool,
+    /// Graphviz layout engine (e.g., dot, sfdp).
+    pub engine: String,
 }
 
 impl Default for DotOptions {
     fn default() -> Self {
         Self {
             include_terminals: true,
+            max_depth: None,
+            skip_rules_above_depth: None,
+            transparent_background: false,
+            dark_mode: false,
             include_usage_counts: true,
             color_by_depth: true,
+            engine: "sfdp".to_string(),
         }
     }
 }
@@ -330,46 +349,259 @@ pub fn write_grammar_gfa<P: AsRef<Path>>(
     Ok(())
 }
 
+/// Generate a GraphML representation of the grammar directly.
+pub fn grammar_to_graphml_direct(grammar: &Grammar, options: &DotOptions) -> Result<String> {
+    let mut buffer = Vec::new();
+    let mut xml_writer = XmlWriter::new_with_indent(&mut buffer, b' ', 2);
+
+    xml_writer.write_event(Event::Start(BytesStart::new("graphml")
+        .with_attributes(vec![
+            ("xmlns".as_bytes(), "http://graphml.graphdrawing.org/xmlns".as_bytes()),
+            ("xmlns:xsi".as_bytes(), "http://www.w3.org/2001/XMLSchema-instance".as_bytes()),
+            ("xsi:schemaLocation".as_bytes(), "http://graphml.graphdrawing.org/xmlns http://graphml.graphdrawing.org/xmlns/1.0/graphml.xsd".as_bytes())
+        ])))?;
+
+    // Define keys for node attributes
+    let node_keys = vec![
+        ("d_label", "label", "string"),      // e.g., R1, A+
+        ("d_type", "type", "string"),       // "rule", "terminal"
+        ("d_usage", "usage_count", "int"), // For rules
+        ("d_depth", "depth", "int"),       // For rules
+    ];
+    for (id, name, type_) in node_keys {
+        xml_writer.write_event(Event::Start(BytesStart::new("key")
+            .with_attributes(vec![("id".as_bytes(), id.as_bytes()), ("for".as_bytes(), "node".as_bytes()), ("attr.name".as_bytes(), name.as_bytes()), ("attr.type".as_bytes(), type_.as_bytes())])))?;
+        xml_writer.write_event(Event::End(BytesEnd::new("key")))?;
+    }
+
+    // Define keys for edge attributes (optional, e.g., relationship type)
+    // let edge_keys = vec![("e_type", "relation", "string")]; // Example: "expands_to", "sequence_link"
+    // for (id, name, type_) in edge_keys {
+    //     xml_writer.write_event(Event::Start(BytesStart::new("key").with_attributes(vec![...])))?;
+    //     xml_writer.write_event(Event::End(BytesEnd::new("key")))?;
+    // }
+
+    xml_writer.write_event(Event::Start(BytesStart::new("graph").with_attributes(vec![("id".as_bytes(), "G".as_bytes()), ("edgedefault".as_bytes(), "directed".as_bytes())])))?;
+
+    // --- Create Nodes and Edges for Rules ---
+    let mut defined_terminals = std::collections::HashSet::new();
+
+    for (&rule_id, rule) in &grammar.rules {
+        // Filter by depth if options specify
+        if let Some(max_d) = options.max_depth {
+            if rule.depth.unwrap_or(0) > max_d {
+                continue;
+            }
+        }
+        if let Some(min_d) = options.skip_rules_above_depth { // This logic is inverted, skip_rules_ABOVE_depth
+            if rule.depth.unwrap_or(0) > min_d { // So if rule_depth > skip_depth, we skip. Correct.
+                continue;
+            }
+        }
+
+        let rule_node_id = format!("R{}", rule_id);
+        xml_writer.write_event(Event::Start(BytesStart::new("node").with_attributes(vec![("id".as_bytes(), rule_node_id.as_bytes())])))?;
+        xml_writer.write_event(Event::Start(BytesStart::new("data").with_attributes(vec![("key".as_bytes(), "d_label".as_bytes())])))?;
+        xml_writer.write_event(Event::Text(quick_xml::events::BytesText::new(&rule_node_id)))?;
+        xml_writer.write_event(Event::End(BytesEnd::new("data")))?;
+        xml_writer.write_event(Event::Start(BytesStart::new("data").with_attributes(vec![("key".as_bytes(), "d_type".as_bytes())])))?;
+        xml_writer.write_event(Event::Text(quick_xml::events::BytesText::new("rule")))?;
+        xml_writer.write_event(Event::End(BytesEnd::new("data")))?;
+        if options.include_usage_counts {
+            xml_writer.write_event(Event::Start(BytesStart::new("data").with_attributes(vec![("key".as_bytes(), "d_usage".as_bytes())])))?;
+            xml_writer.write_event(Event::Text(quick_xml::events::BytesText::new(&rule.usage_count.to_string())))?;
+            xml_writer.write_event(Event::End(BytesEnd::new("data")))?;
+        }
+        if options.color_by_depth { // Using this option to decide if depth data is written
+            xml_writer.write_event(Event::Start(BytesStart::new("data").with_attributes(vec![("key".as_bytes(), "d_depth".as_bytes())])))?;
+            xml_writer.write_event(Event::Text(quick_xml::events::BytesText::new(&rule.depth.unwrap_or(0).to_string())))?;
+            xml_writer.write_event(Event::End(BytesEnd::new("data")))?;
+        }
+        xml_writer.write_event(Event::End(BytesEnd::new("node")))?;
+
+        // For each symbol in the rule, create an edge and potentially a terminal node
+        for (symbol_idx, symbol) in rule.symbols.iter().enumerate() {
+            match symbol.symbol_type {
+                SymbolType::Terminal(base) => {
+                    if options.include_terminals {
+                        let terminal_label = format!("{}{}", base.to_char(), symbol.strand.to_char());
+                        let terminal_node_id = format!("T_{}_{}{}", base.to_char(), symbol.strand.to_char(), symbol.id); // Ensure unique enough ID, include original symbol.id
+                        
+                        if !defined_terminals.contains(&terminal_node_id) {
+                            xml_writer.write_event(Event::Start(BytesStart::new("node").with_attributes(vec![("id".as_bytes(), terminal_node_id.as_bytes())])))?;
+                            xml_writer.write_event(Event::Start(BytesStart::new("data").with_attributes(vec![("key".as_bytes(), "d_label".as_bytes())])))?;
+                            xml_writer.write_event(Event::Text(quick_xml::events::BytesText::new(&terminal_label)))?;
+                            xml_writer.write_event(Event::End(BytesEnd::new("data")))?;
+                            xml_writer.write_event(Event::Start(BytesStart::new("data").with_attributes(vec![("key".as_bytes(), "d_type".as_bytes())])))?;
+                            xml_writer.write_event(Event::Text(quick_xml::events::BytesText::new("terminal")))?;
+                            xml_writer.write_event(Event::End(BytesEnd::new("data")))?;
+                            xml_writer.write_event(Event::End(BytesEnd::new("node")))?;
+                            defined_terminals.insert(terminal_node_id.clone());
+                        }
+                        // Edge from rule to terminal
+                        let edge_id = format!("E_R{}_to_T{}_{}", rule_id, terminal_node_id, symbol_idx);
+                        xml_writer.write_event(Event::Start(BytesStart::new("edge")
+                            .with_attributes(vec![
+                                ("id".as_bytes(), edge_id.as_bytes()),
+                                ("source".as_bytes(), rule_node_id.as_bytes()),
+                                ("target".as_bytes(), terminal_node_id.as_bytes())
+                            ])))?;
+                        xml_writer.write_event(Event::End(BytesEnd::new("edge")))?;
+                    }
+                }
+                SymbolType::NonTerminal(child_rule_id) => {
+                    let child_rule_node_id = format!("R{}", child_rule_id);
+                    // Edge from parent rule to child rule symbol instance
+                    let edge_id = format!("E_R{}_to_R{}_{}", rule_id, child_rule_id, symbol_idx);
+                     xml_writer.write_event(Event::Start(BytesStart::new("edge")
+                        .with_attributes(vec![
+                            ("id".as_bytes(), edge_id.as_bytes()),
+                            ("source".as_bytes(), rule_node_id.as_bytes()),
+                            ("target".as_bytes(), child_rule_node_id.as_bytes())
+                        ])))?;
+                    xml_writer.write_event(Event::End(BytesEnd::new("edge")))?;
+                }
+            }
+        }
+    }
+
+    // --- Create Nodes and Edges for the Main Sequence ---
+    if !grammar.sequence.is_empty() {
+        for i in 0..grammar.sequence.len() {
+            let symbol = &grammar.sequence[i];
+            let current_symbol_node_id: String;
+
+            match symbol.symbol_type {
+                SymbolType::Terminal(base) => {
+                    if options.include_terminals {
+                        let terminal_label = format!("{}{}", base.to_char(), symbol.strand.to_char());
+                        // ID needs to be consistent with how terminals from rules are made, using symbol.id for uniqueness.
+                        let node_id = format!("T_{}_{}{}", base.to_char(), symbol.strand.to_char(), symbol.id);
+                        current_symbol_node_id = node_id.clone();
+
+                        if !defined_terminals.contains(&node_id) {
+                            xml_writer.write_event(Event::Start(BytesStart::new("node").with_attributes(vec![("id".as_bytes(), node_id.as_bytes())])))?;
+                            xml_writer.write_event(Event::Start(BytesStart::new("data").with_attributes(vec![("key".as_bytes(), "d_label".as_bytes())])))?;
+                            xml_writer.write_event(Event::Text(quick_xml::events::BytesText::new(&terminal_label)))?;
+                            xml_writer.write_event(Event::End(BytesEnd::new("data")))?;
+                            xml_writer.write_event(Event::Start(BytesStart::new("data").with_attributes(vec![("key".as_bytes(), "d_type".as_bytes())])))?;
+                            xml_writer.write_event(Event::Text(quick_xml::events::BytesText::new("terminal")))?;
+                            xml_writer.write_event(Event::End(BytesEnd::new("data")))?;
+                            xml_writer.write_event(Event::End(BytesEnd::new("node")))?;
+                            defined_terminals.insert(node_id.clone());
+                        }
+                    } else {
+                        // If terminals are not included, skip creating edges for them in sequence
+                        continue; 
+                    }
+                }
+                SymbolType::NonTerminal(rule_id) => {
+                    // Rule nodes are expected to be defined already by the rule processing loop above.
+                    // Filter by depth if options specify (consistency with rule node generation)
+                    if let Some(rule) = grammar.rules.get(&rule_id) {
+                        if let Some(max_d) = options.max_depth {
+                            if rule.depth.unwrap_or(0) > max_d {
+                                continue; // Skip this symbol in sequence if its rule is too deep
+                            }
+                        }
+                        if let Some(min_d) = options.skip_rules_above_depth {
+                            if rule.depth.unwrap_or(0) > min_d {
+                                continue; // Skip this symbol if its rule is shallower than skip_depth
+                            }
+                        }
+                    }
+                    current_symbol_node_id = format!("R{}", rule_id);
+                }
+            }
+
+            // Add edge from the previous sequence symbol to the current one
+            if i > 0 {
+                let prev_symbol = &grammar.sequence[i-1];
+                let prev_symbol_node_id: String;
+                
+                // Determine previous symbol's node ID, applying same filtering as current
+                match prev_symbol.symbol_type {
+                    SymbolType::Terminal(base) => {
+                        if !options.include_terminals { continue; }
+                        prev_symbol_node_id = format!("T_{}_{}{}", base.to_char(), prev_symbol.strand.to_char(), prev_symbol.id);
+                    }
+                    SymbolType::NonTerminal(rule_id) => {
+                        if let Some(rule) = grammar.rules.get(&rule_id) {
+                            if let Some(max_d) = options.max_depth {
+                                if rule.depth.unwrap_or(0) > max_d { continue; }
+                            }
+                            if let Some(min_d) = options.skip_rules_above_depth {
+                                if rule.depth.unwrap_or(0) > min_d { continue; }
+                            }
+                        }
+                        prev_symbol_node_id = format!("R{}", rule_id);
+                    }
+                }
+
+                // Ensure current_symbol_node_id was actually set (not skipped by continue)
+                // This check might be tricky if current_symbol_node_id was skipped due to its own filtering.
+                // For simplicity, if either prev or current was filtered out by options, this edge won't be drawn.
+                // A more robust way would be to build a list of valid sequence node IDs first.
+                // However, given the current loop structure, we rely on both being present from their respective iterations.
+
+                let edge_id = format!("S_edge_{}_to_{}", i-1, i);
+                xml_writer.write_event(Event::Start(BytesStart::new("edge")
+                    .with_attributes(vec![
+                        ("id".as_bytes(), edge_id.as_bytes()),
+                        ("source".as_bytes(), prev_symbol_node_id.as_bytes()),
+                        ("target".as_bytes(), current_symbol_node_id.as_bytes())
+                    ])))?;
+                xml_writer.write_event(Event::End(BytesEnd::new("edge")))?;
+            }
+        }
+    }
+
+    xml_writer.write_event(Event::End(BytesEnd::new("graph")))?;
+    xml_writer.write_event(Event::End(BytesEnd::new("graphml")))?;
+
+    Ok(String::from_utf8(buffer)?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::grammar::rule::Rule;
-    use crate::grammar::symbol::{Symbol, SymbolType, Direction};
+    // use crate::grammar::symbol::{Symbol, SymbolType, Direction}; // Already imported via super::*
     use crate::encode::dna_2bit::EncodedBase;
     use std::collections::HashMap;
 
-    fn create_test_grammar() -> Grammar {
+    fn create_test_grammar() -> Grammar { // Ensure this test helper is robust
         let mut rules = HashMap::new();
         let rule0 = Rule {
             id: 0,
             symbols: vec![
-                Symbol::terminal(0, EncodedBase(0), Direction::Forward),
-                Symbol::terminal(1, EncodedBase(1), Direction::Forward),
+                Symbol { id: 0, symbol_type: SymbolType::Terminal(EncodedBase::from_base(b'A').unwrap()), strand: Direction::Forward },
+                Symbol { id: 1, symbol_type: SymbolType::Terminal(EncodedBase::from_base(b'C').unwrap()), strand: Direction::Forward },
             ],
             usage_count: 4,
-            positions: vec![0, 2, 4, 6],
+            positions: Vec::new(), // Added default
             depth: Some(1),
         };
         let rule1 = Rule {
             id: 1,
             symbols: vec![
-                Symbol::non_terminal(2, 0, Direction::Forward),
-                Symbol::terminal(3, EncodedBase(2), Direction::Forward),
+                Symbol { id: 2, symbol_type: SymbolType::NonTerminal(0), strand: Direction::Forward }, 
+                Symbol { id: 3, symbol_type: SymbolType::Terminal(EncodedBase::from_base(b'G').unwrap()), strand: Direction::Forward },
             ],
             usage_count: 2,
-            positions: vec![1, 5],
+            positions: Vec::new(), // Added default
             depth: Some(2),
         };
         rules.insert(0, rule0);
         rules.insert(1, rule1);
         Grammar {
             sequence: vec![
-                Symbol::non_terminal(10, 0, Direction::Forward),
-                Symbol::non_terminal(11, 1, Direction::Forward),
+                Symbol { id: 10, symbol_type: SymbolType::NonTerminal(0), strand: Direction::Forward },
+                Symbol { id: 11, symbol_type: SymbolType::NonTerminal(1), strand: Direction::Forward },
             ],
             rules,
-            max_depth: 2,
-            origins: HashMap::new(),
+            max_depth: 2, 
+            origins: HashMap::new(), // Added default
         }
     }
 
@@ -380,6 +612,7 @@ mod tests {
             include_terminals: true,
             include_usage_counts: true,
             color_by_depth: true,
+            ..Default::default()
         };
         let dot = grammar_to_dot(&grammar, &options).unwrap();
         assert!(dot.contains("digraph Grammar"));
@@ -402,23 +635,13 @@ mod tests {
 
     #[test]
     fn test_format_symbol_test() {
-        let s = Symbol::terminal(0, EncodedBase(0), Direction::Forward);
-        let mut rules = HashMap::new();
-        let rule = Rule {
-            id: 0,
-            symbols: vec![s],
-            usage_count: 1,
-            positions: vec![0],
-            depth: Some(1),
+        let g = create_test_grammar(); // Use the helper to get a Grammar instance
+        let base_a = EncodedBase::from_base(b'A').expect("Failed to encode base A");
+        let s = Symbol {
+            id: 0, // Arbitrary ID for the test symbol itself
+            symbol_type: SymbolType::Terminal(base_a),
+            strand: Direction::Forward,
         };
-        rules.insert(0, rule);
-        let g = Grammar {
-            sequence: vec![s],
-            rules,
-            max_depth: 1,
-            origins: HashMap::new(),
-        };
-        let formatted = format_symbol(&s, &g);
-        assert!(formatted.contains("A"));
+        assert_eq!(crate::utils::export::format_symbol(&s, &g), "A+"); 
     }
 } 

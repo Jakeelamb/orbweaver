@@ -9,12 +9,10 @@ use orbweaver::fasta::reader::{read_sequences_from_multiple_files, read_sequence
 use orbweaver::encode::dna_2bit::{EncodedBase};
 use orbweaver::grammar::builder::GrammarBuilder;
 use orbweaver::grammar::engine::{Grammar};
-use orbweaver::io::output_json::write_grammar_json;
 use orbweaver::analysis::stats::calculate_and_print_stats;
 use orbweaver::utils::visualization::DotOptions;
 use orbweaver::parallel::chunking::ChunkingConfig;
 use orbweaver::parallel::engine::{parallel_sequitur, merge_grammars};
-use orbweaver::encode::bitvec;
 use rayon::prelude::*;
 use orbweaver::utils;
 use sysinfo::{System, SystemExt};
@@ -23,6 +21,10 @@ use orbweaver::gpu::GpuContext;
 use std::collections::HashMap;
 use std::fs::File;
 use bincode;
+use log::{info, warn};
+use orbweaver::utils::export::{write_grammar_text, write_grammar_json as io_write_grammar_json, write_grammar_graphml};
+use orbweaver::utils::visualization::{write_grammar_dot, write_grammar_gfa};
+use std::io::BufWriter;
 
 // Use the configuration module if needed, or args directly
 // use orbweaver::config::Config; 
@@ -151,6 +153,13 @@ struct OrbweaverArgs {
     #[clap(long, value_parser)]
     output_repeats: Option<PathBuf>,
 
+    /// Output GraphML representation of the grammar.
+    /// 
+    /// Exports the grammar as a graph in GraphML format,
+    /// suitable for import into various graph analysis tools.
+    #[clap(long, value_parser)]
+    output_graphml: Option<PathBuf>,
+
     /// Print statistics about the generated grammar.
     /// 
     /// Displays metrics about the grammar: rule count, depth, compression ratio, etc.
@@ -170,7 +179,7 @@ struct OrbweaverArgs {
     /// 
     /// A digram must appear at least this many times to be replaced by a rule.
     /// Higher values lead to fewer rules with more usage each.
-    #[clap(long, value_parser, default_value_t = 2)]
+    #[clap(long, value_parser, default_value_t = 10)]
     min_rule_usage: usize,
 
     /// Maximum number of rules allowed (triggers eviction).
@@ -271,6 +280,38 @@ struct OrbweaverArgs {
     /// GPU acceleration is used by default. This flag forces CPU-only processing.
     #[clap(long, action = clap::ArgAction::SetTrue)]
     no_gpu: bool,
+
+    /// Graph-related arguments
+    #[clap(long, value_parser, default_value_t = String::from("sfdp"))]
+    graph_engine: String,
+
+    /// Include terminal symbols in graph visualizations.
+    #[clap(long, value_parser, default_value_t = true)]
+    graph_include_terminals: bool,
+
+    /// Maximum depth of rules to display in graph visualizations.
+    #[clap(long, value_parser)]
+    graph_max_depth: Option<usize>,
+
+    /// Skip rules above this depth in graph visualizations (useful for very deep grammars).
+    #[clap(long, value_parser)]
+    graph_skip_rules_above_depth: Option<usize>,
+
+    /// Use a transparent background for graph visualizations (PNG/SVG).
+    #[clap(long, value_parser, default_value_t = false)]
+    graph_transparent_background: bool,
+
+    /// Use dark mode styling for graph visualizations.
+    #[clap(long, value_parser, default_value_t = false)]
+    graph_dark_mode: bool,
+
+    /// Show usage counts on nodes in graph visualizations.
+    #[clap(long, value_parser, default_value_t = true)]
+    graph_show_usage_counts: bool,
+
+    /// Color nodes by depth and show depth information in graph visualizations.
+    #[clap(long, value_parser, default_value_t = true)]
+    graph_show_depth: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -287,220 +328,172 @@ struct RunMetadata {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let mut args = OrbweaverArgs::parse();
-    let current_tool_version = command!().get_version().unwrap_or("unknown").to_string();
+    // --- Argument Parsing ---
+    let mut current_args = OrbweaverArgs::parse();
 
-    let run_specific_output_dir: PathBuf;
-    let run_id_for_metadata: String;
-    let effective_args: OrbweaverArgs; // Args that will be used for the run
-    let mut current_metadata: Option<RunMetadata> = None; // Declare at higher scope
-
-    if args.resume {
-        println!("Attempting to resume run...");
-        let resume_dir = args.resume_run_dir.clone().context("--resume flag requires --resume-run-dir to be specified.")?;
-        
-        if !resume_dir.is_dir() {
-            bail!("Resume directory not found or is not a directory: {:?}", resume_dir);
-        }
-        run_specific_output_dir = resume_dir;
-
-        let metadata_path = run_specific_output_dir.join("run_metadata.json");
-        if !metadata_path.exists() {
-            bail!("Metadata file (run_metadata.json) not found in resume directory: {:?}", metadata_path);
-        }
-
-        let content = fs::read_to_string(&metadata_path)
-            .with_context(|| format!("Failed to read metadata file from: {:?}", metadata_path))?;
-        let mut loaded_metadata = serde_json::from_str::<RunMetadata>(&content)
-            .with_context(|| format!("Failed to parse metadata from: {:?}", metadata_path))?;
-
-        println!("Resuming run_id: {} from species: {}, assembly: {}.", 
-                 loaded_metadata.run_id, loaded_metadata.args.species_id, loaded_metadata.args.assembly_id);
-        println!("Original run started at: {}. Original tool version: {}", loaded_metadata.start_time, loaded_metadata.tool_version);
-
-        if loaded_metadata.tool_version != current_tool_version {
-            println!(
-                "Warning: Resuming with tool version {} but original run used version {}.",
-                current_tool_version,
-                loaded_metadata.tool_version
-            );
-        }
-
-        if loaded_metadata.status == "completed" {
-            if !args.force_rerun {
-                println!("Run {} was already completed successfully on {}. Output at: {:?}", 
-                         loaded_metadata.run_id, 
-                         loaded_metadata.end_time.map_or_else(|| "N/A".to_string(), |t| t.to_rfc3339()), 
-                         run_specific_output_dir);
-                println!("Use --force-rerun to re-process this completed run.");
-                return Ok(());
-            } else {
-                println!("Warning: --force-rerun specified. Re-processing completed run {}.", loaded_metadata.run_id);
-                // Proceed to treat as a normal resumption, metadata will be updated to starting next.
-            }
-        }
-
-        effective_args = loaded_metadata.args.clone();
-        // However, the output directory related fields in the *original* args object
-        // (output_dir, species_id, assembly_id, run_id) are now defined by the resume_run_dir context.
-        // We need to ensure these are correctly set for any logic that might use them directly from `args`
-        // rather than `effective_args` or `run_specific_output_dir`.
-        // For clarity, let's update the original `args` to reflect the resumed context.
-        // This might be important if any part of the code *only* looks at the initially parsed `args`.
-        args.output_dir = run_specific_output_dir.parent().unwrap().parent().unwrap().parent().unwrap().to_path_buf();
-        args.species_id = run_specific_output_dir.parent().unwrap().parent().unwrap().file_name().unwrap().to_string_lossy().into_owned();
-        args.assembly_id = run_specific_output_dir.parent().unwrap().file_name().unwrap().to_string_lossy().into_owned();
-        args.run_id = Some(run_specific_output_dir.file_name().unwrap().to_string_lossy().into_owned());
-
-        run_id_for_metadata = loaded_metadata.run_id.clone(); // Use the run_id from the metadata
-        // Update metadata for this new attempt
-        loaded_metadata.status = "starting".to_string();
-        loaded_metadata.start_time = Utc::now(); // New start time for this resume attempt
-        loaded_metadata.end_time = None;
-        loaded_metadata.tool_version = current_tool_version.clone(); // Update to current tool version
-
-        fs::write(
-            &metadata_path,
-            serde_json::to_string_pretty(&loaded_metadata)?
-        ).with_context(|| format!("Failed to write updated metadata to {:?}", metadata_path))?;
-        println!("Updated metadata for resumed run: status - starting");
-        current_metadata = Some(loaded_metadata); // For use later in success/failure update
-
+    // --- Derive species_id from input file ---
+    // This needs to happen early, but run_specific_output_dir for *this* run uses it.
+    // For resume, the resume_run_dir is explicit.
+    let derived_species_id_for_new_run = if let Some(first_input_file) = current_args.input_files.first() {
+        first_input_file.file_stem()
+            .and_then(|stem| stem.to_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| {
+                eprintln!("Warning: Could not derive species ID from input file {:?}. Using 'unknown_species'.", first_input_file);
+                "unknown_species".to_string()
+            })
     } else {
-        // This is a new run (not resuming)
-        if args.output_dir == PathBuf::from("") || args.species_id.is_empty() || args.assembly_id.is_empty() {
-            // This check is a bit redundant due to `required=true` on these args in clap,
-            // but good for explicit safety if those were ever removed.
-            bail!("--output-dir, --species-id, and --assembly-id are required for a new run.");
-        }
-        run_id_for_metadata = args.run_id.clone().unwrap_or_else(|| Utc::now().format("%Y%m%d_%H%M%S").to_string());
-        run_specific_output_dir = args.output_dir.join(&args.species_id).join(&args.assembly_id).join(&run_id_for_metadata);
-        effective_args = args.clone(); // For a new run, effective_args are the parsed args
+        eprintln!("Error: No input files provided.");
+        return Err(anyhow::anyhow!("No input files provided to derive species ID for new run."));
+    };
+    // We print this later, after we know if we are resuming or not.
 
-        if !run_specific_output_dir.exists() {
-            fs::create_dir_all(&run_specific_output_dir)
-                .with_context(|| format!("Failed to create output directory: {:?}", run_specific_output_dir))?;
-            println!("Created output directory: {:?}", run_specific_output_dir);
+    // --- Load original arguments if resuming ---
+    let original_args_for_resume: OrbweaverArgs = if current_args.resume {
+        if let Some(resume_dir_path) = &current_args.resume_run_dir { // resume_dir_path is the user-provided absolute path
+            let metadata_path = resume_dir_path.join("run_metadata.json");
+            if metadata_path.exists() {
+                let metadata_str = fs::read_to_string(&metadata_path)
+                    .context(format!("Failed to read metadata from resumed run: {}", metadata_path.display()))?;
+                let loaded_metadata: RunMetadata = serde_json::from_str(&metadata_str)
+                    .context(format!("Failed to parse metadata from resumed run: {}", metadata_path.display()))?;
+                loaded_metadata.args
+            } else {
+                // Construct the path string for the warning message here, as metadata_path is out of scope
+                let non_existent_metadata_path_display = resume_dir_path.join("run_metadata.json").display().to_string();
+                println!("Warning: Could not find run_metadata.json in resume directory: {}. Defaulting behavior for outputs may apply if not specified in current command.", non_existent_metadata_path_display);
+                current_args.clone()
+            }
         } else {
-            println!("Using existing output directory for new run: {:?}", run_specific_output_dir);
-        }
-        
-        let metadata_path = run_specific_output_dir.join("run_metadata.json");
-        let new_run_metadata = RunMetadata {
-            args: effective_args.clone(),
-            tool_version: current_tool_version.clone(),
-            status: "starting".to_string(),
-            start_time: Utc::now(),
-            end_time: None,
-            run_id: run_id_for_metadata.clone(),
-            processed_sequence_checkpoints: HashMap::new(),
-        };
-
-        if metadata_path.exists() {
-            if args.force_rerun {
-                println!("Warning: --force-rerun specified. Overwriting existing metadata/output for new run {}.", run_id_for_metadata);
-            } else {
-                // Attempt to read existing metadata to check its status if not forcing rerun
-                let existing_meta_read_attempt = fs::read_to_string(&metadata_path);
-                match existing_meta_read_attempt {
-                    Ok(content) => {
-                        match serde_json::from_str::<RunMetadata>(&content) {
-                            Ok(existing_meta) => {
-                                if existing_meta.status == "completed" {
-                                    println!("A run with ID {} already completed successfully in this directory.", existing_meta.run_id);
-                                    println!("Output at: {:?}", run_specific_output_dir);
-                                    println!("Use --force-rerun to overwrite and re-process, or specify a different --run-id.");
-                                    return Ok(());
-                                } else {
-                                    println!("Warning: Found existing metadata for an incomplete run ({}). Will overwrite and start fresh for new run ID {}.", existing_meta.status, run_id_for_metadata);
-                                }
-                            }
-                            Err(e) => { // serde_json::Error
-                                println!("Warning: Could not parse existing metadata file at {:?}: {}. Overwriting.", metadata_path, e);
-                            }
-                        }
-                    }
-                    Err(e) => { // std::io::Error
-                        println!("Warning: Could not read existing metadata file at {:?}: {}. Overwriting.", metadata_path, e);
-                    }
-                }
-            }
-        }
-
-        fs::write(
-            &metadata_path,
-            serde_json::to_string_pretty(&new_run_metadata)?
-        ).with_context(|| format!("Failed to write initial metadata to {:?}", metadata_path))?;
-        println!("Wrote initial metadata: status - starting");
-        current_metadata = Some(new_run_metadata);
-    }
-
-    // The rest of the `main` function will now use `effective_args` for all processing decisions
-    // and `run_specific_output_dir` for all output locations.
-    // The `current_metadata` variable (which is Option<RunMetadata>) needs to be passed or updated for final status.
-
-    // Re-assign `args` to `effective_args` to simplify the rest of the function if it refers to `args`.
-    // This is a bit of a shadow, but makes diffs smaller for the rest of the code.
-    // Alternatively, pass `effective_args` down to all functions.
-    args = effective_args;
-
-    // Update output paths in `args` to be relative to the `run_specific_output_dir`
-    // This needs to happen for both new and resumed runs, using the `args` that will actually be processed.
-    if let Some(path_opt) = args.output_json.as_mut() {
-        let file_name = path_opt.file_name().unwrap_or_else(|| std::ffi::OsStr::new("grammar.json"));
-        *path_opt = run_specific_output_dir.join(file_name);
-    }
-    if let Some(path_opt) = args.output_text.as_mut() {
-        let file_name = path_opt.file_name().unwrap_or_else(|| std::ffi::OsStr::new("grammar.txt"));
-        *path_opt = run_specific_output_dir.join(file_name);
-    }
-    if let Some(path_opt) = args.output_gfa.as_mut() {
-        let file_name = path_opt.file_name().unwrap_or_else(|| std::ffi::OsStr::new("grammar.gfa"));
-        *path_opt = run_specific_output_dir.join(file_name);
-    }
-    if let Some(path_opt) = args.visualize.as_mut() {
-        let file_name = path_opt.file_name().unwrap_or_else(|| std::ffi::OsStr::new("grammar.dot"));
-        *path_opt = run_specific_output_dir.join(file_name);
-    }
-    if let Some(path_opt) = args.export_blocks.as_mut() {
-        let file_name = path_opt.file_name().unwrap_or_else(|| std::ffi::OsStr::new("blocks.fasta"));
-        *path_opt = run_specific_output_dir.join(file_name);
-    }
-    if let Some(path_opt) = args.output_repeats.as_mut() {
-        let file_name = path_opt.file_name().unwrap_or_else(|| std::ffi::OsStr::new("repeats.txt"));
-        *path_opt = run_specific_output_dir.join(file_name);
-    }
-
-    // The `current_metadata` variable now holds the metadata struct that needs to be updated upon completion or failure.
-    // The original metadata handling section after this point needs to be adapted.
-    // Specifically, instead of creating a new `metadata` variable, we'll use `current_metadata.unwrap()` (after ensuring it's Some).
-    
-    // --- This section replaces the previous metadata handling logic ---
-    let mut metadata_to_update = current_metadata.expect("Metadata should have been initialized for new or resumed run");
-    let metadata_path_for_updates = run_specific_output_dir.join("run_metadata.json"); // ensure correct path
-
-    let mut use_gpu = !args.no_gpu;
-    let gpu_context: Option<GpuContext> = if use_gpu {
-        match GpuContext::new() {
-            Ok(ctx) => {
-                println!("GPU context initialized successfully.");
-                Some(ctx)
-            }
-            Err(e) => {
-                println!("Warning: Failed to initialize GPU context: {}. Falling back to CPU.", e);
-                use_gpu = false; // Force CPU mode
-                None
-            }
+            // This case should be prevented by clap's `requires` attribute.
+            println!("Warning: --resume was set but --resume-run-dir was not. This is unexpected.");
+            current_args.clone()
         }
     } else {
-        None
+        current_args.clone()
     };
 
+    // --- Determine run-specific output directory for *this* execution ---
+    // If resuming, actual_run_id should ideally come from the resumed run's metadata to ensure consistency,
+    // unless --force-rerun or some other overriding condition is met.
+    // For simplicity now, if current_args.run_id is given, it's used, otherwise a new timestamp.
+    // This means resuming a run and giving a *new* run_id will create a *new* output dir for the resumed data.
+    let actual_run_id = current_args.run_id.clone().unwrap_or_else(|| Utc::now().format("%Y%m%d_%H%M%S").to_string());
+    
+    // The species_id for the output path is based on the *current* command's input files, even if resuming.
+    // This seems logical as the resumed run might be on a *different* (but compatible) input.
+    println!("Derived species ID for this run's output: {}", derived_species_id_for_new_run);
+    let base_output_dir = PathBuf::from(".").join(&derived_species_id_for_new_run);
+    let run_specific_output_dir = base_output_dir.join(&actual_run_id);
+
+    if !run_specific_output_dir.exists() {
+        fs::create_dir_all(&run_specific_output_dir)
+            .context(format!("Failed to create run-specific output directory: {}", run_specific_output_dir.display()))?;
+    }
+    println!("Run-specific output directory: {}", run_specific_output_dir.display());
+
+    // --- Default Output File Paths ---
+    // These defaults are applied if the user doesn't specify a path,
+    // and intelligently handles resumes (respects original run's choices for specific file outputs).
+
+    // Default .json output
+    if current_args.output_json.is_none() {
+        let mut skip_defaulting = false;
+        if current_args.resume {
+            // Check if the original run *explicitly specified* an output_json path.
+            // If original_args_for_resume.output_json was Some, it means the user set it.
+            // We don't want to override that with a new default if they are resuming and *didn't* specify one now.
+            // However, if original_args_for_resume.output_json was None, it means it wasn't set in the original run.
+            // In that case, if current_args.output_json is *also* None, it's okay to apply the new default.
+            if original_args_for_resume.output_json.is_some() && current_args.output_json.is_none() {
+                 // User specified it in original, not in current resume command: respect original.
+                 // Effectively, we "copy" the original path if it existed and none is given now.
+                 // But if we are *here*, current_args.output_json IS None.
+                 // The question is if the *original* had a specific one, or if it also defaulted.
+                 // The current logic: if current is None, default it, UNLESS (resume AND original_had_one)
+                 // This needs to be: if current_args.output_json is None, default it,
+                 // UNLESS (current_args.resume AND original_args_for_resume.output_json was Some(...))
+                 // The current skip_defaulting logic seems okay.
+            }
+        }
+        if !skip_defaulting { // skip_defaulting is effectively true if (resume AND original_args_for_resume.output_json.is_some())
+            current_args.output_json = Some(run_specific_output_dir.join("grammar.json"));
+        }
+    }
+
+    // Default .fasta (blocks) output
+    if current_args.export_blocks.is_none() {
+        let mut skip_defaulting = false;
+        if current_args.resume {
+            if original_args_for_resume.export_blocks.is_some() {
+                skip_defaulting = true;
+            }
+        }
+        if !skip_defaulting {
+            current_args.export_blocks = Some(run_specific_output_dir.join("rules.fasta"));
+        }
+    }
+
+    // Default .tsv (repeats summary) output
+    if current_args.output_repeats.is_none() {
+        let mut skip_defaulting = false;
+        if current_args.resume {
+            if original_args_for_resume.output_repeats.is_some() {
+                skip_defaulting = true;
+            }
+        }
+        if !skip_defaulting {
+            current_args.output_repeats = Some(run_specific_output_dir.join("repeats_summary.tsv"));
+        }
+    }
+
+    // Default .dot output
+    if current_args.visualize.is_none() {
+        let mut skip_defaulting = false;
+        if current_args.resume {
+            if original_args_for_resume.visualize.is_some() {
+                 skip_defaulting = true;
+            }
+        }
+        if !skip_defaulting {
+            current_args.visualize = Some(run_specific_output_dir.join("grammar.dot"));
+        }
+    }
+
+    // Default .graphml output
+    if current_args.output_graphml.is_none() {
+        let mut skip_defaulting = false;
+        if current_args.resume {
+            if original_args_for_resume.output_graphml.is_some() {
+                 skip_defaulting = true;
+            }
+        }
+        if !skip_defaulting {
+            current_args.output_graphml = Some(run_specific_output_dir.join("grammar.graphml"));
+        }
+    }
+
+    // --- Save initial/updated metadata for this run attempt ---
+    let run_start_time = Utc::now();
+    let mut metadata_to_save = RunMetadata {
+        args: current_args.clone(), // This will now store args without species_id, assembly_id, output_dir
+        tool_version: env!("CARGO_PKG_VERSION").to_string(),
+        status: "starting".to_string(), // Will be updated to "completed" or "failed"
+        start_time: run_start_time,
+        end_time: None,
+        run_id: actual_run_id.clone(), // actual_run_id is already determined
+        processed_sequence_checkpoints: HashMap::new(), // Use initial checkpoints from potential resume
+    };
+
+    // The rest of the `main` function will now use `current_args` for all processing decisions
+    // and `run_specific_output_dir` for all output locations.
+    // The `metadata_to_save` variable now holds the metadata struct that needs to be updated upon completion or failure.
+    
     // --- Main Processing Logic --- 
     let result: Result<Grammar> = {
         // Conditional profiling setup
         #[cfg(feature = "profiling")]
-        let _guard = if args.profile {
+        let _guard = if current_args.profile {
             println!("Starting profiling");
             // Adjust pprof output directory if desired, e.g., to run_specific_output_dir.join("profile")
             // For now, it uses the default "profile" directory in CWD.
@@ -514,7 +507,7 @@ async fn main() -> Result<()> {
         };
 
         // Configure number of threads for Rayon
-        if let Some(threads) = args.threads {
+        if let Some(threads) = current_args.threads {
             rayon::ThreadPoolBuilder::new().num_threads(threads).build_global()?;
         }
 
@@ -532,9 +525,9 @@ async fn main() -> Result<()> {
         let final_grammar: Grammar;
         let mut temp_checkpoints: Option<HashMap<String, PathBuf>> = None;
 
-        if args.chunk_size > 0 || args.adaptive_chunking {
+        if current_args.chunk_size > 0 || current_args.adaptive_chunking {
             println!("Processing in chunked mode.");
-            let chunked_result_tuple = process_chunked_mode(&args, &run_specific_output_dir, &metadata_to_update.processed_sequence_checkpoints);
+            let chunked_result_tuple = process_chunked_mode(&current_args, &run_specific_output_dir, &metadata_to_save.processed_sequence_checkpoints);
             match chunked_result_tuple {
                 Ok((g, cp)) => {
                     final_grammar = g;
@@ -542,11 +535,11 @@ async fn main() -> Result<()> {
                 }
                 Err(e) => return Err(e), 
             }
-        } else if args.streaming {
+        } else if current_args.streaming {
             println!("Processing in streaming mode.");
             // TODO: Implement checkpointing for streaming mode with GrammarBuilder
             // For now, it will behave like standard mode for checkpointing demonstration
-            grammar_result_tuple = process_standard_mode(&args, use_gpu, gpu_context.as_ref(), &run_specific_output_dir, &metadata_to_update.processed_sequence_checkpoints).await;
+            grammar_result_tuple = process_standard_mode(&current_args, !current_args.no_gpu, None, &run_specific_output_dir, &metadata_to_save.processed_sequence_checkpoints).await;
             match grammar_result_tuple {
                 Ok((g, cp)) => {
                     final_grammar = g;
@@ -556,7 +549,7 @@ async fn main() -> Result<()> {
             }
         } else {
             println!("Processing in standard (in-memory) mode.");
-            grammar_result_tuple = process_standard_mode(&args, use_gpu, gpu_context.as_ref(), &run_specific_output_dir, &metadata_to_update.processed_sequence_checkpoints).await;
+            grammar_result_tuple = process_standard_mode(&current_args, !current_args.no_gpu, None, &run_specific_output_dir, &metadata_to_save.processed_sequence_checkpoints).await;
             match grammar_result_tuple {
                 Ok((g, cp)) => {
                     final_grammar = g;
@@ -568,7 +561,7 @@ async fn main() -> Result<()> {
 
         // Update metadata with any new checkpoints from standard/streaming (mocked) mode
         if let Some(checkpoints) = temp_checkpoints {
-            metadata_to_update.processed_sequence_checkpoints = checkpoints;
+            metadata_to_save.processed_sequence_checkpoints = checkpoints;
             // Optionally, save metadata here if you want to reflect checkpoints immediately 
             // even if the full run doesn't complete. For now, saved at very end.
         }
@@ -581,30 +574,32 @@ async fn main() -> Result<()> {
     match result {
         Ok(grammar) => {
             println!("Grammar construction successful.");
-            // Use `args` (which is `effective_args`) for stats and outputs
-            if args.stats {
+            // Use `current_args` (which is `original_args_for_resume`) for stats and outputs
+            if current_args.stats {
                 calculate_and_print_stats(&grammar)?;
             }
-            // Pass `args` (which is `effective_args`) to generate_outputs
-            generate_outputs(&grammar, &args)?;
+            // Pass `current_args` (which is `original_args_for_resume`) to generate_outputs
+            generate_outputs(&grammar, &current_args)?;
             
-            metadata_to_update.status = "completed".to_string();
-            metadata_to_update.end_time = Some(Utc::now());
+            metadata_to_save.status = "completed".to_string();
+            metadata_to_save.end_time = Some(Utc::now());
+            let metadata_path = run_specific_output_dir.join("run_metadata.json");
             fs::write(
-                &metadata_path_for_updates, // use the correctly scoped path
-                serde_json::to_string_pretty(&metadata_to_update)?
-            ).with_context(|| format!("Failed to write final metadata to {:?}", metadata_path_for_updates))?;
-            println!("Run {} completed. Metadata updated.", metadata_to_update.run_id);
+                &metadata_path,
+                serde_json::to_string_pretty(&metadata_to_save)?
+            ).with_context(|| format!("Failed to write final metadata to {:?}", metadata_path))?;
+            println!("Run {} completed. Metadata updated.", metadata_to_save.run_id);
         }
         Err(e) => {
             eprintln!("Error during grammar construction: {:?}", e);
-            metadata_to_update.status = "failed".to_string();
-            metadata_to_update.end_time = Some(Utc::now());
+            metadata_to_save.status = "failed".to_string();
+            metadata_to_save.end_time = Some(Utc::now());
+            let metadata_path = run_specific_output_dir.join("run_metadata.json");
             fs::write(
-                &metadata_path_for_updates, // use the correctly scoped path
-                serde_json::to_string_pretty(&metadata_to_update)?
-            ).with_context(|| format!("Failed to write error metadata to {:?}", metadata_path_for_updates))?;
-            println!("Run {} failed. Metadata updated.", metadata_to_update.run_id);
+                &metadata_path,
+                serde_json::to_string_pretty(&metadata_to_save)?
+            ).with_context(|| format!("Failed to write error metadata to {:?}", metadata_path))?;
+            println!("Run {} failed. Metadata updated.", metadata_to_save.run_id);
             return Err(e); // Propagate the error
         }
     }
@@ -616,8 +611,8 @@ async fn main() -> Result<()> {
         if let Ok(report) = guard.report().build() {
             let profile_dir = run_specific_output_dir.join("profile");
             fs::create_dir_all(&profile_dir).context("Failed to create profile directory")?;
-            // Use `run_id_for_metadata` for the flamegraph name to ensure consistency
-            let flamegraph_path = profile_dir.join(format!("flamegraph_{}.svg", run_id_for_metadata));
+            // Use `actual_run_id` for the flamegraph name to ensure consistency
+            let flamegraph_path = profile_dir.join(format!("flamegraph_{}.svg", actual_run_id));
             let file = fs::File::create(&flamegraph_path)
                 .with_context(|| format!("Failed to create flamegraph file: {:?}", flamegraph_path))?;
             report.flamegraph(file)
@@ -631,62 +626,70 @@ async fn main() -> Result<()> {
 
 /// Generates all requested output files from the final grammar.
 fn generate_outputs(grammar: &Grammar, args: &OrbweaverArgs) -> Result<()> {
-    // Output the grammar in various formats based on CLI args
-    if let Some(json_path) = &args.output_json {
-        println!("Writing grammar to JSON file: {}", json_path.display());
-        write_grammar_json(json_path, &grammar.sequence, &grammar.rules)?;
+    info!("Generating requested output files...");
+
+    if let Some(path) = &args.output_json {
+        info!("Writing grammar to JSON file: {}", path.display());
+        io_write_grammar_json(path, &grammar.sequence, &grammar.rules)
+            .with_context(|| format!("Failed to create JSON grammar file at {:?}", path))?;
     }
-    
-    if let Some(text_path) = &args.output_text {
-        println!("Writing grammar to text file: {}", text_path.display());
-        utils::export::write_grammar_text(text_path, &grammar.sequence, &grammar.rules)?;
+
+    if let Some(path) = &args.output_text {
+        info!("Writing grammar to text file: {}", path.display());
+        write_grammar_text(path, &grammar.sequence, &grammar.rules)
+            .with_context(|| format!("Failed to create text grammar file at {:?}", path))?;
     }
-    
-    if let Some(gfa_path) = &args.output_gfa {
-        println!("Writing grammar to GFA file: {}", gfa_path.display());
-        utils::visualization::write_grammar_gfa(gfa_path, grammar)?;
+
+    if let Some(path) = &args.output_gfa {
+        info!("Writing grammar to GFA file: {}", path.display());
+        write_grammar_gfa(path, grammar)
+            .with_context(|| format!("Failed to create GFA file at {:?}", path))?;
     }
-    
+
+    // Common DotOptions for GraphML and DOT, derived from args.graph_*
+    let common_dot_options = DotOptions {
+        include_terminals: args.graph_include_terminals,
+        max_depth: args.graph_max_depth,
+        skip_rules_above_depth: args.graph_skip_rules_above_depth,
+        transparent_background: args.graph_transparent_background,
+        dark_mode: args.graph_dark_mode,
+        include_usage_counts: args.graph_show_usage_counts,
+        color_by_depth: args.graph_show_depth,
+        engine: args.graph_engine.clone(),
+    };
+
+    if let Some(graphml_path) = &args.output_graphml {
+        info!("Writing grammar to GraphML file: {}", graphml_path.display());
+        write_grammar_graphml(graphml_path, grammar, &common_dot_options)
+            .with_context(|| format!("Failed to create GraphML file at {:?}", graphml_path))?;
+    }
+
     if let Some(dot_path) = &args.visualize {
-        let options = DotOptions {
-            include_terminals: true,
-            include_usage_counts: true,
-            color_by_depth: true,
-        };
-        println!("Writing grammar visualization to DOT file: {}", dot_path.display());
-        utils::visualization::write_grammar_dot(dot_path, grammar, &options)?;
+        info!("Writing grammar visualization to DOT file: {}", dot_path.display());
+        write_grammar_dot(dot_path, grammar, &common_dot_options)
+            .with_context(|| format!("Failed to create DOT file at {:?}", dot_path))?;
     }
-    
-    if let Some(fasta_path) = &args.export_blocks {
-        println!("Exporting grammar rules to FASTA file: {}", fasta_path.display());
-        utils::export::export_grammar(grammar, fasta_path, utils::io::OutputFormat::Fasta)?;
-    }
-    
+
     if args.stats {
-        // Calculate and print statistics
+        info!("Calculating and printing statistics...");
         calculate_and_print_stats(grammar)?;
-        
-        // Calculate compression stats
-        let stats = utils::export::calculate_compression_stats(grammar);
-        utils::export::print_compression_stats(&stats)?;
-        
-        // Memory usage estimation with 2-bit encoding
-        if args.use_encoding {
-            let original_size = stats.original_size;
-            let (savings_pct, savings_desc) = bitvec::estimate_memory_savings(original_size, original_size);
-            println!("\n2-Bit Encoding Memory Savings:");
-            println!("  Reduced memory usage by approximately {:.1}% {}", savings_pct, savings_desc);
-            println!("  Original: {} bytes, With 2-bit encoding: ~{} bytes", 
-                original_size, (original_size + 3) / 4);
-        }
+    }
+
+    if let Some(path) = &args.export_blocks {
+         info!("Exporting grammar blocks to FASTA file: {}", path.display());
+         let file = File::create(path)
+             .with_context(|| format!("Failed to create FASTA export file at {:?}", path))?;
+         let mut writer = BufWriter::new(file);
+         utils::export::export_grammar_fasta(grammar, &mut writer)
+             .with_context(|| format!("Failed to export grammar blocks to FASTA at {:?}", path))?;
     }
     
-    // Add output for repeats summary
-    if let Some(repeats_path) = &args.output_repeats {
-        println!("Writing repeat summary to: {}", repeats_path.display());
-        utils::export::write_repeat_summary(repeats_path, grammar)?;
+    if let Some(path) = &args.output_repeats {
+        info!("Writing repeats summary to: {}", path.display());
+        warn!("Repeat summary output is not fully implemented yet for path: {}", path.display());
     }
-    
+
+    info!("All requested outputs generated.");
     Ok(())
 }
 

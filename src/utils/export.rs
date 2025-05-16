@@ -3,7 +3,7 @@ use crate::grammar::engine::Grammar;
 use crate::grammar::rule::Rule;
 use crate::grammar::symbol::{Symbol, SymbolType, Direction};
 use crate::utils::io::OutputFormat;
-use crate::utils::visualization::{grammar_to_dot, DotOptions, grammar_to_gfa};
+use crate::utils::visualization::{grammar_to_dot, DotOptions, grammar_to_gfa, grammar_to_graphml_direct};
 use std::collections::HashMap;
 use std::path::Path;
 use std::fs::File;
@@ -617,6 +617,20 @@ pub fn write_repeat_summary(path: &Path, grammar: &Grammar) -> Result<()> {
     }
 
     println!("Successfully wrote repeat summary.");
+    Ok(())
+}
+
+/// Export grammar to GraphML format
+pub fn write_grammar_graphml(path: &Path, grammar: &Grammar, dot_options: &DotOptions) -> Result<()> {
+    // Use the direct GraphML generation function
+    let graphml_string = grammar_to_graphml_direct(grammar, dot_options)
+        .map_err(|e| anyhow::anyhow!("Failed to generate GraphML content: {}", e))?;
+
+    let file = File::create(path)
+        .map_err(|e| anyhow::anyhow!("Failed to create GraphML file '{}': {}", path.display(), e))?;
+    let mut writer = BufWriter::new(file);
+    writer.write_all(graphml_string.as_bytes())
+        .map_err(|e| anyhow::anyhow!("Failed to write to GraphML file '{}': {}", path.display(), e))?;
     Ok(())
 }
 
