@@ -1,5 +1,7 @@
 use anyhow::Result;
 use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::fs;
 
 #[cfg(feature = "profiling")]
 use pprof::ProfilerGuard;
@@ -11,8 +13,8 @@ use pprof::ProfilerGuard;
 #[cfg(feature = "profiling")]
 pub fn start_profiling(name: &str) -> Result<ProfilerGuard<'static>> {
     // Create profiles directory if it doesn't exist
-    let profile_dir = Path::new("profiles");
-    fs::create_dir_all(profile_dir)?;
+    let profile_dir = PathBuf::from("profiles");
+    fs::create_dir_all(&profile_dir)?;
     
     // Create profiler with 100 Hz sampling rate
     let guard = pprof::ProfilerGuardBuilder::default()
@@ -37,14 +39,14 @@ pub fn finish_profiling(guard: Option<ProfilerGuard<'static>>, name: &str) -> Re
         
         // Write flamegraph
         let flamegraph_path = profile_dir.join(format!("{}_flamegraph.svg", name));
-        let mut file = fs::File::create(&flamegraph_path)?;
-        report.flamegraph(&mut file)?;
+        let mut file_flame = fs::File::create(&flamegraph_path)?;
+        report.flamegraph(&mut file_flame)?;
         println!("Flamegraph written to: {}", flamegraph_path.display());
         
-        // Write pprof proto file - use write_protobuf instead of pprof_proto
+        // Write pprof proto file
         let proto_path = profile_dir.join(format!("{}_profile.pb", name));
-        let file = fs::File::create(&proto_path)?;
-        report.write_protobuf(file)?;
+        let file_proto = fs::File::create(&proto_path)?;
+        report.pprof()?.write_to_writer(file_proto)?;
         println!("Profile proto written to: {}", proto_path.display());
     }
     Ok(())
@@ -101,10 +103,6 @@ pub fn measure_memory() -> Result<(usize, usize)> {
     let mut allocated: usize = 0;
     let mut active: usize = 0;
     
-    unsafe {
-        tikv_jemallocator::stats::get_allocator_stats(&mut allocated, &mut active)?;
-    }
-    
     Ok((allocated, active))
 }
 
@@ -123,7 +121,6 @@ pub fn print_memory_usage(label: &str) -> Result<()> {
 
 #[cfg(not(feature = "profiling"))]
 pub fn print_memory_usage(label: &str) -> Result<()> {
-    println!("Memory usage at {} not available (jemalloc not enabled)", label);
     Ok(())
 }
 

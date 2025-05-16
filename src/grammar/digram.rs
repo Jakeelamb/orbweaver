@@ -1,4 +1,4 @@
-use crate::grammar::symbol::{Symbol, Direction, SymbolType};
+use crate::grammar::symbol::{Symbol, Direction};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::fmt;

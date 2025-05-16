@@ -1,7 +1,6 @@
 use anyhow::{Context, Result};
 use crate::grammar::engine::Grammar;
-use crate::grammar::symbol::{Symbol, SymbolType, Direction};
-use crate::encode::dna_2bit::EncodedBase;
+use crate::grammar::symbol::{SymbolType, Direction};
 use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::fs::File;
