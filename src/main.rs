@@ -398,7 +398,7 @@ async fn main() -> Result<()> {
 
     // Default .json output
     if current_args.output_json.is_none() {
-        let mut skip_defaulting = false;
+        let skip_defaulting = false;
         if current_args.resume {
             // Check if the original run *explicitly specified* an output_json path.
             // If original_args_for_resume.output_json was Some, it means the user set it.

@@ -18,6 +18,19 @@ pub struct OrbweaverArgs {
     #[clap(short, long, value_parser, required = true, value_delimiter = ',')]
     pub input_files: Vec<PathBuf>,
 
+    // --- Workflow and Output Organization ---
+    /// Base directory for all outputs. (Will be derived if not provided if paths are relative, or used as absolute if given)
+    #[clap(short = 'o', long, value_parser)]
+    pub output_dir: Option<PathBuf>,
+
+    /// Species identifier. (Will be derived from the first input file if not provided)
+    #[clap(long, value_parser)]
+    pub species_id: Option<String>,
+
+    /// Assembly identifier. (Optional)
+    #[clap(long, value_parser)]
+    pub assembly_id: Option<String>,
+
     // --- Output Format Options ---
     
     /// Output JSON file path for the grammar.
