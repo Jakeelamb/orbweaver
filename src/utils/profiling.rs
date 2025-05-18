@@ -1,67 +1,116 @@
 use anyhow::Result;
 use std::time::Duration;
-use std::path::{Path, PathBuf};
-use std::fs;
 
 #[cfg(feature = "profiling")]
-use pprof::ProfilerGuard;
-
-/// Start CPU profiling with pprof.
-/// 
-/// Returns a guard that must be kept alive during the profiling period.
-/// When the guard is dropped, profiling stops.
+use pprof::{ProfilerGuard, ProfilerGuardBuilder, Report};
 #[cfg(feature = "profiling")]
-pub fn start_profiling(name: &str) -> Result<ProfilerGuard<'static>> {
-    // Create profiles directory if it doesn't exist
-    let profile_dir = PathBuf::from("profiles");
-    fs::create_dir_all(&profile_dir)?;
-    
-    // Create profiler with 100 Hz sampling rate
-    let guard = pprof::ProfilerGuardBuilder::default()
-        .frequency(100)
-        .blocklist(&["libc", "libgcc", "pthread", "vdso"])
-        .build()?;
-    
-    println!("Profiling started: {}", name);
-    Ok(guard)
+use pprof::protos::Message;
+
+#[cfg(feature = "profiling")]
+pub struct ProfileSessionGuard {
+    guard: Option<ProfilerGuard<'static>>,
+    name: String,
 }
 
-/// Finish profiling and write results to files.
 #[cfg(feature = "profiling")]
-pub fn finish_profiling(guard: Option<ProfilerGuard<'static>>, name: &str) -> Result<()> {
-    if let Some(guard) = guard {
-        // Get report
-        let report = guard.report().build()?;
-        
-        // Create profiles directory if it doesn't exist
-        let profile_dir = PathBuf::from("profiles");
-        fs::create_dir_all(&profile_dir)?;
-        
-        // Write flamegraph
-        let flamegraph_path = profile_dir.join(format!("{}_flamegraph.svg", name));
-        let mut file_flame = fs::File::create(&flamegraph_path)?;
-        report.flamegraph(&mut file_flame)?;
-        println!("Flamegraph written to: {}", flamegraph_path.display());
-        
-        // Write pprof proto file
-        let proto_path = profile_dir.join(format!("{}_profile.pb", name));
-        let file_proto = fs::File::create(&proto_path)?;
-        report.pprof()?.write_to_writer(file_proto)?;
-        println!("Profile proto written to: {}", proto_path.display());
+impl Drop for ProfileSessionGuard {
+    fn drop(&mut self) {
+        if let Some(guard) = self.guard.take() {
+            if let Err(e) = finish_profiling_internal(guard, &self.name) {
+                eprintln!("Error finishing profiling for '{}': {}", self.name, e);
+            }
+        }
+    }
+}
+
+#[cfg(feature = "profiling")]
+fn finish_profiling_internal(guard: ProfilerGuard<'static>, name: &str) -> Result<()> {
+    println!("Finishing profiling for: {}", name);
+    let report_build_result = guard.report().build();
+    
+    let report = match report_build_result {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Failed to build profiling report for '{}': {}", name, e);
+            return Err(e.into());
+        }
+    };
+    
+    let profile_dir = PathBuf::from("profiles");
+    if !profile_dir.exists() {
+        if let Err(e) = fs::create_dir_all(&profile_dir) {
+            eprintln!("Failed to create profiles directory '{}': {}", profile_dir.display(), e);
+            return Err(e.into());
+        }
+    }
+    
+    let flamegraph_path = profile_dir.join(format!("{}_flamegraph.svg", name));
+    match fs::File::create(&flamegraph_path) {
+        Ok(mut file_flame) => {
+            if let Err(e) = report.flamegraph(&mut file_flame) {
+                eprintln!("Failed to write flamegraph to '{}': {}", flamegraph_path.display(), e);
+            } else {
+                println!("Flamegraph written to: {}", flamegraph_path.display());
+            }
+        }
+        Err(e) => {
+            eprintln!("Failed to create flamegraph file '{}': {}", flamegraph_path.display(), e);
+        }
+    }
+    
+    let proto_path = profile_dir.join(format!("{}_profile.pb", name));
+    match fs::File::create(&proto_path) {
+        Ok(mut file_proto) => {
+            match report.pprof() {
+                Ok(pprof_profile_message) => {
+                    match pprof_profile_message.write_to_writer(&mut file_proto) {
+                        Ok(_) => println!("Profile proto written to: {}", proto_path.display()),
+                        Err(e) => eprintln!("Failed to write pprof proto to '{}': {}", proto_path.display(), e),
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Failed to generate pprof::protos::Profile from report for '{}': {}", name, e);
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("Failed to create pprof proto file '{}': {}", proto_path.display(), e);
+        }
     }
     Ok(())
 }
 
-// Dummy implementations for when profiling is disabled
-#[cfg(not(feature = "profiling"))]
-pub fn start_profiling(_name: &str) -> Result<()> {
-    println!("Profiling not enabled. Compile with --features=profiling to enable.");
-    Ok(())
-}
-
-#[cfg(not(feature = "profiling"))]
-pub fn finish_profiling(_guard: Option<()>, _name: &str) -> Result<()> {
-    Ok(())
+/// Start CPU profiling with pprof.
+///
+/// Returns a ProfileSessionGuard. Profiling stops when this guard is dropped.
+#[cfg(feature = "profiling")]
+pub fn start_profiling(name: &str) -> Result<ProfileSessionGuard> {
+    let profile_dir = PathBuf::from("profiles");
+    if !profile_dir.exists() {
+        fs::create_dir_all(&profile_dir)?;
+    }
+    
+    println!("Attempting to start profiling: {}", name);
+    match ProfilerGuardBuilder::default()
+        .frequency(1000)
+        .blocklist(&["libc", "libgcc", "pthread", "vdso"])
+        .build()
+    {
+        Ok(guard) => {
+            println!("Profiling started successfully: {}", name);
+            Ok(ProfileSessionGuard {
+                guard: Some(guard),
+                name: name.to_string(),
+            })
+        }
+        Err(e) => {
+            eprintln!("Failed to start profiling for '{}': {}. Profiling will be skipped.", name, e);
+            Ok(ProfileSessionGuard {
+                guard: None,
+                name: name.to_string(),
+            })
+        }
+    }
 }
 
 /// Time a function execution and print the elapsed time.
@@ -100,8 +149,8 @@ pub fn format_duration(duration: Duration) -> String {
 /// Measure memory usage using pprof.
 #[cfg(feature = "profiling")]
 pub fn measure_memory() -> Result<(usize, usize)> {
-    let mut allocated: usize = 0;
-    let mut active: usize = 0;
+    let allocated: usize = 0;
+    let active: usize = 0;
     
     Ok((allocated, active))
 }
@@ -122,6 +171,27 @@ pub fn print_memory_usage(label: &str) -> Result<()> {
 #[cfg(not(feature = "profiling"))]
 pub fn print_memory_usage(label: &str) -> Result<()> {
     Ok(())
+}
+
+#[cfg(not(feature = "profiling"))]
+pub fn start_profiling(name: &str) -> Result<ProfileSessionGuard> {
+    println!(
+        "Profiling not enabled for '{}'. Compile with --features=profiling to enable.",
+        name
+    );
+    Ok(ProfileSessionGuard { _private: (()) })
+}
+
+#[cfg(not(feature = "profiling"))]
+pub struct ProfileSessionGuard {
+    _private: (),
+}
+
+#[cfg(not(feature = "profiling"))]
+impl Drop for ProfileSessionGuard {
+    fn drop(&mut self) {
+        // No-op when profiling is not enabled
+    }
 }
 
 #[cfg(test)]

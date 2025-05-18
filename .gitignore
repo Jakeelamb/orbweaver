@@ -32,6 +32,10 @@
 *.data.old
 # Environment variables
 .env
+*.dot 
+*.gfa 
+*.graphml 
+*.bincode
 
 # IDE/Editor specific files
 .vscode/

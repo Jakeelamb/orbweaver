@@ -23,6 +23,7 @@ use orbweaver::utils::export::{write_grammar_text, write_grammar_json as io_writ
 use orbweaver::utils::visualization::{write_grammar_gfa, write_grammar_dot};
 use orbweaver::io::output_fasta::write_grammar_fasta;
 use std::fs::write as fs_write;
+use orbweaver::utils::profiling; // Added for profiling RAII guard
 
 // Use the configuration module if needed, or args directly
 // use orbweaver::config::Config; 
@@ -303,208 +304,193 @@ impl RunMetadata {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // --- Argument Parsing ---
-    let current_args = OrbweaverArgs::parse();
-    let mut original_args_for_resume: Option<OrbweaverArgs> = None; // Added for effective_build_args
+    // Initialize logging
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    // Determine Run ID if not provided
-    let run_id_str = current_args.run_id.clone().unwrap_or_else(|| {
+    let mut args = OrbweaverArgs::parse();
+    let cli_force_rerun = args.force_rerun;
+
+    // --- Profiling Setup ---
+    let _profiler_session_guard = if args.profile {
+        #[cfg(feature = "profiling")]
+        {
+            match profiling::start_profiling("orbweaver_run") {
+                Ok(guard) => Some(guard),
+                Err(e) => {
+                    eprintln!("Failed to start profiling: {}. Continuing without profiling.", e);
+                    None
+                }
+            }
+        }
+        #[cfg(not(feature = "profiling"))]
+        {
+            println!("Profiling requested via --profile flag, but Orbweaver was not compiled with the 'profiling' feature.");
+            println!("To enable profiling, recompile with: cargo build --features profiling");
+            match profiling::start_profiling("orbweaver_run_disabled") {
+                 Ok(guard) => Some(guard),
+                 Err(_) => None, 
+            }
+        }
+    } else {
+        None
+    };
+
+    // --- Run ID and Output Directory Setup ---
+    let run_id_str = args.run_id.clone().unwrap_or_else(|| {
         let now: DateTime<Utc> = Utc::now();
         now.format("%Y%m%d_%H%M%S").to_string()
     });
 
-    // Determine the base name for the output directory from the first input file.
-    let first_input_file = current_args.input_files.get(0).context("No input files provided.")?;
+    let first_input_file = args.input_files.get(0).context("No input files provided.")?;
     let input_file_stem = first_input_file.file_stem()
         .context("Could not extract file stem from input file.")?
         .to_string_lossy();
 
-    // Construct the run-specific output directory path in the current working directory
-    // e.g., inputfilename_runid
-    let run_specific_output_dir = PathBuf::from(format!("{}_{}", input_file_stem, run_id_str));
+    let mut metadata_to_save;
+    let mut initial_checkpoints: HashMap<String, PathBuf> = HashMap::new();
+    let run_specific_output_dir: PathBuf;
 
-    // Ensure the run-specific output directory exists
-    // This check and creation should happen *before* attempting to save metadata into it.
-    // It will be created later if resume is not active or if force_rerun is true.
+    let base_output_dir = PathBuf::from("."); 
+    let determined_run_id = args.run_id.clone().unwrap_or_else(|| Utc::now().format("%Y%m%d_%H%M%S").to_string());
 
-    // Path for the run metadata file
-    let metadata_path = run_specific_output_dir.join("run_metadata.json");
+    // --- Resumption Logic ---
+    if args.resume {
+        // Clone resume_run_dir to take ownership *before* args is potentially reassigned.
+        if let Some(owned_resume_dir) = args.resume_run_dir.clone() {
+            let metadata_path = owned_resume_dir.join("run_metadata.json");
+            if metadata_path.exists() {
+                println!("Resuming run from: {}", owned_resume_dir.display());
+                match RunMetadata::load(&metadata_path) {
+                    Ok(loaded_metadata) => {
+                        if loaded_metadata.status == "completed" && !cli_force_rerun {
+                            println!("Run {} was already completed. Use --force-rerun to re-process.", loaded_metadata.run_id);
+                            return Ok(());
+                        }
+                        
+                        let mut original_loaded_args = loaded_metadata.args.clone();
+                        
+                        if args.output_json.is_some() { original_loaded_args.output_json = args.output_json.clone(); }
+                        if args.output_text.is_some() { original_loaded_args.output_text = args.output_text.clone(); }
+                        if args.output_gfa.is_some() { original_loaded_args.output_gfa = args.output_gfa.clone(); }
 
-    // If not resuming a *completed* run (or if forcing rerun), save initial metadata.
-    // If resuming an incomplete run, its existing metadata will be loaded and updated.
-    if !current_args.resume && run_specific_output_dir.exists() && !current_args.force_rerun {
-        bail!(
-            "Output directory {:?} already exists. Use --resume to continue or --force-rerun to overwrite.",
-            run_specific_output_dir
-        );
-    } else if run_specific_output_dir.exists() && current_args.force_rerun {
-        info!("Deleting existing output directory due to --force-rerun: {:?}", run_specific_output_dir);
-        fs::remove_dir_all(&run_specific_output_dir)
-            .with_context(|| format!("Failed to delete existing output directory: {:?}", run_specific_output_dir))?;
-        fs::create_dir_all(&run_specific_output_dir)
-            .with_context(|| format!("Failed to create run-specific output directory: {:?}", run_specific_output_dir))?;
-    } else if !run_specific_output_dir.exists() {
-        fs::create_dir_all(&run_specific_output_dir)
-            .with_context(|| format!("Failed to create run-specific output directory: {:?}", run_specific_output_dir))?;
-    }
+                        args = original_loaded_args; 
+                        
+                        args.resume = true; 
+                        // Use the owned_resume_dir here, which is from the *original* args before overwrite.
+                        args.resume_run_dir = Some(owned_resume_dir.clone()); 
+                        args.force_rerun = cli_force_rerun; 
+                        
+                        args.run_id = Some(loaded_metadata.run_id.clone()); 
+                        run_specific_output_dir = owned_resume_dir.clone(); // Output to the resumed run's directory.
 
-    info!("Run output will be saved to: {:?}", run_specific_output_dir);
+                        metadata_to_save = loaded_metadata;
+                        metadata_to_save.status = if args.force_rerun { "starting (forced rerun on resumed)".to_string() } else { "resuming".to_string() };
+                        metadata_to_save.start_time = Utc::now(); 
+                        metadata_to_save.end_time = None;
+                        if !args.force_rerun { 
+                           initial_checkpoints = metadata_to_save.processed_sequence_checkpoints.clone();
+                        } else {
+                            metadata_to_save.processed_sequence_checkpoints = HashMap::new(); 
+                        }
 
-    // --- Handle Run Metadata (Save/Load/Update) ---
-    let initial_metadata_start_time = Utc::now(); // Capture start time for initial metadata save
-
-    // This metadata is saved initially and then updated at the end (or on error).
-    // It needs to be mutable because its status and end_time will be updated.
-    let mut metadata_to_save = RunMetadata {
-        args: current_args.clone(), // Save the *current* command's args
-        tool_version: env!("CARGO_PKG_VERSION").to_string(),
-        status: "starting".to_string(),
-        start_time: initial_metadata_start_time,
-        end_time: None,
-        run_id: run_id_str.clone(), // Use the determined actual_run_id
-        processed_sequence_checkpoints: HashMap::new(), // Initialize empty for a new run or overwrite for resume
-    };
-
-    // If not resuming a *completed* run (or if forcing rerun), save initial metadata.
-    // If resuming an incomplete run, its existing metadata will be loaded and updated.
-    if !metadata_path.exists() || current_args.force_rerun || current_args.resume {
-        if metadata_path.exists() && current_args.resume {
-            // Attempt to load existing metadata if resuming, to preserve checkpoints etc.
-            match RunMetadata::load(&metadata_path) {
-                Ok(loaded_meta) => {
-                    if loaded_meta.status == "completed" && !current_args.force_rerun {
-                        println!("Run {} was already completed. Metadata preserved. Use --force-rerun to overwrite.", loaded_meta.run_id);
-                        // No need to save new initial metadata if we're just exiting.
-                        return Ok(());
-                    } else if loaded_meta.status == "completed" && current_args.force_rerun {
-                         println!("Forcing rerun of completed run {}. Previous metadata will be overwritten.", loaded_meta.run_id);
-                         metadata_to_save.status = "starting (forced rerun)".to_string();
-                         metadata_to_save.start_time = initial_metadata_start_time;
-                         metadata_to_save.end_time = None;
-                         original_args_for_resume = Some(loaded_meta.args.clone()); // Store original args
-                    } else {
-                        println!("Resuming run {}. Loaded previous metadata.", loaded_meta.run_id);
-                        metadata_to_save.processed_sequence_checkpoints = loaded_meta.processed_sequence_checkpoints.clone();
-                        original_args_for_resume = Some(loaded_meta.args.clone()); // Store original args
+                        println!("Successfully loaded and configured for resuming run: {}", metadata_to_save.run_id);
+                        println!("Effective arguments for this resumed run: {:#?}", args);
+                    }
+                    Err(e) => {
+                        bail!("Failed to load metadata from {}: {}. Cannot resume.", metadata_path.display(), e);
                     }
                 }
-                Err(e) => {
-                     eprintln!("Warning: Failed to load existing metadata for resume from {}: {}. Starting with fresh metadata.", metadata_path.display(), e);
-                     // metadata_to_save is already initialized for a new run.
-                }
+            } else {
+                bail!("Metadata file run_metadata.json not found in resume directory: {}. Cannot resume.", owned_resume_dir.display());
             }
+        } else {
+            bail!("--resume flag was set, but --resume-run-dir was not provided.");
         }
-        metadata_to_save.save(&metadata_path)
-            .context(format!("Failed to save initial run metadata to {}", metadata_path.display()))?;
     } else {
-        // Metadata exists, not resuming, not forcing. This implies a completed run.
-        let loaded_meta = RunMetadata::load(&metadata_path)
-             .context(format!("Failed to load existing metadata from {}", metadata_path.display()))?;
-        if loaded_meta.status == "completed" {
-            println!("Run {} already completed. Output at: {}. Use --force-rerun to run again.", 
-                loaded_meta.run_id, run_specific_output_dir.display());
+        // This is a new run or a non-resumed forced re-run of an existing ID
+        run_specific_output_dir = base_output_dir.join(&determined_run_id);
+        if run_specific_output_dir.exists() && !cli_force_rerun { 
+            println!(
+                "Output directory {} already exists. Use --force-rerun to overwrite or a different --run-id.", 
+                run_specific_output_dir.display()
+            );
             return Ok(());
         }
-        // If it's not completed but exists and we're not resuming/forcing, this is an odd state.
-        // For now, we'll proceed as if it's a new run, potentially overwriting.
-        // The initial save handles this by checking `metadata_path.exists()`.
+        if run_specific_output_dir.exists() && cli_force_rerun { 
+            fs::remove_dir_all(&run_specific_output_dir)
+                 .with_context(|| format!("Failed to remove existing output directory for forced rerun: {}", run_specific_output_dir.display()))?;
+        }
+        fs::create_dir_all(&run_specific_output_dir)
+            .with_context(|| format!("Failed to create run output directory: {}", run_specific_output_dir.display()))?;
+
+        metadata_to_save = RunMetadata {
+            args: args.clone(), 
+            tool_version: command!().get_version().unwrap_or("unknown").to_string(),
+            status: "starting".to_string(),
+            start_time: Utc::now(),
+            end_time: None,
+            run_id: determined_run_id.clone(), 
+            processed_sequence_checkpoints: HashMap::new(),
+        };
+        args.force_rerun = cli_force_rerun;
+        args.run_id = Some(determined_run_id); 
     }
 
+    // Save initial metadata (either new or updated for resume)
+    let metadata_path = run_specific_output_dir.join("run_metadata.json");
+    metadata_to_save.save(&metadata_path)
+        .with_context(|| format!("Failed to save initial run metadata to {}", metadata_path.display()))?;
 
-    // --- Set up GPU context ---
-    let gpu_context = if !current_args.no_gpu {
-        match GpuContext::new() {
-            Ok(ctx) => {
-                println!("GPU context initialized successfully.");
-                Some(ctx)
-            }
-            Err(e) => {
-                eprintln!("Failed to initialize GPU context: {}. Falling back to CPU.", e);
-                None
-            }
-        }
-    } else {
-        println!("GPU usage explicitly disabled.");
-        None
-    };
-    
-    // --- Main processing logic ---
-    // Use `original_args_for_resume` for parameters that define the core run (like min_rule_usage),
-    // but `current_args` for things like output paths (which are now relative to run_specific_output_dir)
-    // or flags like `--stats` which might be toggled for a resume.
-    // However, with output_dir, species_id, assembly_id removed, current_args holds most relevant info
-    // for how to *behave* now, while original_args_for_resume might hold parameters of *what* was built.
-    // For simplicity now, most processing will use `current_args`. Checkpoints will use `original_args_for_resume`
-    // to ensure the *same kind of grammar* is being resumed.
+    // Log the arguments being used for this run
+    info!("Starting Orbweaver run with arguments: {:#?}", args);
+    info!("Run ID: {}", metadata_to_save.run_id);
+    info!("Output will be saved to: {}", run_specific_output_dir.display());
 
-    // The actual args to use for the core grammar building algorithm:
-    // If resuming, we *must* use the grammar parameters from the original run.
-    // If not resuming, we use the current_args.
-    let effective_build_args = if current_args.resume {
-        original_args_for_resume.as_ref().unwrap_or(&current_args)
+    // --- Main Processing Logic ---
+    let result: Result<(Grammar, HashMap<String, PathBuf>)> = if args.streaming {
+        process_streaming_mode(&args, None, &run_specific_output_dir, &initial_checkpoints).await
+    } else if args.chunk_size > 0 || args.adaptive_chunking {
+        // TODO: Pass GPU context to chunked mode if/when it supports it
+        Ok(process_chunked_mode(&args, &run_specific_output_dir, &initial_checkpoints)?)
     } else {
-        &current_args
-    };
-    
-    let main_processing_result = if effective_build_args.chunk_size > 0 {
-        process_chunked_mode(effective_build_args, &run_specific_output_dir, &metadata_to_save.processed_sequence_checkpoints)
-    } else if effective_build_args.streaming {
-        process_streaming_mode(effective_build_args, gpu_context.as_ref(), &run_specific_output_dir, &metadata_to_save.processed_sequence_checkpoints).await
-    } else {
-        process_standard_mode(effective_build_args, gpu_context.is_some(), gpu_context.as_ref(), &run_specific_output_dir, &metadata_to_save.processed_sequence_checkpoints).await
+        process_standard_mode(&args, false, None, &run_specific_output_dir, &initial_checkpoints).await
     };
 
-    match main_processing_result {
-        Ok((grammar, final_checkpoints)) => {
-            println!("Grammar construction completed.");
-            generate_outputs(&grammar, &current_args, &run_specific_output_dir)?; // Pass run_specific_output_dir
-
-            if current_args.stats {
-                orbweaver::analysis::stats::calculate_and_print_stats(&grammar)?;
+    match result {
+        Ok((final_grammar, final_checkpoints)) => {
+            info!("Grammar construction completed successfully.");
+            if args.stats {
+                calculate_and_print_stats(&final_grammar)?;
             }
-
-            // Update and save final metadata
+            generate_outputs(&final_grammar, &args, &run_specific_output_dir)?;
+            
+            // Update and save metadata as completed
             metadata_to_save.status = "completed".to_string();
             metadata_to_save.end_time = Some(Utc::now());
             metadata_to_save.processed_sequence_checkpoints = final_checkpoints;
             metadata_to_save.save(&metadata_path)
-                .context(format!("Failed to save final run metadata to {}", metadata_path.display()))?;
-            println!("Run {} completed successfully. Outputs in {}", run_id_str, run_specific_output_dir.display());
+                .with_context(|| format!("Failed to save final run metadata to {}", metadata_path.display()))?;
+            info!("Orbweaver run {} completed successfully.", metadata_to_save.run_id);
+
+            // No explicit finish_profiling call needed, _profiler_session_guard will handle it on drop
+            Ok(())
         }
         Err(e) => {
-            // Error occurred, update metadata to "failed"
-            let mut metadata_to_save_on_error = RunMetadata::load(&metadata_path) // Load existing or initial
-                .unwrap_or_else(|_| {
-                    // Fallback if loading fails (e.g., first time, file corrupt)
-                    // This re-uses the initial metadata constructed earlier, but updates status/time
-                    let current_time = Utc::now();
-                    RunMetadata {
-                        args: current_args.clone(), // current_args were used for *this* attempt
-                        tool_version: env!("CARGO_PKG_VERSION").to_string(),
-                        status: "failed".to_string(),
-                        start_time: initial_metadata_start_time, // Use the start time from the initial save
-                        end_time: Some(current_time),
-                        run_id: run_id_str.clone(), // Use the determined actual_run_id
-                        processed_sequence_checkpoints: HashMap::new(), // Likely no new checkpoints on failure
-                    }
-                });
-
-            metadata_to_save_on_error.status = "failed".to_string();
-            metadata_to_save_on_error.end_time = Some(Utc::now());
-            // Potentially update checkpoints if the error happened *after* some successful chunk processing.
-            // For now, let's assume the 'final_checkpoints' from a failed run might not be reliable or not produced.
-            // If `main_processing_result` could return partial checkpoints on error, we could save them.
-
-            if let Err(save_err) = metadata_to_save_on_error.save(&metadata_path) {
-                 eprintln!("Additionally, failed to save 'failed' status to metadata file {}: {}", metadata_path.display(), save_err);
+            eprintln!("Error during Orbweaver processing: {:?}", e);
+            // Update and save metadata as failed
+            metadata_to_save.status = "failed".to_string();
+            metadata_to_save.end_time = Some(Utc::now());
+            // Checkpoints might be partially updated, save what we have
+            // If result was Err, final_checkpoints isn't available in this scope.
+            // We should ideally get the checkpoints from the error or pass metadata_to_save into processing functions.
+            // For now, just save metadata without updating checkpoints on error.
+            if let Err(save_err) = metadata_to_save.save(&metadata_path) {
+                 eprintln!("Additionally, failed to save error state metadata to {}: {}", metadata_path.display(), save_err);
             }
-            
-            eprintln!("Error during processing: {}", e); // Print the original error
-            return Err(e); // Propagate the error
+            // No explicit finish_profiling call needed here either
+            Err(e) // Propagate the original error
         }
     }
-
-    Ok(())
 }
 
 /// Generates all requested output files from the final grammar.

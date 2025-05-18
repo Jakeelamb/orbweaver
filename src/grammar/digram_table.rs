@@ -119,16 +119,12 @@ impl DigramTable {
     }
 
     /// Finds the most frequent canonical digram.
-    /// Returns Option<(CanonicalDigramKey, count, Vec<(position, original_instance)>)> 
+    /// Returns Option<(CanonicalDigramKey, count, Vec<(position, original_instance)>)>
     pub fn find_most_frequent_digram(&self) -> Option<(DigramKeyTuple, usize, Vec<(usize, DigramSource)>)> {
         self.occurrences
             .iter()
-            .map(|entry| { // entry is RefMulti
-                let key = *entry.key();
-                let value = entry.value();
-                (key, value.len(), value.clone()) // Clone occurrences for return
-            })
-            .max_by_key(|&(_, count, _)| count)
+            .max_by_key(|entry| entry.value().len())
+            .map(|entry| (*entry.key(), entry.value().len(), entry.value().clone()))
     }
 
     /// Removes occurrences associated with a specific digram instance (by position).
@@ -215,39 +211,31 @@ impl DigramTable {
 
         let num_chunks = rayon::current_num_threads();
         // Ensure chunk_size is at least 1, and at least 2 for digram processing if sequence is long enough
-        let chunk_size = if sequence.len() < 2 { 
-            sequence.len().max(1) 
-        } else { 
+        let chunk_size = if sequence.len() < 2 {
+            sequence.len().max(1)
+        } else {
             ((sequence.len() as f64 / num_chunks as f64).ceil() as usize).max(2) // Corrected casting and max call
         };
 
-        if sequence.len() < 2 || chunk_size == 0 { 
+        if sequence.len() < 2 || chunk_size == 0 {
             return Self { occurrences, rule_references };
         }
-        
-        let digram_data_chunks: Vec<Vec<(DigramKeyTuple, usize, DigramSource)>> = sequence
+
+        sequence
             .par_chunks(chunk_size)
             .enumerate()
-            .map(|(chunk_idx, chunk)| {
-                let mut local_digrams = Vec::new();
-                if chunk.len() >= 2 { 
+            .for_each(|(chunk_idx, chunk)| {
+                if chunk.len() >= 2 {
                     for i in 0..chunk.len() - 1 {
-                        let s1 = &chunk[i]; // Get references
-                        let s2 = &chunk[i+1]; // Get references
-                        let key = Self::canonical_key((s1, s2), reverse_aware); // Pass tuple of refs
-                        let original_pos = chunk_idx * chunk_size + i; 
-                        local_digrams.push((key, original_pos, DigramSource::Original));
+                        let s1 = &chunk[i];
+                        let s2 = &chunk[i+1];
+                        let key = Self::canonical_key((s1, s2), reverse_aware);
+                        let original_pos = chunk_idx * chunk_size + i;
+                        occurrences.entry(key).or_default().push((original_pos, DigramSource::Original));
                     }
                 }
-                local_digrams
-            })
-            .collect();
+            });
 
-        for chunk_data in digram_data_chunks {
-            for (key, pos, source) in chunk_data {
-                occurrences.entry(key).or_default().push((pos, source));
-            }
-        }
         Self { occurrences, rule_references }
     }
 
