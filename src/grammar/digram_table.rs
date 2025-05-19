@@ -76,21 +76,17 @@ impl DigramTable {
                 self.add_digram(i, sequence[i].clone(), sequence[i+1].clone(), reverse_aware);
             }
         } else {
-            // Parallel for larger sequences (simplified from original complex rayon code)
-            let digram_data: Vec<(DigramKeyTuple, usize, DigramSource)> = sequence // Changed DigramKey to DigramKeyTuple
+            // Parallel for larger sequences
+            sequence
                 .par_windows(2)
                 .enumerate()
-                .map(|(i, window)| {
+                .for_each(|(i, window)| {
                     let sym1 = window[0].clone(); // Clone symbols for ownership
                     let sym2 = window[1].clone();
                     let key = Self::canonical_key((&sym1, &sym2), reverse_aware); // Pass tuple of refs
-                    (key, i, DigramSource::Original)
-                })
-                .collect();
-
-            for (key, pos, source) in digram_data {
-                self.occurrences.entry(key).or_default().push((pos, source));
-            }
+                    // The original index `i` from enumerate is the position of the first symbol of the digram.
+                    self.occurrences.entry(key).or_default().push((i, DigramSource::Original));
+                });
         }
     }
 
