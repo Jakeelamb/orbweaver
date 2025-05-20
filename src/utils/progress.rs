@@ -101,16 +101,6 @@ impl fmt::Display for ProgressTracker {
     }
 }
 
-/// Format a duration as HH:MM:SS
-fn format_duration(duration: Duration) -> String {
-    let total_seconds = duration.as_secs();
-    let hours = total_seconds / 3600;
-    let minutes = (total_seconds % 3600) / 60;
-    let seconds = total_seconds % 60;
-    
-    format!("{:02}:{:02}:{:02}", hours, minutes, seconds)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -141,14 +131,5 @@ mod tests {
         assert!(status.contains("Test:"));
         assert!(status.contains("100/100"));
         assert!(status.contains("100.0%"));
-    }
-    
-    #[test]
-    fn test_format_duration() {
-        let duration = Duration::from_secs(3661); // 1h 1m 1s
-        assert_eq!(format_duration(duration), "01:01:01");
-        
-        let duration2 = Duration::from_secs(59); // 59s
-        assert_eq!(format_duration(duration2), "00:00:59");
     }
 } 

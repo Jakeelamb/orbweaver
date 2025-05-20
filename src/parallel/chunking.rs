@@ -172,10 +172,6 @@ pub fn split_into_chunks(
             sys.available_memory() as usize
         } {
             available_memory => available_memory,
-            _ => {
-                println!("Warning: Could not get available memory, using default memory value");
-                1024 * 1024 * 1024 // Default to 1GB as a reasonable fallback
-            }
         };
         
         calculate_adaptive_chunk_size(sequence, config, available_memory)

@@ -24,6 +24,7 @@ use orbweaver::utils::visualization::{write_grammar_gfa, write_grammar_dot};
 use orbweaver::io::output_fasta::write_grammar_fasta;
 use std::fs::write as fs_write;
 use orbweaver::utils::profiling; // Added for profiling RAII guard
+use uuid;
 
 // Use the configuration module if needed, or args directly
 // use orbweaver::config::Config; 
@@ -336,13 +337,12 @@ async fn main() -> Result<()> {
     };
 
     // --- Run ID and Output Directory Setup ---
-    let run_id_str = args.run_id.clone().unwrap_or_else(|| {
-        let now: DateTime<Utc> = Utc::now();
-        now.format("%Y%m%d_%H%M%S").to_string()
+    let _run_id_str = args.run_id.clone().unwrap_or_else(|| {
+        uuid::Uuid::new_v4().to_string()
     });
 
     let first_input_file = args.input_files.get(0).context("No input files provided.")?;
-    let input_file_stem = first_input_file.file_stem()
+    let _input_file_stem = first_input_file.file_stem()
         .context("Could not extract file stem from input file.")?
         .to_string_lossy();
 
@@ -460,7 +460,7 @@ async fn main() -> Result<()> {
         Ok((final_grammar, final_checkpoints)) => {
             info!("Grammar construction completed successfully.");
             if args.stats {
-                calculate_and_print_stats(&final_grammar)?;
+                calculate_and_print_stats()?;
             }
             generate_outputs(&final_grammar, &args, &run_specific_output_dir)?;
             
@@ -563,7 +563,7 @@ fn generate_outputs(grammar: &Grammar, args: &OrbweaverArgs, run_specific_output
 
     if args.stats {
         info!("Calculating and printing statistics...");
-        calculate_and_print_stats(grammar)?;
+        calculate_and_print_stats()?;
     }
 
     info!("All requested outputs generated.");
@@ -891,7 +891,7 @@ fn process_chunked_mode(
 
     let seq_id = input_path.file_stem().unwrap_or_default().to_string_lossy().to_string();
     let checkpoint_filename = format!("{}_chunked_final.grammar", seq_id);
-    let checkpoint_path = run_specific_output_dir.join(&checkpoint_filename);
+    let _checkpoint_path = run_specific_output_dir.join(&checkpoint_filename);
 
     if let Some(resumed_grammar_path) = initial_checkpoints.get(&format!("{}_final", seq_id)) { // Check for final checkpoint
         if resumed_grammar_path.exists() && !args.force_rerun {

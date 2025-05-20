@@ -1,12 +1,11 @@
 // Placeholder for the parallel grammar engine
 
 use crate::encode::dna_2bit::EncodedBase;
-use crate::fasta::reader::SequenceChunk;
 use crate::grammar::engine::Grammar;
 use crate::grammar::rule::Rule;
 use crate::grammar::symbol::{Symbol, SymbolType};
 use crate::utils::hash::canonical_hash_symbols;
-use crate::parallel::chunking::{ChunkingConfig, split_into_chunks, Chunk};
+use crate::parallel::chunking::{ChunkingConfig, split_into_chunks};
 use crate::grammar::builder::GrammarBuilder;
 use anyhow::{Result, Context};
 use rayon::prelude::*;
@@ -121,7 +120,7 @@ pub fn parallel_sequitur(
 
 /// Merges multiple grammars into a single grammar
 /// This function is now public.
-pub fn merge_grammars(grammars: Vec<Grammar>, config: &ChunkingConfig, total_sequence_len: usize) -> Result<(Grammar, ParallelMetrics)> {
+pub fn merge_grammars(grammars: Vec<Grammar>, _config: &ChunkingConfig, total_sequence_len: usize) -> Result<(Grammar, ParallelMetrics)> {
     let start_merge = Instant::now();
     let mut metrics = ParallelMetrics::default();
 
@@ -152,7 +151,7 @@ pub fn merge_grammars(grammars: Vec<Grammar>, config: &ChunkingConfig, total_seq
     let mut current_original_pos = 0; // Track position in the original, uncompressed sequence
 
     for (chunk_index, (grammar_id, grammar)) in grammars_with_ids.iter().enumerate() { // Iterate with grammar_id
-        let chunk_start_in_original = grammar.sequence.first().map_or(current_original_pos, |s| s.id); // Approximate start pos
+        let _chunk_start_in_original = grammar.sequence.first().map_or(current_original_pos, |s| s.id); // Approximate start pos
         let chunk_seq = &grammar.sequence;
 
         // Determine the segment of the chunk sequence to append
@@ -387,60 +386,6 @@ fn calculate_rule_depth(
     depth
 }
 
-/// Convert a SequenceChunk to our new Chunk type
-fn convert_chunk(chunk: &SequenceChunk) -> Chunk {
-    // Convert the Vec<u8> to Vec<EncodedBase>
-    let encoded_data: Vec<EncodedBase> = chunk.data.iter()
-        .filter_map(|&b| EncodedBase::from_base(b))
-        .collect();
-
-    Chunk {
-        index: 0, // We don't have this information in SequenceChunk
-        data: encoded_data,
-        start: chunk.start_pos,
-        end: chunk.end_pos,
-        is_first: chunk.start_pos == 0,
-        is_last: chunk.is_last,
-    }
-}
-
-/// Creates overlapping chunks from a sequence of bases
-fn create_chunks(bases: &[EncodedBase], chunk_size: usize, overlap: usize) -> Vec<SequenceChunk> {
-    let mut chunks = Vec::new();
-    let mut start = 0;
-    
-    while start < bases.len() {
-        let end = (start + chunk_size).min(bases.len());
-        let is_last = end == bases.len();
-        
-        // Convert EncodedBase chunk back to Vec<u8> for SequenceChunk
-        let data_u8: Vec<u8> = bases[start..end].iter().map(|b| b.to_char() as u8).collect();
-
-        chunks.push(SequenceChunk {
-            data: data_u8,
-            start_pos: start,
-            end_pos: end,
-            record_id: String::new(),
-            is_last,
-        });
-        
-        if is_last {
-            break;
-        }
-        
-        // Move start position for next chunk, ensuring overlap
-        // Ensure we don't subtract past zero with saturating_sub
-        start = end.saturating_sub(overlap.min(chunk_size.saturating_sub(1)));
-        
-        // Prevent infinite loops if overlap is too large or start doesn't advance
-        if start >= end.saturating_sub(1) && !is_last { 
-             start = end; // Force advance if stuck
-        }
-    }
-    
-    chunks
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -455,40 +400,6 @@ mod tests {
                 _ => None,
             })
             .collect()
-    }
-    
-    #[test]
-    fn test_create_chunks() {
-        let bases = make_bases("ACGTACGTACGT");
-        
-        // Chunk size = 5, overlap = 2
-        let chunks = create_chunks(&bases, 5, 2);
-        
-        assert_eq!(chunks.len(), 4);
-        
-        // First chunk: 0-5 (ACGTA)
-        assert_eq!(chunks[0].data.len(), 5);
-        assert_eq!(chunks[0].start_pos, 0);
-        assert_eq!(chunks[0].end_pos, 5);
-        assert!(!chunks[0].is_last);
-        
-        // Second chunk: 3-8 (TACGT)
-        assert_eq!(chunks[1].data.len(), 5);
-        assert_eq!(chunks[1].start_pos, 3);
-        assert_eq!(chunks[1].end_pos, 8);
-        assert!(!chunks[1].is_last);
-        
-        // Third chunk: 6-11 (ACGTA)
-        assert_eq!(chunks[2].data.len(), 5);
-        assert_eq!(chunks[2].start_pos, 6);
-        assert_eq!(chunks[2].end_pos, 11);
-        assert!(!chunks[2].is_last);
-        
-        // Fourth chunk: 9-12 (CGT)
-        assert_eq!(chunks[3].data.len(), 3);
-        assert_eq!(chunks[3].start_pos, 9);
-        assert_eq!(chunks[3].end_pos, 12);
-        assert!(chunks[3].is_last);
     }
     
     #[test]

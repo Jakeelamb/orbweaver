@@ -3,7 +3,6 @@ use crate::grammar::rule::Rule;
 use crate::grammar::symbol::{Direction, Symbol};
 use anyhow::Result;
 use std::collections::{HashMap};
-use rayon::prelude::*;
 use serde::{Serialize, Deserialize};
 
 /// A Grammar is the result of the Sequitur algorithm,
@@ -27,22 +26,22 @@ pub struct Grammar {
 /// Sequitur algorithm implementation for inferring hierarchical structure in sequences
 pub struct Sequitur {
     /// Minimum number of occurrences required to create a rule
-    min_rule_usage: usize,
+    _min_rule_usage: usize,
     
     /// Whether to consider reverse complements
-    reverse_aware: bool,
+    _reverse_aware: bool,
     
     /// Counter for assigning rule IDs
-    next_rule_id: usize,
+    _next_rule_id: usize,
 }
 
 impl Sequitur {
     /// Create a new Sequitur instance
     pub fn new(min_rule_usage: usize, reverse_aware: bool) -> Self {
         Self {
-            min_rule_usage,
-            reverse_aware,
-            next_rule_id: 0,
+            _min_rule_usage: min_rule_usage,
+            _reverse_aware: reverse_aware,
+            _next_rule_id: 0,
         }
     }
     

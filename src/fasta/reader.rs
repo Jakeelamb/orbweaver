@@ -147,10 +147,9 @@ pub async fn read_fasta_sequences_async(fasta_path: &Path, skip_ns: bool) -> Res
 }
 
 // Basic structure to hold FASTA record information parsed from memory-mapped file
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct MmapFastaRecord {
     id: String,
-    header_offset: usize,
     sequence_offset: usize,
     sequence_length: usize,
 }
@@ -239,7 +238,7 @@ impl MemoryMappedFastaReader {
         while pos < data.len() {
             // Find the start of a record (>)
             if data[pos] == b'>' {
-                let header_offset = pos;
+                let _header_offset = pos;
                 
                 // Find the end of the header line
                 let mut header_end = pos;
@@ -279,7 +278,6 @@ impl MemoryMappedFastaReader {
                 
                 records.push(MmapFastaRecord {
                     id,
-                    header_offset,
                     sequence_offset,
                     sequence_length: seq_len,
                 });

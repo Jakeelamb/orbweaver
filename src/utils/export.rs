@@ -146,7 +146,7 @@ pub fn export_grammar_fasta<W: Write>(grammar: &Grammar, writer: &mut W) -> Resu
 }
 
 /// Format a symbol for display
-pub fn format_symbol(symbol: &Symbol, grammar: &Grammar) -> String {
+pub fn format_symbol(symbol: &Symbol, _grammar: &Grammar) -> String {
     match symbol.symbol_type {
         SymbolType::Terminal(base) => {
             // Map terminal ID to a DNA base
@@ -251,23 +251,6 @@ pub fn expand_sequence_to_string(sequence: &[Symbol], rules: &HashMap<usize, Rul
     }
     
     result
-}
-
-/// Calculate the reverse complement of a DNA string
-fn reverse_complement(sequence: &str) -> String {
-    sequence.chars().rev().map(|c| {
-        match c {
-            'A' => 'T',
-            'C' => 'G',
-            'G' => 'C',
-            'T' => 'A',
-            'a' => 't',
-            'c' => 'g',
-            'g' => 'c',
-            't' => 'a',
-            other => other,
-        }
-    }).collect()
 }
 
 /// Calculate compression statistics for a grammar
@@ -564,7 +547,7 @@ pub fn write_dna_fasta<P: AsRef<Path>>(
     let line_width = 80;
     let mut line_count = 0;
     
-    for (base, strand) in &dna_sequence {
+    for (base, _strand) in &dna_sequence {
         // For FASTA, we don't include strand information directly
         write!(&mut writer, "{}", base.to_char())?;
         
@@ -720,13 +703,5 @@ mod tests {
         assert!(text.contains("== Final Sequence"));
         assert!(text.contains("R0"));
         assert!(text.contains("R1"));
-    }
-
-    #[test]
-    fn test_reverse_complement() {
-        let rc = reverse_complement("ACGT");
-        assert_eq!(rc, "ACGT");
-        let rc2 = reverse_complement("AAGT");
-        assert_eq!(rc2, "ACTT");
     }
 } 

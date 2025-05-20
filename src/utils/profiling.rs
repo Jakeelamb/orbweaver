@@ -157,7 +157,7 @@ pub fn measure_memory() -> Result<(usize, usize)> {
 
 /// Print current memory usage.
 #[cfg(feature = "profiling")]
-pub fn print_memory_usage(label: &str) -> Result<()> {
+pub fn print_memory_usage(_label: &str) -> Result<()> {
     let (allocated, active) = measure_memory()?;
     println!(
         "Memory usage at {}: allocated={}MB, active={}MB", 
@@ -169,7 +169,7 @@ pub fn print_memory_usage(label: &str) -> Result<()> {
 }
 
 #[cfg(not(feature = "profiling"))]
-pub fn print_memory_usage(label: &str) -> Result<()> {
+pub fn print_memory_usage(_label: &str) -> Result<()> {
     Ok(())
 }
 

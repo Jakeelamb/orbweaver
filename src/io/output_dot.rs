@@ -39,10 +39,10 @@ fn dot_node_label(symbol: Symbol) -> String {
 /// Args:
 ///     grammar_builder: The GrammarBuilder instance after build_grammar() has run.
 ///     output_path: The path to the output DOT file.
-pub fn write_grammar_dot(grammar_builder: &GrammarBuilder, output_path: &Path, options: &DotOptions) -> Result<()> {
+pub fn write_grammar_dot(grammar_builder: &GrammarBuilder, output_path: &Path, _options: &DotOptions) -> Result<()> {
     println!("Writing grammar to DOT: {}", output_path.display());
 
-    let (_final_sequence, rules) = grammar_builder.get_grammar();
+    let (_sequence, rules) = grammar_builder.get_grammar();
 
     let file = File::create(output_path)
         .with_context(|| format!("Failed to create DOT output file: {}", output_path.display()))?;

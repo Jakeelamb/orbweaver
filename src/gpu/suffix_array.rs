@@ -11,8 +11,6 @@ use crate::gpu::{GpuContext, digram::GpuSequence};
 pub struct GpuSuffixArray {
     /// The suffix array (indices into the original sequence)
     sa: Vec<usize>,
-    /// GPU buffer for suffix array
-    device_buffer: Option<Buffer<usize>>,
 }
 
 impl GpuSuffixArray {
@@ -20,7 +18,6 @@ impl GpuSuffixArray {
     pub fn new() -> Self {
         GpuSuffixArray {
             sa: Vec::new(),
-            device_buffer: None,
         }
     }
     
@@ -90,7 +87,7 @@ impl GpuSuffixArray {
         }
         
         // Get the OpenCL context and queue
-        let context = &gpu_context.context;
+        let _context = &gpu_context.context;
         let queue = &gpu_context.queue;
         
         // Create a sequence buffer
@@ -167,7 +164,7 @@ impl GpuSuffixArray {
     }
     
     /// Build suffix array using a chunked approach when the sequence is too large for GPU memory
-    fn build_chunked_opencl(sequence: &GpuSequence, gpu_context: &GpuContext) -> Result<Vec<usize>> {
+    fn build_chunked_opencl(sequence: &GpuSequence, _gpu_context: &GpuContext) -> Result<Vec<usize>> {
         let seq_data = sequence.get_data();
         let seq_len = sequence.get_len();
         

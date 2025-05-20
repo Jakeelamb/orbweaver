@@ -106,7 +106,7 @@ impl GpuSequence {
     pub fn find_most_frequent_digram(
         &self, 
         min_count: usize, 
-        reverse_aware: bool,
+        _reverse_aware: bool,
         gpu_context: Option<&GpuContext>
     ) -> Result<Option<(DigramKey, Vec<(usize, (Symbol, Symbol))>)>> {
         if let Some(context) = gpu_context {
@@ -115,29 +115,29 @@ impl GpuSequence {
                 // Need to upload first - but this requires a mutable reference
                 // Instead, compute on CPU
                 println!("Sequence not uploaded to GPU. Using CPU implementation.");
-                return self.find_most_frequent_digram_cpu(min_count, reverse_aware);
+                return self.find_most_frequent_digram_cpu(min_count, _reverse_aware);
             }
             
             // Use OpenCL
-            match find_most_frequent_digram_opencl(self, min_count, reverse_aware, context) {
+            match find_most_frequent_digram_opencl(self, min_count, _reverse_aware, context) {
                 Ok(result) => return Ok(result),
                 Err(e) => {
                     println!("GPU digram finding failed: {:?}. Falling back to CPU", e);
-                    return self.find_most_frequent_digram_cpu(min_count, reverse_aware);
+                    return self.find_most_frequent_digram_cpu(min_count, _reverse_aware);
                 }
             }
         }
         
         // Fallback to CPU
         println!("Using CPU implementation (no GPU context provided)");
-        self.find_most_frequent_digram_cpu(min_count, reverse_aware)
+        self.find_most_frequent_digram_cpu(min_count, _reverse_aware)
     }
     
     /// CPU implementation for finding most frequent digram
     pub(crate) fn find_most_frequent_digram_cpu(
         &self, 
         min_count: usize, 
-        reverse_aware: bool
+        _reverse_aware: bool
     ) -> Result<Option<(DigramKey, Vec<(usize, (Symbol, Symbol))>)>> {
         // Calculate digram frequencies
         let mut digram_counts: HashMap<DigramKey, Vec<(usize, (Symbol, Symbol))>> = HashMap::new();
@@ -151,7 +151,7 @@ impl GpuSequence {
             let sym1 = Symbol::terminal(i, base1, Direction::Forward);
             let sym2 = Symbol::terminal(i+1, base2, Direction::Forward);
             
-            let key_tuple = DigramTable::canonical_key((&sym1, &sym2), reverse_aware);
+            let key_tuple = DigramTable::canonical_key((&sym1, &sym2), _reverse_aware);
             let key_hash = custom_hash(&key_tuple);
             
             digram_counts.entry(key_hash)
@@ -175,7 +175,7 @@ impl GpuSequence {
     pub fn find_most_frequent_digram_enhanced(
         &self,
         min_count: usize,
-        reverse_aware: bool,
+        _reverse_aware: bool,
         gpu_context: &GpuContext
     ) -> Result<Option<(DigramKey, Vec<(usize, (Symbol, Symbol))>)>> {
         // Let's use our new sequential version which supports chunking
@@ -230,7 +230,7 @@ impl GpuSequence {
         Some((max_key, occurrences))
     }
 
-    pub fn find_most_frequent_digram_sequential(&self, min_count: usize, gpu_context: &GpuContext) -> Result<Option<(DigramKey, Vec<(usize, (Symbol, Symbol))>)>> {
+    pub fn find_most_frequent_digram_sequential(&self, min_count: usize, _gpu_context: &GpuContext) -> Result<Option<(DigramKey, Vec<(usize, (Symbol, Symbol))>)>> {
         // Calculate approximate memory needed for this operation
         // Each sequence element needs space for the original data and at least 8 bytes for counts
         let estimated_mem_needed = self.data.len() * (1 + 8);
@@ -319,7 +319,7 @@ impl GpuSequence {
 fn find_most_frequent_digram_opencl(
     sequence: &GpuSequence,
     min_count: usize,
-    reverse_aware: bool,
+    _reverse_aware: bool,
     gpu_context: &GpuContext
 ) -> Result<Option<(DigramKey, Vec<(usize, (Symbol, Symbol))>)>> {
     if sequence.get_len() < 2 {
@@ -327,8 +327,8 @@ fn find_most_frequent_digram_opencl(
     }
     
     // Get the OpenCL context and queue
-    let context = &gpu_context.context;
-    let queue = &gpu_context.queue;
+    let _context = &gpu_context.context;
+    let _queue = &gpu_context.queue;
     
     // Get maximum memory of GPU and calculate safe memory usage (50% of available)
     let max_memory = gpu_context.device.info(ocl::enums::DeviceInfo::GlobalMemSize)
@@ -351,7 +351,7 @@ fn find_most_frequent_digram_opencl(
     
     // If sequence fits in memory, use direct method
     if memory_needed <= safe_memory {
-        return find_most_frequent_digram_opencl_direct(sequence, min_count, reverse_aware, gpu_context);
+        return find_most_frequent_digram_opencl_direct(sequence, min_count, _reverse_aware, gpu_context);
     }
     
     // Otherwise use chunked approach
@@ -381,11 +381,11 @@ fn find_most_frequent_digram_opencl(
         let chunk_seq = GpuSequence::new(chunk_data.to_vec());
         
         // Process this chunk
-        if let Ok(Some((chunk_key, _chunk_positions))) = 
-            find_most_frequent_digram_opencl_direct(&chunk_seq, 0, reverse_aware, gpu_context) {
+        if let Ok(Some((_chunk_key, _chunk_positions))) = 
+            find_most_frequent_digram_opencl_direct(&chunk_seq, 0, _reverse_aware, gpu_context) {
             
             // Extract all digram counts from this chunk (min_count = 0 to get all)
-            let chunk_counts = count_digrams_gpu(&chunk_seq, reverse_aware, gpu_context)?;
+            let chunk_counts = count_digrams_gpu(&chunk_seq, _reverse_aware, gpu_context)?;
             
             // Merge counts with global map
             for (key, count) in chunk_counts.counts {
@@ -417,7 +417,7 @@ fn find_most_frequent_digram_opencl(
         let sym1 = sequence.get_symbol(i);
         let sym2 = sequence.get_symbol(i + 1);
         
-        let key_tuple = DigramTable::canonical_key((&sym1, &sym2), reverse_aware);
+        let key_tuple = DigramTable::canonical_key((&sym1, &sym2), _reverse_aware);
         let key_hash = custom_hash(&key_tuple);
         
         if key_hash == max_key {
@@ -433,9 +433,10 @@ fn find_most_frequent_digram_opencl(
 fn find_most_frequent_digram_opencl_direct(
     sequence: &GpuSequence,
     min_count: usize,
-    reverse_aware: bool,
+    _reverse_aware: bool,
     gpu_context: &GpuContext
 ) -> Result<Option<(DigramKey, Vec<(usize, (Symbol, Symbol))>)>> {
+    let _context = &gpu_context.context;
     let seq_len = sequence.get_len();
     
     if seq_len < 2 {
@@ -443,8 +444,7 @@ fn find_most_frequent_digram_opencl_direct(
     }
     
     // Get the OpenCL context and queue
-    let context = &gpu_context.context;
-    let queue = &gpu_context.queue;
+    let _queue = &gpu_context.queue;
     
     // Get work group size information
     let max_work_group_size = gpu_context.get_recommended_work_group_size()
@@ -456,7 +456,7 @@ fn find_most_frequent_digram_opencl_direct(
         None => {
             let data = sequence.get_data();
             Buffer::builder()
-                .queue(queue.clone())
+                .queue(gpu_context.queue.clone())
                 .flags(ocl::flags::MEM_READ_ONLY)
                 .len(data.len())
                 .copy_host_slice(data)
@@ -470,7 +470,7 @@ fn find_most_frequent_digram_opencl_direct(
     
     // Create a buffer for counts
     let counts_buffer = Buffer::<u32>::builder()
-        .queue(queue.clone())
+        .queue(gpu_context.queue.clone())
         .flags(ocl::flags::MEM_READ_WRITE)
         .len(max_digrams)
         .fill_val(0u32)
@@ -485,12 +485,12 @@ fn find_most_frequent_digram_opencl_direct(
     let kernel = Kernel::builder()
         .program(program)
         .name("compute_digram_hashes")
-        .queue(queue.clone())
+        .queue(gpu_context.queue.clone())
         .global_work_size(seq_len - 1)
         .local_work_size(max_work_group_size)
         .arg(&symbols_buffer)
         .arg(seq_len as u32)
-        .arg(reverse_aware as u32)
+        .arg(_reverse_aware as u32)
         .arg(&counts_buffer)
         .build()
         .map_err(|e| anyhow!("Failed to build digram counting kernel: {}", e))?;
@@ -533,7 +533,7 @@ fn find_most_frequent_digram_opencl_direct(
         let sym1 = sequence.get_symbol(i);
         let sym2 = sequence.get_symbol(i + 1);
         
-        let key_tuple = DigramTable::canonical_key((&sym1, &sym2), reverse_aware);
+        let key_tuple = DigramTable::canonical_key((&sym1, &sym2), _reverse_aware);
         let key_hash = custom_hash(&key_tuple);
         
         if key_hash == max_key {
@@ -553,13 +553,13 @@ pub struct GpuDigramCounts {
 /// Count digrams using GPU acceleration with OpenCL
 pub fn count_digrams_gpu(
     sequence: &GpuSequence,
-    reverse_aware: bool,
+    _reverse_aware: bool,
     gpu_context: &GpuContext
 ) -> Result<GpuDigramCounts> {
     // Get hashes for all digrams
     let hashes = compute_digram_hashes_opencl(
         &sequence.data,
-        reverse_aware,
+        _reverse_aware,
         gpu_context
     ).map_err(|e| anyhow!("Failed to compute digram hashes: {:?}", e))?;
     
@@ -583,7 +583,7 @@ pub fn is_opencl_available() -> bool {
 
 pub fn compute_digram_hashes_opencl(
     sequence: &[u8],
-    reverse_aware: bool,
+    _reverse_aware: bool,
     gpu_context: &GpuContext,
 ) -> Result<Vec<u64>, ocl::Error> {
     let seq_len = sequence.len();
@@ -662,7 +662,7 @@ pub fn compute_digram_hashes_opencl(
         .local_work_size(local_work_size)
         .arg(&seq_buffer)
         .arg(seq_len as u32)
-        .arg(reverse_aware as u32)
+        .arg(_reverse_aware as u32)
         .arg(&hash_buffer)
         .build()?;
 
@@ -680,7 +680,7 @@ pub fn compute_digram_hashes_opencl(
 
 pub fn populate_opencl(
     sequence: &[Symbol],
-    reverse_aware: bool,
+    _reverse_aware: bool,
     gpu_context: &GpuContext,
 ) -> Result<HashMap<u64, Vec<(usize, (Symbol, Symbol))>>, ocl::Error> {
     if sequence.len() < 2 { // Handle sequences too short for digrams
@@ -705,7 +705,7 @@ pub fn populate_opencl(
         return Ok(HashMap::new());
     }
 
-    let hashes = compute_digram_hashes_opencl(&encoded, reverse_aware, gpu_context)?;
+    let hashes = compute_digram_hashes_opencl(&encoded, _reverse_aware, gpu_context)?;
 
     let mut occurrences = HashMap::new();
     // IMPORTANT: The hashes correspond to digrams in `encoded`.
@@ -718,7 +718,7 @@ pub fn populate_opencl(
     // The loop should iterate up to `hashes.len()`, which is `encoded.len() - 1`.
     // The `sequence` indices for `s1` and `s2` must be correct.
 
-    let current_terminal_idx = 0;
+    let _current_terminal_idx = 0;
     let mut original_indices = Vec::new();
     for (original_idx, sym) in sequence.iter().enumerate() {
         if matches!(sym.symbol_type, SymbolType::Terminal(_)) {
@@ -760,8 +760,8 @@ pub fn populate_opencl(
 pub fn find_most_frequent_terminal_digram_suffix_array(
     sequence: &[EncodedBase],
     min_usage: usize,
-    reverse_aware: bool,
-    suffix_array: Option<&[usize]>
+    _reverse_aware: bool,
+    _suffix_array: Option<&[usize]>
 ) -> Option<(DigramKey, Vec<(usize, (Symbol, Symbol))>)> {
     // Convert to GpuSequence format
     let seq_data: Vec<u8> = sequence.iter().map(|b| b.0).collect();
@@ -773,7 +773,7 @@ pub fn find_most_frequent_terminal_digram_suffix_array(
 
 pub fn find_most_frequent_digram_gpu_optimized(
     sequence: &GpuSequence, 
-    reverse_aware: bool, 
+    _reverse_aware: bool, 
     _gpu_context: &GpuContext, 
     min_count: usize
 ) -> Result<Option<(DigramKeyTuple, usize)>, String> { 
@@ -785,7 +785,7 @@ pub fn find_most_frequent_digram_gpu_optimized(
         let sym2 = sequence.get_symbol(i + 1);
         
         // 1. Get precise canonical key tuple
-        let key_tuple = DigramTable::canonical_key((&sym1, &sym2), reverse_aware);
+        let key_tuple = DigramTable::canonical_key((&sym1, &sym2), _reverse_aware);
 
         let count_entry = counts.entry(key_tuple).or_insert(0);
         *count_entry += 1;

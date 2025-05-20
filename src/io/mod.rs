@@ -1,4 +1,3 @@
-pub mod ncbi;
 pub mod encoding;
 pub mod output_json;
 pub mod output_gfa;

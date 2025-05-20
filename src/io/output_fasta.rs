@@ -14,7 +14,7 @@ pub fn write_grammar_fasta(path: &Path, grammar: &Grammar) -> Result<()> {
     let mut writer = BufWriter::new(file);
     
     // Get the sequence and rules from the grammar
-    let sequence = &grammar.sequence;
+    let _sequence = &grammar.sequence;
     let rules = &grammar.rules;
     
     // Export each rule as a separate FASTA entry
