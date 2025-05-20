@@ -79,6 +79,7 @@ union-find = "0.4.2"
 # Profiling dependencies
 pprof = { version = "0.12.1", features = ["flamegraph", "protobuf-codec"], optional = true }
 tikv-jemallocator = { version = "0.5.4", optional = true } # Added jemalloc for profiling
+fxhash = "0.2.1" # Faster hasher for HashMaps/DashMaps
 
 # Add litemap as a direct dependency to force its version
 litemap = "=0.7.0" # Forcing version for MSRV compatibility

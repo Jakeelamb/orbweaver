@@ -4,6 +4,7 @@ use rayon::prelude::*;
 use std::collections::{HashMap, BinaryHeap};
 use std::hash::{Hash, Hasher};
 use std::cmp::Reverse;
+use fxhash::FxBuildHasher;
 
 /// The key used for indexing digrams in the digram table
 /// For terminals: ((base1, strand1), (base2, strand2))
@@ -29,9 +30,9 @@ pub enum DigramSource {
 /// Stores digram occurrences and handles canonicalization.
 #[derive(Debug)]
 pub struct DigramTable {
-    occurrences_shards: Vec<DashMap<DigramKeyTuple, Vec<(usize, DigramSource)>>>,
+    occurrences_shards: Vec<DashMap<DigramKeyTuple, Vec<(usize, DigramSource)>, FxBuildHasher>>,
     num_shards: usize,
-    pub(crate) rule_references: DashMap<usize, Vec<DigramKeyTuple>>,
+    pub(crate) rule_references: DashMap<usize, Vec<DigramKeyTuple>, FxBuildHasher>,
 }
 
 impl DigramTable {
@@ -39,12 +40,12 @@ impl DigramTable {
         let num_shards = rayon::current_num_threads().max(1);
         let mut occurrences_shards = Vec::with_capacity(num_shards);
         for _ in 0..num_shards {
-            occurrences_shards.push(DashMap::new());
+            occurrences_shards.push(DashMap::with_hasher(FxBuildHasher::default()));
         }
         Self {
             occurrences_shards,
             num_shards,
-            rule_references: DashMap::new(),
+            rule_references: DashMap::with_hasher(FxBuildHasher::default()),
         }
     }
 
@@ -374,12 +375,12 @@ mod tests {
     fn new_test_table(num_shards: usize) -> DigramTable {
         let mut occurrences_shards = Vec::with_capacity(num_shards);
         for _ in 0..num_shards {
-            occurrences_shards.push(DashMap::new());
+            occurrences_shards.push(DashMap::with_hasher(FxBuildHasher::default()));
         }
         DigramTable {
             occurrences_shards,
             num_shards,
-            rule_references: DashMap::new(),
+            rule_references: DashMap::with_hasher(FxBuildHasher::default()),
         }
     }
 } 
