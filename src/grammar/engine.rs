@@ -54,7 +54,7 @@ impl Sequitur {
         let mut symbols = Vec::with_capacity(sequence.len());
         
         for (i, &base) in sequence.iter().enumerate() {
-            symbols.push(Symbol::terminal(i, base, Direction::Forward));
+            symbols.push(Symbol::terminal(i, base, Direction::Forward, None, None));
         }
         
         Ok(Grammar {

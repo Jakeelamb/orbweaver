@@ -23,6 +23,10 @@ pub struct Rule {
     
     /// The hierarchical depth of this rule in the grammar (for analysis)
     pub depth: Option<usize>,
+
+    // NEW FIELD: Stores the calculated assembly index for this rule.
+    // Option<usize> allows it to be None before calculation and usize afterwards.
+    pub assembly_index: Option<usize>,
 }
 
 impl Rule {
@@ -34,6 +38,7 @@ impl Rule {
             usage_count: 0, // Initial usage count is 0, incremented when used
             positions: Vec::new(), // Initialize empty positions
             depth: None,
+            assembly_index: None, // Initialize assembly_index to None
         }
     }
     

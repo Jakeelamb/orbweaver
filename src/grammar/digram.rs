@@ -200,8 +200,8 @@ pub fn find_most_frequent_terminal_digram_suffix_array(
             let base2 = EncodedBase(digram_tuple.1);
             
             // Create temporary symbols for canonical key calculation
-            let sym1 = Symbol::terminal(0, base1, Direction::Forward);
-            let sym2 = Symbol::terminal(1, base2, Direction::Forward);
+            let sym1 = Symbol::terminal(0, base1, Direction::Forward, None, None);
+            let sym2 = Symbol::terminal(1, base2, Direction::Forward, None, None);
             
             // Use DigramTable's canonical_key function to get hash-based key
             let key = crate::grammar::digram_table::DigramTable::canonical_key((&sym1, &sym2), true);
@@ -227,8 +227,8 @@ pub fn find_most_frequent_terminal_digram_suffix_array(
             let base2 = EncodedBase(digram_tuple.1);
             
             // Create temporary symbols for canonical key calculation
-            let sym1 = Symbol::terminal(0, base1, Direction::Forward);
-            let sym2 = Symbol::terminal(1, base2, Direction::Forward);
+            let sym1 = Symbol::terminal(0, base1, Direction::Forward, None, None);
+            let sym2 = Symbol::terminal(1, base2, Direction::Forward, None, None);
             
             // Use DigramTable's canonical_key function to get hash-based key
             let key = crate::grammar::digram_table::DigramTable::canonical_key((&sym1, &sym2), false);
@@ -317,7 +317,7 @@ mod tests {
     }
 
     fn create_terminal(id: u32, base: u8, strand: Direction) -> Symbol {
-        Symbol::terminal(id as usize, EncodedBase(base), strand)
+        Symbol::terminal(id as usize, EncodedBase(base), strand, None, None)
     }
 
     fn create_nonterminal(id: u32, rule_id: u32, strand: Direction) -> Symbol {

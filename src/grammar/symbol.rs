@@ -58,37 +58,43 @@ pub struct Symbol {
     pub id: usize, // Instance ID of the symbol in a sequence
     pub symbol_type: SymbolType,
     pub strand: Direction,
+    pub source_grammar_id: Option<usize>, // Index of the source sequence/chromosome
+    pub original_pos: Option<usize>,      // Original 0-indexed position in the source sequence
 }
 
 impl Symbol {
     /// Create a new terminal symbol.
-    pub fn terminal(id: usize, base: EncodedBase, strand: Direction) -> Self {
-        Symbol::new(id, SymbolType::Terminal(base), strand)
+    pub fn terminal(id: usize, base: EncodedBase, strand: Direction, source_grammar_id: Option<usize>, original_pos: Option<usize>) -> Self {
+        Symbol::new(id, SymbolType::Terminal(base), strand, source_grammar_id, original_pos)
     }
     
     /// Create a new non-terminal symbol.
     pub fn non_terminal(id: usize, rule_id: usize, strand: Direction) -> Self {
-        Symbol::new(id, SymbolType::NonTerminal(rule_id), strand)
+        Symbol::new(id, SymbolType::NonTerminal(rule_id), strand, None, None)
     }
     
     /// Get the reverse complement of this symbol.
     pub fn reverse_complement(&self) -> Self {
         match self.symbol_type {
             SymbolType::Terminal(base) => Symbol {
-                id: self.id, // Keep the same instance ID for now, or use a convention?
+                id: self.id,
                 symbol_type: SymbolType::Terminal(base.revcomp()),
                 strand: self.strand.flip(),
+                source_grammar_id: self.source_grammar_id, // Preserve source ID
+                original_pos: self.original_pos,        // Preserve original position
             },
             SymbolType::NonTerminal(rule_id) => Symbol {
                 id: self.id,
                 symbol_type: SymbolType::NonTerminal(rule_id), // Rule ID doesn't change
                 strand: self.strand.flip(),
+                source_grammar_id: self.source_grammar_id, // Preserve source ID for non-terminals if it exists
+                original_pos: self.original_pos,        // Preserve original position if it exists
             },
         }
     }
 
-    pub fn new(id: usize, symbol_type: SymbolType, strand: Direction) -> Self {
-        Symbol { id, symbol_type, strand }
+    pub fn new(id: usize, symbol_type: SymbolType, strand: Direction, source_grammar_id: Option<usize>, original_pos: Option<usize>) -> Self {
+        Symbol { id, symbol_type, strand, source_grammar_id, original_pos }
     }
 }
 

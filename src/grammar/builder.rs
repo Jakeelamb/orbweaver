@@ -10,6 +10,7 @@ use std::time::Instant;
 use crate::gpu::GpuContext;
 use crate::gpu::digram::GpuSequence;
 use crate::grammar::engine::Grammar;
+use crate::analysis::assembly_index::calculate_rule_assembly_indices; // Added for Assembly Index
 use log;
 
 /// Builds a grammar (set of rules) by iteratively replacing 
@@ -110,14 +111,15 @@ impl GrammarBuilder {
 
     /// Initializes the builder with the input sequence.
     /// Converts the raw byte sequence into Terminal Symbols.
-    fn initialize_sequence(&mut self, initial_sequence: &[EncodedBase]) {
+    fn initialize_sequence(&mut self, initial_sequence: &[EncodedBase], source_grammar_id: usize) {
         self.sequence = initial_sequence
             .iter()
             .enumerate()
-            .map(|(_i, &base)| {
+            .map(|(i, &base)| {
                 // Initial symbols are always on the '+' strand? Or does this need context?
                 // Assume '+' for now.
-                Symbol::terminal(_i, base, Direction::Forward)
+                // Use 'i' (original position) as the symbol's ID for terminals.
+                Symbol::terminal(i, base, Direction::Forward, Some(source_grammar_id), Some(i))
             })
             .collect();
         println!("Initialized sequence with {} symbols.", self.sequence.len());
@@ -201,6 +203,7 @@ impl GrammarBuilder {
                             usage_count: count,
                             positions: occurrences.iter().map(|(pos, _source)| *pos).collect(),
                             depth: None,
+                            assembly_index: None, // Initialize assembly_index
                         };
 
                         self.rules.insert(self.next_rule_id, new_rule);
@@ -257,6 +260,7 @@ impl GrammarBuilder {
                          usage_count: count,
                          positions: occurrences.iter().map(|(pos, _)| *pos).collect(),
                          depth: None,
+                         assembly_index: None, // Initialize assembly_index
                      };
                      self.rules.insert(self.next_rule_id, new_rule);
 
@@ -338,25 +342,27 @@ impl GrammarBuilder {
     }
 
     /// Process a chunk of the sequence incrementally
-    pub fn process_sequence_chunk(&mut self, chunk: &[EncodedBase]) -> Result<()> {
+    pub fn process_sequence_chunk(&mut self, chunk: &[EncodedBase], source_grammar_id: usize, chunk_offset: usize) -> Result<()> {
         let chunk_start_time = Instant::now();
         self.chunk_count += 1;
         self.total_bases_processed += chunk.len();
         
-        if self.sequence.is_empty() {
+        if self.sequence.is_empty() && chunk_offset == 0 { // Ensure it's truly the first chunk of a sequence
             // First chunk - initialize the sequence
-            self.initialize_sequence(chunk);
+            self.initialize_sequence(chunk, source_grammar_id);
         } else {
             // Add this chunk to the existing sequence
-            let start_id = self.sequence.len();
+            let start_symbol_id = self.sequence.len(); // ID within the current builder's sequence context
             let chunk_symbols: Vec<Symbol> = chunk
                 .iter()
                 .enumerate()
                 .map(|(i, &base)| {
-                    Symbol::terminal(start_id + i, base, Direction::Forward)
+                    // start_symbol_id + i is the ID in the context of this GrammarBuilder's sequence
+                    // chunk_offset + i is the original position in the source file/chromosome
+                    Symbol::terminal(start_symbol_id + i, base, Direction::Forward, Some(source_grammar_id), Some(chunk_offset + i))
                 })
                 .collect();
-            
+        
             self.sequence.extend(chunk_symbols);
         }
         
@@ -447,10 +453,10 @@ impl GrammarBuilder {
 
     /// Builds a grammar from the given sequence.
     /// This is the main entry point for grammar construction.
-    pub fn build_grammar(&mut self, initial_sequence: &[EncodedBase]) -> Result<()> {
+    pub fn build_grammar(&mut self, initial_sequence: &[EncodedBase], source_grammar_id: usize) -> Result<()> {
         // Use GPU acceleration if context is available
         if self.gpu_context.is_some() {
-            match self.build_grammar_with_gpu(initial_sequence) {
+            match self.build_grammar_with_gpu(initial_sequence, source_grammar_id) {
                 Ok(_) => return Ok(()),
                 Err(e) => {
                     println!("GPU processing failed: {}. Falling back to CPU.", e);
@@ -464,12 +470,13 @@ impl GrammarBuilder {
         
         // Initialize the sequence if not in streaming mode
         if !self.stream_mode {
-            self.initialize_sequence(initial_sequence);
+            self.initialize_sequence(initial_sequence, source_grammar_id);
             // Debug: print first 10 symbols after initialization
             println!("DEBUG: First 10 symbols after initialization: {:#?}", &self.sequence.iter().take(10).collect::<Vec<_>>());
         } else {
             // In streaming mode, we process the chunk directly
-            return self.process_sequence_chunk(initial_sequence);
+            // build_grammar is called with a single sequence, so chunk_offset is 0
+            return self.process_sequence_chunk(initial_sequence, source_grammar_id, 0);
         }
         
         // Build the digram table
@@ -509,25 +516,35 @@ impl GrammarBuilder {
         // Calculate rule depths for hierarchy analysis
         self.calculate_rule_depths();
         
+        // Calculate Assembly Indices for all rules
+        match calculate_rule_assembly_indices(&mut self.rules) {
+            Ok(_) => log::debug!("Assembly indices calculated successfully."),
+            Err(e) => {
+                log::warn!("Failed to calculate assembly indices: {}. Proceeding without them.", e);
+                // Decide if this should be a hard error or just a warning.
+                // For now, logging as warning and proceeding.
+            }
+        }
+
         // Print stats
         self.metrics.step_count = steps;
         println!("Grammar construction completed in {:?}", start.elapsed());
         println!("Rules: {}, Steps: {}", self.rules.len(), steps);
-        
+        log::info!("Grammar construction complete. Total rules: {}, Max depth: {}", self.rules.len(), self.get_max_rule_depth());
         Ok(())
     }
     
     /// Process the grammar using GPU acceleration, including digram finding and suffix array construction.
-    pub fn build_grammar_with_gpu(&mut self, initial_sequence: &[EncodedBase]) -> Result<()> {
+    pub fn build_grammar_with_gpu(&mut self, initial_sequence: &[EncodedBase], source_grammar_id: usize) -> Result<()> {
         if self.gpu_context.is_none() {
             log::warn!("GPU context not provided, falling back to CPU implementation.");
-            return self.build_grammar(initial_sequence);
+            return self.build_grammar(initial_sequence, source_grammar_id); // Pass source_grammar_id to fallback
         }
         log::info!("Starting grammar construction with GPU acceleration...");
         // Clone the GpuContext to avoid borrow issues
         let gpu_context = self.gpu_context.as_ref().unwrap().clone(); 
 
-        self.initialize_sequence(initial_sequence);
+        self.initialize_sequence(initial_sequence, source_grammar_id);
         let mut current_rule_id_counter = 0; 
 
         loop {
@@ -560,6 +577,7 @@ impl GrammarBuilder {
                         usage_count: occurrences_gpu.len(),
                         positions: occurrences_gpu.iter().map(|(pos, _syms)| *pos).collect(),
                         depth: None, 
+                        assembly_index: None, // Initialize assembly_index
                     };
                     self.rules.insert(current_rule_id_counter, new_rule);
 
@@ -582,7 +600,21 @@ impl GrammarBuilder {
             }
         }
 
-        self.finalize_grammar()
+        self.finalize_grammar()?;
+
+        // Calculate rule depths for hierarchy analysis
+        self.calculate_rule_depths();
+
+        // Calculate Assembly Indices for all rules
+        match calculate_rule_assembly_indices(&mut self.rules) {
+            Ok(_) => log::debug!("Assembly indices calculated successfully after GPU build."),
+            Err(e) => {
+                log::warn!("Failed to calculate assembly indices after GPU build: {}. Proceeding without them.", e);
+            }
+        }
+
+        log::info!("GPU-accelerated grammar construction complete. Total rules: {}, Max depth: {}", self.rules.len(), self.get_max_rule_depth());
+        Ok(())
     }
 
     /// Calculate the hierarchical depth of each rule in the grammar using recursion and memoization.
@@ -704,14 +736,14 @@ impl GrammarBuilder {
     }
 
     /// Process a chunk of raw bytes by converting them to EncodedBase
-    pub fn process_bytes_chunk(&mut self, chunk: &[u8]) -> Result<()> {
-        // Convert from bytes to EncodedBase
+    pub fn process_bytes_chunk(&mut self, chunk: &[u8], source_grammar_id: usize, chunk_offset: usize) -> Result<()> {
+        // Convert raw bytes to EncodedBase
         let encoded_chunk: Vec<EncodedBase> = chunk.iter()
             .filter_map(|&b| EncodedBase::from_base(b))
             .collect();
         
         // Use the regular process_sequence_chunk method
-        self.process_sequence_chunk(&encoded_chunk)
+        self.process_sequence_chunk(&encoded_chunk, source_grammar_id, chunk_offset)
     }
 
     /// Evicts rules to keep the number of rules below a maximum.
@@ -1068,8 +1100,8 @@ mod tests {
     fn test_simple_repetition() -> Result<()> {
         let mut builder = GrammarBuilder::new(2, false);
         let seq = encode_seq(b"AAAAAA");
-        builder.build_grammar(&seq)?;
-        let (final_sequence, rules) = builder.get_grammar();
+        builder.build_grammar(&seq, 0)?;
+        let (_, rules) = builder.get_grammar();
         // There should be a rule of length 2 with A then A
         let has_aa_rule = rules.values().any(|r| r.symbols.len() == 2 &&
             matches!(r.symbols[0].symbol_type, SymbolType::Terminal(t) if t == EncodedBase(0)) &&
@@ -1082,7 +1114,7 @@ mod tests {
     fn test_overlapping_patterns() -> Result<()> {
         let mut builder = GrammarBuilder::new(2, false);
         let seq = encode_seq(b"ABCABCABC");
-        builder.build_grammar(&seq)?;
+        builder.build_grammar(&seq, 0)?;
         let (_final_sequence, rules) = builder.get_grammar();
         // There should be at least one rule of length 2 with valid terminal content
         let found = rules.values().any(|r| r.symbols.len() == 2 &&
@@ -1096,7 +1128,7 @@ mod tests {
     fn test_nested_rules() -> Result<()> {
         let mut builder = GrammarBuilder::new(2, false);
         let seq = encode_seq(b"ACACACACACACACAC");
-        builder.build_grammar(&seq)?;
+        builder.build_grammar(&seq, 0)?;
         let (_final_sequence, rules) = builder.get_grammar();
         // There should be at least one rule that contains a non-terminal (nested rule)
         let found = rules.values().any(|r| r.symbols.iter().any(|s| matches!(s.symbol_type, SymbolType::NonTerminal(_))));
@@ -1108,7 +1140,7 @@ mod tests {
     fn test_rule_utility() -> Result<()> {
         let mut builder = GrammarBuilder::new(2, false);
         let seq = encode_seq(b"AAAACCCC");
-        builder.build_grammar(&seq)?;
+        builder.build_grammar(&seq, 0)?;
         let (_final_sequence, rules) = builder.get_grammar();
         // Find rules by content
         let aa_rule = rules.values().find(|r| r.symbols.len() == 2 &&
@@ -1126,7 +1158,7 @@ mod tests {
     fn test_no_frequent_digrams() -> Result<()> {
         let mut builder = GrammarBuilder::new(2, false);
         let seq = encode_seq(b"ACGT");
-        builder.build_grammar(&seq)?;
+        builder.build_grammar(&seq, 0)?;
         let (final_sequence, rules) = builder.get_grammar();
         assert!(rules.is_empty());
         assert_eq!(final_sequence.len(), 4);
@@ -1140,7 +1172,7 @@ mod tests {
     fn test_empty_sequence() -> Result<()> {
         let mut builder = GrammarBuilder::new(2, false);
         let seq = encode_seq(b"");
-        builder.build_grammar(&seq)?;
+        builder.build_grammar(&seq, 0)?;
         let (final_sequence, rules) = builder.get_grammar();
         assert!(rules.is_empty());
         assert!(final_sequence.is_empty());
@@ -1151,7 +1183,7 @@ mod tests {
     fn test_single_base_sequence() -> Result<()> {
         let mut builder = GrammarBuilder::new(2, false);
         let seq = encode_seq(b"A");
-        builder.build_grammar(&seq)?;
+        builder.build_grammar(&seq, 0)?;
         let (final_sequence, rules) = builder.get_grammar();
         assert!(rules.is_empty());
         assert_eq!(final_sequence.len(), 1);
@@ -1163,7 +1195,7 @@ mod tests {
     fn test_reverse_complement_aware() -> Result<()> {
         let mut builder_aware = GrammarBuilder::new(2, true);
         let seq = encode_seq(b"ACGTACGT");
-        builder_aware.build_grammar(&seq)?;
+        builder_aware.build_grammar(&seq, 0)?;
         let (_final_sequence_aware, rules_aware) = builder_aware.get_grammar();
         assert!(!rules_aware.is_empty(), "Reverse aware should find repeating patterns");
         Ok(())

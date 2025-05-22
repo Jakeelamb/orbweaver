@@ -447,7 +447,7 @@ async fn main() -> Result<()> {
     info!("Output will be saved to: {}", run_specific_output_dir.display());
 
     // --- Main Processing Logic ---
-    let result: Result<(Grammar, HashMap<String, PathBuf>)> = if args.streaming {
+    let result: Result<(Grammar, HashMap<String, PathBuf>, Vec<(String, usize)>)> = if args.streaming {
         process_streaming_mode(&args, None, &run_specific_output_dir, &initial_checkpoints).await
     } else if args.chunk_size > 0 || args.adaptive_chunking {
         // TODO: Pass GPU context to chunked mode if/when it supports it
@@ -457,12 +457,9 @@ async fn main() -> Result<()> {
     };
 
     match result {
-        Ok((final_grammar, final_checkpoints)) => {
+        Ok((final_grammar, final_checkpoints, chromosome_details)) => {
             info!("Grammar construction completed successfully.");
-            if args.stats {
-                calculate_and_print_stats()?;
-            }
-            generate_outputs(&final_grammar, &args, &run_specific_output_dir)?;
+            generate_outputs(&final_grammar, &args, &run_specific_output_dir, &chromosome_details)?;
             
             // Update and save metadata as completed
             metadata_to_save.status = "completed".to_string();
@@ -494,7 +491,7 @@ async fn main() -> Result<()> {
 }
 
 /// Generates all requested output files from the final grammar.
-fn generate_outputs(grammar: &Grammar, args: &OrbweaverArgs, run_specific_output_dir: &PathBuf) -> Result<()> {
+fn generate_outputs(grammar: &Grammar, args: &OrbweaverArgs, run_specific_output_dir: &PathBuf, chromosome_details: &[(String, usize)]) -> Result<()> {
     info!("Generating outputs in directory: {:?}", run_specific_output_dir);
 
     let dot_options = DotOptions {
@@ -563,7 +560,9 @@ fn generate_outputs(grammar: &Grammar, args: &OrbweaverArgs, run_specific_output
 
     if args.stats {
         info!("Calculating and printing statistics...");
-        calculate_and_print_stats()?;
+        let stats_path = run_specific_output_dir.join("grammar_stats.txt");
+        calculate_and_print_stats(grammar, &stats_path, args.stats, chromosome_details)
+            .with_context(|| format!("Failed to calculate or write stats to {:?}", stats_path))?;
     }
 
     info!("All requested outputs generated.");
@@ -576,7 +575,7 @@ async fn process_standard_mode(
     gpu_context: Option<&GpuContext>,
     run_specific_output_dir: &PathBuf,
     initial_checkpoints: &HashMap<String, PathBuf>
-) -> Result<(Grammar, HashMap<String, PathBuf>)> { 
+) -> Result<(Grammar, HashMap<String, PathBuf>, Vec<(String, usize)>)> { 
     println!("Using standard mode (loading entire sequence asynchronously)");
 
     let checkpoints_dir = run_specific_output_dir.join("checkpoints");
@@ -620,6 +619,10 @@ async fn process_standard_mode(
     println!("Processing {} sequences in total", selected_sequences.len());
     
     let total_len_estimate = selected_sequences.iter().map(|(_, b)| b.len()).sum();
+
+    let chromosome_details: Vec<(String, usize)> = selected_sequences.iter()
+        .map(|(name, bases)| (name.clone(), bases.len()))
+        .collect();
 
     let mut grammars = vec![];
     let args_arc = Arc::new(args.clone());
@@ -674,14 +677,14 @@ async fn process_standard_mode(
 
                 if use_gpu_override && task_gpu_context.is_some() {
                     grammar_builder = grammar_builder.with_gpu(task_gpu_context.as_ref());
-                    grammar_builder.build_grammar_with_gpu(&encoded_bases)?;
+                    grammar_builder.build_grammar_with_gpu(&encoded_bases, seq_idx)?;
                 } else {
                     if use_gpu && task_gpu_context.is_none() {
                         println!("Warning: GPU mode selected, but GPU context is unavailable for sequence {}. Falling back to CPU.", record_id_owned);
                     } else if use_gpu_override {
                         println!("INFO: GPU path forced off for debugging.");
                     }
-                    grammar_builder.build_grammar(&encoded_bases)?;
+                    grammar_builder.build_grammar(&encoded_bases, seq_idx)?;
                 }
                 
                 let (sequence, rules) = grammar_builder.get_grammar();
@@ -700,12 +703,12 @@ async fn process_standard_mode(
 
                 if use_gpu && task_gpu_context.is_some() {
                     grammar_builder = grammar_builder.with_gpu(task_gpu_context.as_ref());
-                    grammar_builder.build_grammar_with_gpu(&encoded_bases_fallback)?;
+                    grammar_builder.build_grammar_with_gpu(&encoded_bases_fallback, seq_idx)?;
                 } else {
                     if use_gpu && task_gpu_context.is_none() {
                          println!("Warning: GPU mode selected (no encoding), but GPU context is unavailable for sequence {}. Falling back to CPU.", record_id_owned);
                     }
-                    grammar_builder.build_grammar(&encoded_bases_fallback)?;
+                    grammar_builder.build_grammar(&encoded_bases_fallback, seq_idx)?;
                 }
                 let (sequence, rules) = grammar_builder.get_grammar();
                 let max_depth = grammar_builder.get_max_rule_depth();
@@ -744,7 +747,7 @@ async fn process_standard_mode(
     println!("Merging complete. Final grammar has {} rules.", merged_grammar.rules.len());
     // println!("Total merging time: {:?}", merge_metrics.merge_time);
     
-    Ok((merged_grammar, current_run_checkpoints))
+    Ok((merged_grammar, current_run_checkpoints, chromosome_details))
 }
 
 async fn process_streaming_mode(
@@ -752,7 +755,7 @@ async fn process_streaming_mode(
     gpu_context: Option<&GpuContext>,
     run_specific_output_dir: &PathBuf,
     initial_checkpoints: &HashMap<String, PathBuf>
-) -> Result<(Grammar, HashMap<String, PathBuf>)> {
+) -> Result<(Grammar, HashMap<String, PathBuf>, Vec<(String, usize)>)> {
     println!("Using streaming mode.");
 
     let checkpoints_dir = run_specific_output_dir.join("checkpoints");
@@ -823,7 +826,7 @@ async fn process_streaming_mode(
                 }
 
                 if !encoded_chunk_bases.is_empty() {
-                    grammar_builder.process_sequence_chunk(&encoded_chunk_bases)
+                    grammar_builder.process_sequence_chunk(&encoded_chunk_bases, file_idx, record_processed_bases)
                         .with_context(|| format!("Failed to process sequence chunk for record {} from file {}", record.id(), input_file_path.display()))?;
                     record_processed_bases += encoded_chunk_bases.len();
                 }
@@ -868,12 +871,12 @@ async fn process_streaming_mode(
     }
 
     if grammars.len() == 1 {
-        Ok((grammars.remove(0), current_run_checkpoints))
+        Ok((grammars.remove(0), current_run_checkpoints, Vec::new())) // Return empty vec for chromosome_details
     } else {
         println!("Merging {} grammars from streaming mode...", grammars.len());
         let dummy_config = ChunkingConfig::default();
         merge_grammars(grammars, &dummy_config, total_bases_processed_estimate)
-             .map(|(g, _metrics)| (g, current_run_checkpoints))
+             .map(|(g, _metrics)| (g, current_run_checkpoints, Vec::new())) // Return empty vec for chromosome_details
             .context("Failed to merge grammars from streaming mode")
     }
 }
@@ -882,7 +885,7 @@ fn process_chunked_mode(
     args: &OrbweaverArgs, 
     run_specific_output_dir: &PathBuf,
     initial_checkpoints: &HashMap<String, PathBuf>
-) -> Result<(Grammar, HashMap<String, PathBuf>)> {
+) -> Result<(Grammar, HashMap<String, PathBuf>, Vec<(String, usize)>)> {
     if args.input_files.len() > 1 {
          return Err(anyhow::anyhow!("Chunked mode currently supports only a single input FASTA file. Please provide one file or use standard/streaming mode for multiple files."));
     }
@@ -955,7 +958,7 @@ fn process_chunked_mode(
     // final_checkpoints.insert(format!("{}_final", seq_id), checkpoint_path);
     // println!("Saved final chunked grammar checkpoint for {} to {}", seq_id, checkpoint_filename);
 
-    Ok((grammar, final_checkpoints))
+    Ok((grammar, final_checkpoints, Vec::new())) // Return empty vec for chromosome_details
 }
 
 fn encode_dna(bases: &[u8]) -> Vec<EncodedBase> {

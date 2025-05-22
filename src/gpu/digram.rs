@@ -77,7 +77,7 @@ impl GpuSequence {
         }
         
         let base = EncodedBase(self.data[pos]);
-        Symbol::terminal(pos, base, Direction::Forward)
+        Symbol::terminal(pos, base, Direction::Forward, None, None)
     }
     
     /// Upload the sequence to GPU memory using OpenCL
@@ -148,8 +148,8 @@ impl GpuSequence {
             let base1 = EncodedBase(data[i]);
             let base2 = EncodedBase(data[i+1]);
             
-            let sym1 = Symbol::terminal(i, base1, Direction::Forward);
-            let sym2 = Symbol::terminal(i+1, base2, Direction::Forward);
+            let sym1 = Symbol::terminal(i, base1, Direction::Forward, None, None);
+            let sym2 = Symbol::terminal(i+1, base2, Direction::Forward, None, None);
             
             let key_tuple = DigramTable::canonical_key((&sym1, &sym2), _reverse_aware);
             let key_hash = custom_hash(&key_tuple);
@@ -191,8 +191,8 @@ impl GpuSequence {
             let base1 = EncodedBase(data[i]);
             let base2 = EncodedBase(data[i+1]);
             
-            let sym1 = Symbol::terminal(i, base1, Direction::Forward);
-            let sym2 = Symbol::terminal(i+1, base2, Direction::Forward);
+            let sym1 = Symbol::terminal(i, base1, Direction::Forward, None, None);
+            let sym2 = Symbol::terminal(i+1, base2, Direction::Forward, None, None);
             
             let key_tuple = DigramTable::canonical_key((&sym1, &sym2), false);
             let key_hash = custom_hash(&key_tuple);
@@ -221,8 +221,8 @@ impl GpuSequence {
             let base1 = EncodedBase(data[pos]);
             let base2 = EncodedBase(data[pos+1]);
             
-            let sym1 = Symbol::terminal(pos, base1, Direction::Forward);
-            let sym2 = Symbol::terminal(pos+1, base2, Direction::Forward);
+            let sym1 = Symbol::terminal(pos, base1, Direction::Forward, None, None);
+            let sym2 = Symbol::terminal(pos+1, base2, Direction::Forward, None, None);
             
             occurrences.push((pos, (sym1, sym2)));
         }
@@ -792,7 +792,7 @@ pub fn find_most_frequent_digram_gpu_optimized(
     }
 
     // Find the most frequent digram
-    let mut max_key = DigramKeyTuple::new(&Symbol::terminal(0, EncodedBase(0), Direction::Forward), &Symbol::terminal(1, EncodedBase(1), Direction::Forward));
+    let mut max_key = DigramKeyTuple::new(&Symbol::terminal(0, EncodedBase(0), Direction::Forward, None, None), &Symbol::terminal(1, EncodedBase(1), Direction::Forward, None, None));
     let mut max_count = 0;
 
     for (key, count) in &counts {

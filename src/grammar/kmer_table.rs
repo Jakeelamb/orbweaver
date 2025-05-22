@@ -44,7 +44,7 @@ impl KmerTable {
 
         // 1. Normalize original symbols to have ID 0 and Forward strand for comparison purposes.
         let kmer_fwd_norm: Vec<Symbol> = symbols.iter()
-            .map(|s| Symbol::new(0, s.symbol_type, Direction::Forward))
+            .map(|s| Symbol::new(0, s.symbol_type, Direction::Forward, None, None))
             .collect();
 
         if !reverse_aware {
@@ -72,7 +72,7 @@ impl KmerTable {
 
             // 3. Normalize this reverse complement sequence to ID 0 and Forward strand.
             let kmer_rc_seq_fwd_norm: Vec<Symbol> = rev_comp_seq.iter()
-                .map(|s| Symbol::new(0, s.symbol_type, Direction::Forward))
+                .map(|s| Symbol::new(0, s.symbol_type, Direction::Forward, None, None))
                 .collect();
             
             // 4. Compare the two normalized, forward-stranded Vec<Symbol>s and return the smaller.
@@ -314,9 +314,9 @@ mod tests {
 
         // The expected canonical form is the normalized forward k-mer (ACG) because A < C
         let expected_canonical_form: Vec<Symbol> = vec![
-            Symbol::new(0, s1.symbol_type, Direction::Forward), // A0F
-            Symbol::new(0, s2.symbol_type, Direction::Forward), // C0F
-            Symbol::new(0, s3.symbol_type, Direction::Forward)  // G0F
+            Symbol::new(0, s1.symbol_type, Direction::Forward, None, None), // A0F
+            Symbol::new(0, s2.symbol_type, Direction::Forward, None, None), // C0F
+            Symbol::new(0, s3.symbol_type, Direction::Forward, None, None)  // G0F
         ];
         // println!("DEBUG: expected_canonical_form = {:?}", expected_canonical_form);
 

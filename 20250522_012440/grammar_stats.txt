@@ -1,0 +1,12 @@
+--- Grammar Statistics ---
+Number of Rules: 2495
+Compressed Sequence Length (Symbols): 2094877
+Compressed Sequence Length (Base Pairs): 10485760
+Maximum Rule Depth: 5
+Total Symbols in Rule Definitions: 4990
+Average Symbols per Rule: 2.00
+Rules with Assembly Index calculated: 2495
+Number of Chromosomes/Sequences: 1
+--- End of Statistics ---
+
+Total Whole Genome Ensemble Assembly Index: 8390883

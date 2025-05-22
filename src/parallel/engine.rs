@@ -15,6 +15,7 @@ use union_find::UnionFind;
 use union_find::QuickUnionUf;
 use union_find::UnionBySize;
 use crate::gpu::GpuContext; // Import GpuContext
+use crate::analysis::assembly_index::calculate_rule_assembly_indices; // Added for Assembly Index
 
 /// Metrics for the parallel Sequitur algorithm
 #[derive(Debug, Default)]
@@ -77,13 +78,13 @@ pub fn parallel_sequitur(
              // Build grammar using GPU or CPU based on config and context availability
              if config.use_gpu && gpu_context_param.is_some() {
                  builder = builder.with_gpu(gpu_context_param);
-                 builder.build_grammar_with_gpu(&chunk.data)?;
+                 builder.build_grammar_with_gpu(&chunk.data, chunk.index)?;
              } else {
                  if config.use_gpu && gpu_context_param.is_none() {
                      // Print warning only once or use logging if available
                      // For now, skipping the print to avoid excessive output
                  }
-                 builder.build_grammar(&chunk.data)?;
+                 builder.build_grammar(&chunk.data, chunk.index)?;
              }
              
              let (seq, rules) = builder.get_grammar();
@@ -140,7 +141,7 @@ pub fn merge_grammars(grammars: Vec<Grammar>, _config: &ChunkingConfig, total_se
 
     // Deduplicate rules using the union-find approach, passing grammars with IDs
     let deduplication_start = Instant::now();
-    let (rule_map, merged_rules, rule_origins) = deduplicate_rules(&grammars_with_ids); // Pass grammars with IDs
+    let (rule_map, mut merged_rules, rule_origins) = deduplicate_rules(&grammars_with_ids); // Pass grammars with IDs
     metrics.deduplication_time = deduplication_start.elapsed();
     // Calculate rules_before_merge here using input `grammars`
     metrics.rules_before_merge = grammars_with_ids.iter().map(|(_, g)| g.rules.len()).sum(); // Use grammars_with_ids
@@ -199,6 +200,15 @@ pub fn merge_grammars(grammars: Vec<Grammar>, _config: &ChunkingConfig, total_se
 
     // Calculate merge time excluding deduplication
     metrics.merge_time = start_merge.elapsed().saturating_sub(metrics.deduplication_time);
+
+    // Calculate Assembly Indices for the merged rules
+    // It's important to operate on a mutable reference if the function modifies the rules in place.
+    // Assuming merged_rules needs to be mutable for this call, or the function handles it.
+    // If calculate_rule_assembly_indices doesn't modify in place but returns new map, adjust accordingly.
+    if let Err(e) = calculate_rule_assembly_indices(&mut merged_rules) {
+        eprintln!("Warning: Failed to calculate assembly indices during grammar merge: {}. Proceeding without them.", e);
+        // Depending on policy, this could be a hard error: return Err(e.into());
+    }
 
     // Calculate final max depth
     let max_depth = calculate_max_depth(&merged_rules);
@@ -316,6 +326,8 @@ fn deduplicate_rules(grammars_with_ids: &[(usize, Grammar)])
                         id: original_symbol.id, 
                         symbol_type: SymbolType::NonTerminal(*final_new_child_id),
                         strand: original_symbol.strand,
+                        source_grammar_id: None, // Not directly from an original sequence after merge
+                        original_pos: None,      // Not directly from an original sequence after merge
                     });
                 } else {
                     eprintln!("Warning: Could not remap non-terminal ID {} (from grammar {}) in rule {}", old_child_id, origin_grammar_id, final_id);
@@ -333,6 +345,7 @@ fn deduplicate_rules(grammars_with_ids: &[(usize, Grammar)])
             usage_count: total_usage_count, // Use summed usage count
             positions: Vec::new(),     // Positions are lost/invalid after merge
             depth: None,               // Depth needs recalculation
+            assembly_index: None,      // Initialize assembly_index
         });
     }
 
