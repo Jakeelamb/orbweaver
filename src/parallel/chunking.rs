@@ -28,7 +28,7 @@ pub struct ChunkingConfig {
     /// Maximum memory usage per chunk (bytes)
     pub max_memory_per_chunk: Option<usize>,
     /// Whether to use GPU acceleration
-    pub use_gpu: bool,
+    pub gpu_context: Option<std::sync::Arc<crate::gpu::GpuContext>>,
 }
 
 impl Default for ChunkingConfig {
@@ -42,7 +42,7 @@ impl Default for ChunkingConfig {
             show_progress: true,
             adaptive_chunking: false,
             max_memory_per_chunk: None,
-            use_gpu: false,
+            gpu_context: None,
         }
     }
 }
@@ -254,8 +254,9 @@ where
             
             // Update progress if tracking
             if let Some(ref progress) = progress {
-                let mut progress = progress.lock().unwrap();
-                progress.increment();
+                if let Ok(mut progress) = progress.lock() {
+                    progress.increment();
+                }
             }
             
             result
@@ -264,8 +265,9 @@ where
     
     // Finalize progress
     if let Some(progress) = progress {
-        let mut progress = progress.lock().unwrap();
-        progress.finish();
+        if let Ok(mut progress) = progress.lock() {
+            progress.finish();
+        }
     }
     
     // Collect and transform results

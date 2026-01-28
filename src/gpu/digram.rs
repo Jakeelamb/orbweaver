@@ -5,12 +5,113 @@
 
 use crate::grammar::symbol::{Symbol, SymbolType, Direction};
 use crate::grammar::digram_table::{DigramKey, DigramKeyTuple, DigramTable};
+use crate::grammar::digram::Digram; // For Digram type
 use crate::encode::dna_2bit::EncodedBase;
 use crate::gpu::GpuContext;
+use rustc_hash::{FxHashMap, FxHasher};
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher; // For DefaultHasher - keep for now, might be used elsewhere or can be cleaned later
+use std::hash::{Hash, Hasher};
 use ocl::{Buffer, Kernel};
 use anyhow::{Result, bail, anyhow};
 use crate::utils::hash::custom_hash;
+
+// --- Digram constants for GPU Kernels ---
+
+/// Maximum possible digram ID value that the kernel can produce or count (0-15 for 2-bit DNA).
+/// The `count_digrams_by_id` kernel uses `local_counts[16]` and expects this as `max_digram_id_value` argument.
+pub const MAX_POSSIBLE_DIGRAM_IDS: u32 = 16;
+
+/// Maps a kernel output ID (0-15) back to its canonical `(Symbol, Symbol)` pair.
+/// This array is indexed by the ID received from the `compute_digram_ids` kernel or generated directly.
+/// When `reverse_aware` is true in `compute_digram_ids`, the kernel outputs one of 10 unique canonical IDs.
+/// Those 10 canonical IDs are: AA (0), AC (1), AG (2), AT (3), CA (4), CC (5), CG (6), GA (8), GC (9), TA (12).
+/// Entries for other IDs (which would only be produced if `reverse_aware` is false, or if an ID
+/// is one of the non-canonical results of `base1*4 + base2` that maps to a canonical one) are marked
+/// with `(Symbol::N, Symbol::N)` if they don't directly correspond to one of the 10 canonical forms
+/// *at that specific ID index*. The primary use is to map the 10 canonical output IDs.
+pub static CANONICAL_KERNEL_ID_TO_BASES: [(Symbol, Symbol); MAX_POSSIBLE_DIGRAM_IDS as usize] = [
+    // ID 0 (AA)
+    (
+        Symbol { id: 0, symbol_type: SymbolType::Terminal(EncodedBase(0b00)), strand: Direction::Forward, source_grammar_id: None, original_pos: None },
+        Symbol { id: 0, symbol_type: SymbolType::Terminal(EncodedBase(0b00)), strand: Direction::Forward, source_grammar_id: None, original_pos: None },
+    ),
+    // ID 1 (AC)
+    (
+        Symbol { id: 0, symbol_type: SymbolType::Terminal(EncodedBase(0b00)), strand: Direction::Forward, source_grammar_id: None, original_pos: None },
+        Symbol { id: 0, symbol_type: SymbolType::Terminal(EncodedBase(0b01)), strand: Direction::Forward, source_grammar_id: None, original_pos: None },
+    ),
+    // ID 2 (AG)
+    (
+        Symbol { id: 0, symbol_type: SymbolType::Terminal(EncodedBase(0b00)), strand: Direction::Forward, source_grammar_id: None, original_pos: None },
+        Symbol { id: 0, symbol_type: SymbolType::Terminal(EncodedBase(0b10)), strand: Direction::Forward, source_grammar_id: None, original_pos: None },
+    ),
+    // ID 3 (AT)
+    (
+        Symbol { id: 0, symbol_type: SymbolType::Terminal(EncodedBase(0b00)), strand: Direction::Forward, source_grammar_id: None, original_pos: None },
+        Symbol { id: 0, symbol_type: SymbolType::Terminal(EncodedBase(0b11)), strand: Direction::Forward, source_grammar_id: None, original_pos: None },
+    ),
+    // ID 4 (CA)
+    (
+        Symbol { id: 0, symbol_type: SymbolType::Terminal(EncodedBase(0b01)), strand: Direction::Forward, source_grammar_id: None, original_pos: None },
+        Symbol { id: 0, symbol_type: SymbolType::Terminal(EncodedBase(0b00)), strand: Direction::Forward, source_grammar_id: None, original_pos: None },
+    ),
+    // ID 5 (CC)
+    (
+        Symbol { id: 0, symbol_type: SymbolType::Terminal(EncodedBase(0b01)), strand: Direction::Forward, source_grammar_id: None, original_pos: None },
+        Symbol { id: 0, symbol_type: SymbolType::Terminal(EncodedBase(0b01)), strand: Direction::Forward, source_grammar_id: None, original_pos: None },
+    ),
+    // ID 6 (CG)
+    (
+        Symbol { id: 0, symbol_type: SymbolType::Terminal(EncodedBase(0b01)), strand: Direction::Forward, source_grammar_id: None, original_pos: None },
+        Symbol { id: 0, symbol_type: SymbolType::Terminal(EncodedBase(0b10)), strand: Direction::Forward, source_grammar_id: None, original_pos: None },
+    ),
+    // ID 7 (CT -> maps to AG, ID 2 if reverse_aware) - Placeholder for direct mapping at ID 7
+    (
+        Symbol { id: 0, symbol_type: SymbolType::Terminal(EncodedBase(4)), strand: Direction::Forward, source_grammar_id: None, original_pos: None }, // N
+        Symbol { id: 0, symbol_type: SymbolType::Terminal(EncodedBase(4)), strand: Direction::Forward, source_grammar_id: None, original_pos: None }, // N
+    ),
+    // ID 8 (GA)
+    (
+        Symbol { id: 0, symbol_type: SymbolType::Terminal(EncodedBase(0b10)), strand: Direction::Forward, source_grammar_id: None, original_pos: None },
+        Symbol { id: 0, symbol_type: SymbolType::Terminal(EncodedBase(0b00)), strand: Direction::Forward, source_grammar_id: None, original_pos: None },
+    ),
+    // ID 9 (GC)
+    (
+        Symbol { id: 0, symbol_type: SymbolType::Terminal(EncodedBase(0b10)), strand: Direction::Forward, source_grammar_id: None, original_pos: None },
+        Symbol { id: 0, symbol_type: SymbolType::Terminal(EncodedBase(0b01)), strand: Direction::Forward, source_grammar_id: None, original_pos: None },
+    ),
+    // ID 10 (GG -> maps to CC, ID 5 if reverse_aware) - Placeholder for direct mapping at ID 10
+    (
+        Symbol { id: 0, symbol_type: SymbolType::Terminal(EncodedBase(4)), strand: Direction::Forward, source_grammar_id: None, original_pos: None }, // N
+        Symbol { id: 0, symbol_type: SymbolType::Terminal(EncodedBase(4)), strand: Direction::Forward, source_grammar_id: None, original_pos: None }, // N
+    ),
+    // ID 11 (GT -> maps to AC, ID 1 if reverse_aware) - Placeholder for direct mapping at ID 11
+    (
+        Symbol { id: 0, symbol_type: SymbolType::Terminal(EncodedBase(4)), strand: Direction::Forward, source_grammar_id: None, original_pos: None }, // N
+        Symbol { id: 0, symbol_type: SymbolType::Terminal(EncodedBase(4)), strand: Direction::Forward, source_grammar_id: None, original_pos: None }, // N
+    ),
+    // ID 12 (TA)
+    (
+        Symbol { id: 0, symbol_type: SymbolType::Terminal(EncodedBase(0b11)), strand: Direction::Forward, source_grammar_id: None, original_pos: None },
+        Symbol { id: 0, symbol_type: SymbolType::Terminal(EncodedBase(0b00)), strand: Direction::Forward, source_grammar_id: None, original_pos: None },
+    ),
+    // ID 13 (TC -> maps to GA, ID 8 if reverse_aware) - Placeholder for direct mapping at ID 13
+    (
+        Symbol { id: 0, symbol_type: SymbolType::Terminal(EncodedBase(4)), strand: Direction::Forward, source_grammar_id: None, original_pos: None }, // N
+        Symbol { id: 0, symbol_type: SymbolType::Terminal(EncodedBase(4)), strand: Direction::Forward, source_grammar_id: None, original_pos: None }, // N
+    ),
+    // ID 14 (TG -> maps to CA, ID 4 if reverse_aware) - Placeholder for direct mapping at ID 14
+    (
+        Symbol { id: 0, symbol_type: SymbolType::Terminal(EncodedBase(4)), strand: Direction::Forward, source_grammar_id: None, original_pos: None }, // N
+        Symbol { id: 0, symbol_type: SymbolType::Terminal(EncodedBase(4)), strand: Direction::Forward, source_grammar_id: None, original_pos: None }, // N
+    ),
+    // ID 15 (TT -> maps to AA, ID 0 if reverse_aware) - Placeholder for direct mapping at ID 15
+    (
+        Symbol { id: 0, symbol_type: SymbolType::Terminal(EncodedBase(4)), strand: Direction::Forward, source_grammar_id: None, original_pos: None }, // N
+        Symbol { id: 0, symbol_type: SymbolType::Terminal(EncodedBase(4)), strand: Direction::Forward, source_grammar_id: None, original_pos: None }, // N
+    ),
+];
 
 /// Structure to hold a sequence for GPU operations
 pub struct GpuSequence {
@@ -97,8 +198,8 @@ impl GpuSequence {
             .map_err(|e| anyhow!("Failed to upload sequence to GPU: {:?}", e))?;
             
         self.buffer = Some(buffer);
-        println!("Successfully uploaded {} bytes to GPU", self.data.len());
-        
+        log::debug!("Uploaded {} bytes to GPU", self.data.len());
+
         Ok(())
     }
     
@@ -112,24 +213,23 @@ impl GpuSequence {
         if let Some(context) = gpu_context {
             // Try to use GPU acceleration
             if self.buffer.is_none() {
+                log::debug!("Sequence not uploaded to GPU, using CPU implementation.");
                 // Need to upload first - but this requires a mutable reference
                 // Instead, compute on CPU
-                println!("Sequence not uploaded to GPU. Using CPU implementation.");
                 return self.find_most_frequent_digram_cpu(min_count, _reverse_aware);
             }
-            
+
             // Use OpenCL
             match find_most_frequent_digram_opencl(self, min_count, _reverse_aware, context) {
                 Ok(result) => return Ok(result),
                 Err(e) => {
-                    println!("GPU digram finding failed: {:?}. Falling back to CPU", e);
+                    log::warn!("GPU digram finding failed: {:?}. Falling back to CPU", e);
                     return self.find_most_frequent_digram_cpu(min_count, _reverse_aware);
                 }
             }
         }
-        
+
         // Fallback to CPU
-        println!("Using CPU implementation (no GPU context provided)");
         self.find_most_frequent_digram_cpu(min_count, _reverse_aware)
     }
     
@@ -140,7 +240,7 @@ impl GpuSequence {
         _reverse_aware: bool
     ) -> Result<Option<(DigramKey, Vec<(usize, (Symbol, Symbol))>)>> {
         // Calculate digram frequencies
-        let mut digram_counts: HashMap<DigramKey, Vec<(usize, (Symbol, Symbol))>> = HashMap::new();
+        let mut digram_counts: FxHashMap<DigramKey, Vec<(usize, (Symbol, Symbol))>> = FxHashMap::default();
         let data_arc = self.get_data();
         let data = &data_arc[..];
         
@@ -241,14 +341,14 @@ impl GpuSequence {
         let mut counts = HashMap::<DigramKey, Vec<usize>>::new();
         
         if estimated_mem_needed > 1_000_000_000 { // 1 GB threshold for chunking
-            println!("Sequence too large for GPU memory, processing in chunks");
+            log::debug!("Sequence too large for GPU memory, processing in chunks");
             
             // Process in chunks
             while position < self.data.len() {
                 let end_pos = std::cmp::min(position + chunk_size, self.data.len());
                 let chunk_len = end_pos - position;
                 
-                println!("Processing chunk starting at {} with length {}", position, chunk_len);
+                log::trace!("Processing chunk starting at {} with length {}", position, chunk_len);
                 
                 // Extract chunk
                 let chunk_data = self.data[position..end_pos].to_vec();
@@ -353,17 +453,17 @@ fn find_most_frequent_digram_opencl(
     if memory_needed <= safe_memory {
         return find_most_frequent_digram_opencl_direct(sequence, min_count, _reverse_aware, gpu_context);
     }
-    
+
     // Otherwise use chunked approach
-    println!("Sequence too large for GPU memory ({} bytes needed, {} available), using chunked approach",
+    log::debug!("Sequence too large for GPU memory ({} bytes needed, {} available), using chunked approach",
              memory_needed, safe_memory);
     
     // Define chunk size to fit within memory constraints (with safety margin)
     let chunk_size = (safe_memory / 8) / 2;
     let chunk_count = (seq_len + chunk_size - 1) / chunk_size;
     
-    println!("Processing in {} chunks of ~{} bytes each", chunk_count, chunk_size);
-    
+    log::debug!("Processing in {} chunks of ~{} bytes each", chunk_count, chunk_size);
+
     // Process each chunk and combine results
     let mut all_counts = HashMap::<DigramKey, usize>::new();
     
@@ -393,7 +493,7 @@ fn find_most_frequent_digram_opencl(
             }
         }
     }
-    
+
     // Find the most frequent digram across all chunks
     let mut max_key = 0;
     let mut max_count = 0;
@@ -413,18 +513,25 @@ fn find_most_frequent_digram_opencl(
     // Now we need to collect all positions - do another pass over the sequence
     let mut positions = Vec::new();
     
-    for i in 0..seq_len - 1 {
+    for i in 0..seq_len.saturating_sub(1) {
         let sym1 = sequence.get_symbol(i);
         let sym2 = sequence.get_symbol(i + 1);
         
-        let key_tuple = DigramTable::canonical_key((&sym1, &sym2), _reverse_aware);
-        let key_hash = custom_hash(&key_tuple);
+        // Create Digram and get its canonical form
+        let current_digram = Digram::new(sym1.clone(), sym2.clone());
+        let canonical_digram_to_hash = current_digram.canonical(_reverse_aware);
+
+        // Hash the canonical Digram to get its DigramKey (u64)
+        let mut hasher = DefaultHasher::new();
+        canonical_digram_to_hash.hash(&mut hasher);
+        let current_key_hash: DigramKey = hasher.finish();
         
-        if key_hash == max_key {
+        if current_key_hash == max_key {
+            // Store the original symbols, not necessarily the canonical ones, along with position
             positions.push((i, (sym1, sym2)));
         }
     }
-    
+
     // Return the result
     Ok(Some((max_key, positions)))
 }
@@ -436,107 +543,48 @@ fn find_most_frequent_digram_opencl_direct(
     _reverse_aware: bool,
     gpu_context: &GpuContext
 ) -> Result<Option<(DigramKey, Vec<(usize, (Symbol, Symbol))>)>> {
-    let _context = &gpu_context.context;
     let seq_len = sequence.get_len();
-    
     if seq_len < 2 {
         return Ok(None);
     }
-    
-    // Get the OpenCL context and queue
-    let _queue = &gpu_context.queue;
-    
-    // Get work group size information
-    let max_work_group_size = gpu_context.get_recommended_work_group_size()
-        .unwrap_or(256);
-    
-    // Create buffers for symbols - use existing buffer if available
-    let symbols_buffer = match sequence.get_buffer() {
-        Some(buffer) => buffer.clone(),
-        None => {
-            let data = sequence.get_data();
-            Buffer::builder()
-                .queue(gpu_context.queue.clone())
-                .flags(ocl::flags::MEM_READ_ONLY)
-                .len(data.len())
-                .copy_host_slice(data)
-                .build()
-                .map_err(|e| anyhow!("Failed to create symbol buffer: {}", e))?
-        }
-    };
-    
-    // Calculate number of possible digrams (2^12 for combinations of symbols, strands, etc.)
-    let max_digrams = 4096;
-    
-    // Create a buffer for counts
-    let counts_buffer = Buffer::<u32>::builder()
-        .queue(gpu_context.queue.clone())
-        .flags(ocl::flags::MEM_READ_WRITE)
-        .len(max_digrams)
-        .fill_val(0u32)
-        .build()
-        .map_err(|e| anyhow!("Failed to create counts buffer: {}", e))?;
-    
-    // Get the kernel for digram counting
-    let program = gpu_context.program.as_ref()
-        .ok_or_else(|| anyhow!("OpenCL program not loaded"))?;
-    
-    // Create kernel for digram counting
-    let kernel = Kernel::builder()
-        .program(program)
-        .name("compute_digram_hashes")
-        .queue(gpu_context.queue.clone())
-        .global_work_size(seq_len - 1)
-        .local_work_size(max_work_group_size)
-        .arg(&symbols_buffer)
-        .arg(seq_len as u32)
-        .arg(_reverse_aware as u32)
-        .arg(&counts_buffer)
-        .build()
-        .map_err(|e| anyhow!("Failed to build digram counting kernel: {}", e))?;
-    
-    // Execute kernel
-    unsafe {
-        kernel.enq()
-            .map_err(|e| anyhow!("Failed to execute digram counting kernel: {}", e))?;
-    }
-    
-    // Read back the results
-    let mut counts = vec![0u32; max_digrams];
-    counts_buffer.read(&mut counts)
-        .enq()
-        .map_err(|e| anyhow!("Failed to read counts: {}", e))?;
-    
-    // Find the most frequent digram hash
-    let mut max_idx = 0;
-    let mut max_count = 0;
-    
-    for (idx, &count) in counts.iter().enumerate() {
+
+    // 1. Get digram counts using the GPU
+    let gpu_digram_counts = count_digrams_gpu(sequence, _reverse_aware, gpu_context)?;
+
+    // 2. Find the most frequent digram from the counts
+    let mut max_key: DigramKey = 0;
+    let mut max_count: usize = 0;
+
+    for (key, count) in gpu_digram_counts.counts {
         if count > max_count {
+            max_key = key;
             max_count = count;
-            max_idx = idx;
         }
     }
-    
-    // If no digram appears enough times, return None
-    if max_count < min_count as u32 {
+
+    // 3. If no digram appears enough times, return None
+    if max_count < min_count {
         return Ok(None);
     }
-    
-    // Use the DigramKey directly
-    let max_key = max_idx as DigramKey;
-    
-    // Find all occurrences of this digram in the original sequence
+
+    // 4. Collect all positions of the most frequent digram
+    // This requires a CPU pass over the sequence, generating keys consistently.
     let mut positions = Vec::new();
-    
-    for i in 0..seq_len - 1 {
+    for i in 0..seq_len.saturating_sub(1) {
         let sym1 = sequence.get_symbol(i);
         let sym2 = sequence.get_symbol(i + 1);
+
+        // Create Digram and get its canonical form
+        let current_digram = Digram::new(sym1.clone(), sym2.clone());
+        let canonical_digram_to_hash = current_digram.canonical(_reverse_aware);
         
-        let key_tuple = DigramTable::canonical_key((&sym1, &sym2), _reverse_aware);
-        let key_hash = custom_hash(&key_tuple);
-        
-        if key_hash == max_key {
+        // Hash the canonical Digram to get its DigramKey (u64)
+        let mut hasher = DefaultHasher::new();
+        canonical_digram_to_hash.hash(&mut hasher);
+        let current_key_hash: DigramKey = hasher.finish();
+
+        if current_key_hash == max_key {
+            // Store the original symbols, not necessarily the canonical ones, along with position
             positions.push((i, (sym1, sym2)));
         }
     }
@@ -551,29 +599,156 @@ pub struct GpuDigramCounts {
 }
 
 /// Count digrams using GPU acceleration with OpenCL
+/// Count digrams using GPU acceleration with OpenCL
 pub fn count_digrams_gpu(
     sequence: &GpuSequence,
     _reverse_aware: bool,
     gpu_context: &GpuContext
 ) -> Result<GpuDigramCounts> {
-    // Get hashes for all digrams
-    let hashes = compute_digram_hashes_opencl(
+    let program = gpu_context.program.as_ref().ok_or_else(|| anyhow!("OpenCL program not loaded in GpuContext"))?;
+
+    // Step 1: Compute digram IDs using the first kernel, getting the GPU buffer directly
+    let (digram_ids_buffer, num_ids) = compute_digram_ids_opencl(
         &sequence.data,
         _reverse_aware,
         gpu_context
-    ).map_err(|e| anyhow!("Failed to compute digram hashes: {:?}", e))?;
-    
-    if hashes.is_empty() {
+    ).map_err(|e| anyhow!("Failed to compute digram IDs via OpenCL: {:?}", e))?;
+
+    if num_ids == 0 {
         return Ok(GpuDigramCounts { counts: HashMap::new() });
     }
+    // The digram_ids_buffer is now directly from compute_digram_ids_opencl, no need to recreate.
+
+    // Determine max_digram_id_value based on reverse_aware flag.
+    // If _reverse_aware, the kernel uses a mapping to 8 canonical IDs (0-7).
+    // If not _reverse_aware, all 16 digram IDs (0-15) are used.
+    // The `count_digrams_by_id` kernel's `local_counts` array is always size 16.
+    // The `max_digram_id_value` argument tells the kernel the upper bound of IDs to consider.
+    // This should always be MAX_POSSIBLE_DIGRAM_IDS (16) because the digram_ids themselves
+    // will be in the correct range (0-15, or the 10 canonical IDs if reverse_aware).
+    let max_digram_id_value = MAX_POSSIBLE_DIGRAM_IDS;
+
+    // --- Global Counts Buffer (Output for count_digrams_by_id kernel) ---
+    // Size is max_digram_id_value, as kernel outputs counts for each possible ID up to this max.
+    let global_counts_buffer = Buffer::<u32>::builder()
+        .queue(gpu_context.queue.clone())
+        .flags(ocl::flags::MEM_WRITE_ONLY) // Kernel writes to it
+        .len(max_digram_id_value as usize)
+        .build().map_err(|e| anyhow!("Failed to create OpenCL buffer for global counts: {:?}", e))?;
+
+    // --- Setup and Run count_digrams_by_id Kernel ---
+    // Determine Work Sizes (similar logic to compute_digram_ids_opencl, but for num_ids)
+    // This preliminary kernel is just to query work group info for "count_digrams_by_id"
+    let preliminary_count_kernel = Kernel::builder()
+        .program(program)
+        .name("count_digrams_by_id")
+        .queue(gpu_context.queue.clone())
+        .global_work_size(1) // Dummy size
+        .local_work_size(1)  // Dummy size
+        .arg_named("digram_ids", None::<&Buffer<u8>>)
+        .arg_named("num_ids", 0u32)
+        .arg_named("global_counts", None::<&Buffer<u32>>)
+        .arg_named("max_digram_id_value", MAX_POSSIBLE_DIGRAM_IDS)
+        .build().map_err(|e| anyhow!("Failed to build preliminary count_digrams_by_id kernel: {:?}", e))?;
+
+    let device_max_wg_size = gpu_context.get_recommended_work_group_size().unwrap_or(256).max(1);
+    let kernel_max_wg_size = match preliminary_count_kernel.wg_info(
+        gpu_context.device, ocl::enums::KernelWorkGroupInfo::WorkGroupSize
+    )? {
+        ocl::enums::KernelWorkGroupInfoResult::WorkGroupSize(size) => size.max(1),
+        _ => 256usize,
+    };
+    let mut local_work_size = std::cmp::min(device_max_wg_size, kernel_max_wg_size);
+    local_work_size = std::cmp::min(local_work_size, num_ids).max(1);
+    let global_work_size = ((num_ids + local_work_size - 1) / local_work_size * local_work_size).max(local_work_size);
     
-    // Count occurrences of each hash
-    let mut counts = HashMap::new();
-    for &hash in &hashes {
-        *counts.entry(hash).or_insert(0) += 1;
+    let count_kernel = Kernel::builder()
+        .program(program)
+        .name("count_digrams_by_id")
+        .queue(gpu_context.queue.clone())
+        .global_work_size(global_work_size)
+        .local_work_size(local_work_size)
+        .arg(&digram_ids_buffer)
+        .arg(num_ids as u32)
+        .arg(&global_counts_buffer)
+        .arg(max_digram_id_value as u32)
+        .build().map_err(|e| anyhow!("Failed to build count_digrams_by_id kernel: {:?}", e))?;
+
+    unsafe {
+        count_kernel.enq().map_err(|e| anyhow!("Failed to enqueue count_digrams_by_id kernel: {:?}", e))?;
     }
-    
-    Ok(GpuDigramCounts { counts })
+
+    // --- Read Results from global_counts_buffer ---
+    let counts_buffer_size = MAX_POSSIBLE_DIGRAM_IDS;
+    let mut counts_vec = vec![0u32; MAX_POSSIBLE_DIGRAM_IDS as usize];
+    global_counts_buffer.read(&mut counts_vec).enq().map_err(|e| anyhow!("Failed to read digram counts from GPU: {:?}", e))?;
+
+    let mut final_counts: HashMap<DigramKey, usize> = HashMap::new();
+    for (id_uchar_idx, &count_val) in counts_vec.iter().enumerate() {
+        if count_val > 0 {
+            let b1_val: u8;
+            let b2_val: u8;
+
+            if _reverse_aware {
+                // id_uchar_idx is 0-7 (kernel's canonical ID)
+                if id_uchar_idx < CANONICAL_KERNEL_ID_TO_BASES.len() {
+                    let (s1, s2) = CANONICAL_KERNEL_ID_TO_BASES[id_uchar_idx];
+b1_val = match s1.symbol_type {
+    SymbolType::Terminal(eb) => eb.0,
+    _ => {
+        eprintln!("[GPU COUNTING ERROR] Non-terminal symbol found in CANONICAL_KERNEL_ID_TO_BASES at index {}. Skipping.", id_uchar_idx);
+        continue;
+    }
+};
+b2_val = match s2.symbol_type {
+    SymbolType::Terminal(eb) => eb.0,
+    _ => {
+        eprintln!("[GPU COUNTING ERROR] Non-terminal symbol found in CANONICAL_KERNEL_ID_TO_BASES at index {}. Skipping.", id_uchar_idx);
+        continue;
+    }
+};
+                } else {
+                    // This should not happen if max_digram_id_value was set correctly to 8
+                    eprintln!("[GPU COUNTING ERROR] Canonical ID index {} out of bounds for CANONICAL_KERNEL_ID_TO_BASES (len {}). Skipping.", id_uchar_idx, CANONICAL_KERNEL_ID_TO_BASES.len());
+                    continue; 
+                }
+            } else {
+                // id_uchar_idx is 0-15 (direct non-canonical digram ID from base1*4 + base2)
+                b1_val = (id_uchar_idx / 4) as u8;
+                b2_val = (id_uchar_idx % 4) as u8;
+            }
+
+            let base1 = EncodedBase(b1_val);
+            let base2 = EncodedBase(b2_val);
+
+            // Create symbols. Instance ID (0) and source info (None) are fine
+            // as they are ignored for hashing/comparison in Symbol. Strand is Forward.
+            let sym1 = Symbol::terminal(0, base1, Direction::Forward, None, None);
+            let sym2 = Symbol::terminal(0, base2, Direction::Forward, None, None);
+            
+            let original_digram = Digram::new(sym1, sym2);
+            
+            // When _reverse_aware, the kernel already provides a canonical ID.
+            // The (b1_val, b2_val) from CANONICAL_KERNEL_ID_TO_BASES represents one form of that canonical digram.
+            // We must ensure the Digram object we hash is the canonical one according to Rust's definition.
+            let key_digram = if _reverse_aware {
+                original_digram.canonical(true) 
+            } else {
+                // If not reverse_aware, the kernel counted this specific (b1,b2) orientation.
+                // The concept of a single canonical key is less applicable as all 16 are distinct counts.
+                // However, to store in GpuDigramCounts which uses DigramKey (u64), we still hash this specific form.
+                original_digram
+            };
+
+            let mut hasher = DefaultHasher::new();
+            key_digram.hash(&mut hasher);
+            let digram_key: DigramKey = hasher.finish();
+
+            final_counts.insert(digram_key, count_val as usize);
+        }
+    }
+
+    Ok(GpuDigramCounts { counts: final_counts })
 }
 
 /// Check if OpenCL is available on the system
@@ -581,14 +756,20 @@ pub fn is_opencl_available() -> bool {
     crate::gpu::GpuContext::is_gpu()
 }
 
-pub fn compute_digram_hashes_opencl(
+pub fn compute_digram_ids_opencl(
     sequence: &[u8],
     _reverse_aware: bool,
     gpu_context: &GpuContext,
-) -> Result<Vec<u64>, ocl::Error> {
+) -> Result<(Buffer<u8>, usize), ocl::Error> {
     let seq_len = sequence.len();
     if seq_len < 2 {
-        return Ok(Vec::new());
+        let num_digrams = 0;
+        let empty_buffer = Buffer::<u8>::builder()
+            .queue(gpu_context.queue.clone())
+            .flags(ocl::flags::MEM_READ_WRITE) // General purpose flags for an empty buffer
+            .len(num_digrams)
+            .build()?;
+        return Ok((empty_buffer, num_digrams));
     }
     let num_digrams = seq_len - 1;
 
@@ -602,8 +783,8 @@ pub fn compute_digram_hashes_opencl(
         .copy_host_slice(sequence)
         .build()?;
 
-    // --- Hashes Buffer ---
-    let hash_buffer = Buffer::<u64>::builder()
+    // --- IDs Buffer ---
+    let ids_buffer = Buffer::<u8>::builder()
         .queue(gpu_context.queue.clone())
         .flags(ocl::flags::MEM_WRITE_ONLY)
         .len(num_digrams)
@@ -612,14 +793,14 @@ pub fn compute_digram_hashes_opencl(
     // --- Build Kernel (first to query its properties) ---
     let preliminary_kernel = Kernel::builder()
         .program(program)
-        .name("compute_digram_hashes")
+        .name("compute_digram_ids")
         .queue(gpu_context.queue.clone())
         .global_work_size(1)
         .local_work_size(1)
         .arg_named("sequence", None::<&Buffer<u8>>)
         .arg_named("sequence_len", 0u32)
         .arg_named("reverse_aware", 0u32)
-        .arg_named("hashes", None::<&Buffer<u64>>)
+        .arg_named("digram_ids", None::<&Buffer<u8>>)
         .build()?;
 
     // --- Determine Work Sizes ---
@@ -656,14 +837,14 @@ pub fn compute_digram_hashes_opencl(
     // --- Re-Create Kernel with Correct Args & Work Sizes ---
     let kernel = Kernel::builder()
         .program(program)
-        .name("compute_digram_hashes")
+        .name("compute_digram_ids")
         .queue(gpu_context.queue.clone())
         .global_work_size(global_work_size)
         .local_work_size(local_work_size)
         .arg(&seq_buffer)
         .arg(seq_len as u32)
         .arg(_reverse_aware as u32)
-        .arg(&hash_buffer)
+        .arg(&ids_buffer)
         .build()?;
 
     // Execute kernel
@@ -671,11 +852,8 @@ pub fn compute_digram_hashes_opencl(
         kernel.enq()?;
     }
 
-    // --- Read Results ---
-    let mut hashes = vec![0u64; num_digrams];
-    hash_buffer.read(&mut hashes).enq()?;
-
-    Ok(hashes)
+    // Return the buffer and number of digrams directly
+    Ok((ids_buffer, num_digrams))
 }
 
 pub fn populate_opencl(
@@ -705,7 +883,7 @@ pub fn populate_opencl(
         return Ok(HashMap::new());
     }
 
-    let hashes = compute_digram_hashes_opencl(&encoded, _reverse_aware, gpu_context)?;
+    let (ids_buffer, num_digrams) = compute_digram_ids_opencl(&encoded, _reverse_aware, gpu_context)?;
 
     let mut occurrences = HashMap::new();
     // IMPORTANT: The hashes correspond to digrams in `encoded`.
@@ -726,30 +904,58 @@ pub fn populate_opencl(
         }
     }
 
-    for (hash_idx, &hash_val) in hashes.iter().enumerate() {
-        // hash_idx corresponds to the start of a digram in `encoded`.
-        // We need to find the corresponding original indices in `sequence`.
-        if hash_idx + 1 < encoded.len() { // Digram exists in `encoded`
-            // Get the original sequence indices for this digram
-            // This assumes `original_indices` correctly maps `encoded` indices back.
-            let s1_orig_idx = original_indices.get(hash_idx).cloned();
-            let s2_orig_idx = original_indices.get(hash_idx + 1).cloned();
+    // Read the digram IDs from the GPU buffer
+    let mut host_ids = vec![0u8; num_digrams];
+    if num_digrams > 0 { // Only read if there are digrams
+        ids_buffer.read(&mut host_ids).enq()?;
+    }
 
-            if let (Some(s1_idx), Some(s2_idx)) = (s1_orig_idx, s2_orig_idx) {
-                 // Ensure these indices are adjacent in the *original* sequence
-                 if s2_idx == s1_idx + 1 {
-                    let s1 = sequence[s1_idx].clone();
-                    let s2 = sequence[s2_idx].clone();
-                    occurrences
-                        .entry(hash_val)
-                        .or_insert_with(Vec::new)
-                        .push((s1_idx, (s1, s2)));
-                 } else {
-                    // This can happen if non-terminals were between terminals.
-                    // The current approach of creating `encoded` and then mapping back might be complex.
-                    // The original prompt's panic for non-terminals might have been simpler if that's the design.
-                    // For now, this digram is skipped as it's not contiguous in the original `sequence`.
-                 }
+    for i in 0..num_digrams {
+        let digram_id = host_ids[i] as usize;
+        
+        if digram_id >= CANONICAL_KERNEL_ID_TO_BASES.len() {
+            eprintln!("Warning: GPU returned an out-of-bounds digram ID: {}. Max expected: {}. Skipping.", digram_id, CANONICAL_KERNEL_ID_TO_BASES.len() - 1);
+            continue; 
+        }
+
+        let (s1_base_sym, s2_base_sym) = CANONICAL_KERNEL_ID_TO_BASES[digram_id];
+
+        match (s1_base_sym.symbol_type, s2_base_sym.symbol_type) {
+            (SymbolType::Terminal(_), SymbolType::Terminal(_)) => {
+                // This digram ID corresponds to a valid pair of terminal symbols.
+                // `i` is the starting index of the digram in the `encoded` sequence.
+                // `original_indices[i]` is the index in the original `sequence` for the first symbol.
+                // `original_indices[i+1]` is the index for the second symbol.
+                if i + 1 < original_indices.len() { // Ensure we have a pair of original indices
+                    let s1_orig_idx = original_indices[i];
+                    let s2_orig_idx = original_indices[i+1];
+
+                    // Critical check: were these symbols adjacent in the *original* sequence?
+                    if s2_orig_idx == s1_orig_idx + 1 {
+                        let s1_original = sequence[s1_orig_idx].clone();
+                        let s2_original = sequence[s2_orig_idx].clone();
+
+                        // s1_base_sym and s2_base_sym are the canonical symbols from CANONICAL_KERNEL_ID_TO_BASES
+                        // Get the canonical tuple first.
+                        let canonical_tuple: DigramKeyTuple = DigramTable::canonical_key((&s1_base_sym, &s2_base_sym), _reverse_aware);
+                        
+                        // Now, hash this tuple to get the u64 key for the local FxHashMap
+                        let mut hasher = FxHasher::default();
+                        canonical_tuple.hash(&mut hasher);    // DigramKeyTuple (Symbol, Symbol) implements Hash
+                        let occurrences_key: u64 = hasher.finish();
+
+                        occurrences
+                            .entry(occurrences_key) // Use the u64 hash
+                            .or_insert_with(Vec::new)
+                            .push((s1_orig_idx, (s1_original, s2_original)));
+                    }
+                    // If not adjacent in original sequence, they don't form this digram at that position.
+                }
+            }
+            _ => {
+                // This digram ID maps to a placeholder (e.g., N,N) in CANONICAL_KERNEL_ID_TO_BASES.
+                // These are not actual digrams to be counted, so skip.
+                continue;
             }
         }
     }

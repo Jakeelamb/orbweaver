@@ -112,31 +112,31 @@ pub fn export_grammar_fasta<W: Write>(grammar: &Grammar, writer: &mut W) -> Resu
         )?;
         
         // Write sequence with line wrapping (80 chars per line)
-        for i in 0..sequence.len() {
-            write!(writer, "{}", sequence.chars().nth(i).unwrap())?;
+        for (i, ch) in sequence.chars().enumerate() {
+            write!(writer, "{}", ch)?;
             if (i + 1) % 80 == 0 {
                 writeln!(writer)?;
             }
         }
-        
+
         // Add final newline if not already added
         if sequence.len() % 80 != 0 {
             writeln!(writer)?;
         }
     }
-    
+
     // Add the final sequence
     writeln!(writer, ">Final_Sequence [Length={}]", grammar.sequence.len())?;
     let final_sequence = expand_sequence_to_string(&grammar.sequence, &grammar.rules);
-    
+
     // Write sequence with line wrapping (80 chars per line)
-    for i in 0..final_sequence.len() {
-        write!(writer, "{}", final_sequence.chars().nth(i).unwrap())?;
+    for (i, ch) in final_sequence.chars().enumerate() {
+        write!(writer, "{}", ch)?;
         if (i + 1) % 80 == 0 {
             writeln!(writer)?;
         }
     }
-    
+
     // Add final newline if not already added
     if final_sequence.len() % 80 != 0 {
         writeln!(writer)?;
@@ -632,22 +632,24 @@ mod tests {
         let rule0 = Rule {
             id: 0,
             symbols: vec![
-                Symbol::terminal(0, EncodedBase(0), Direction::Forward),
-                Symbol::terminal(1, EncodedBase(1), Direction::Forward),
+                Symbol::terminal(0, EncodedBase(0), Direction::Forward, None, None),
+                Symbol::terminal(1, EncodedBase(1), Direction::Forward, None, None),
             ],
             usage_count: 4,
             positions: vec![0, 2, 4, 6],
             depth: Some(1),
+            assembly_index: None,
         };
         let rule1 = Rule {
             id: 1,
             symbols: vec![
                 Symbol::non_terminal(2, 0, Direction::Forward),
-                Symbol::terminal(3, EncodedBase(2), Direction::Forward),
+                Symbol::terminal(3, EncodedBase(2), Direction::Forward, None, None),
             ],
             usage_count: 2,
             positions: vec![1, 5],
             depth: Some(2),
+            assembly_index: None,
         };
         rules.insert(0, rule0);
         rules.insert(1, rule1);
