@@ -44,45 +44,50 @@ fn grammar_to_json(sequence: &[Symbol], rules: &HashMap<usize, Rule>) -> Value {
         "final_sequence": serialize_sequence(sequence),
         "rules": {},
     });
-    
+
     // Add each rule to the JSON object
-    let rules_obj = json_grammar["rules"].as_object_mut().unwrap();
-    for (rule_id, rule) in rules {
-        let rule_json = json!({
-            "symbols": serialize_sequence(&rule.symbols),
-            "usage_count": rule.usage_count,
-            "depth": rule.depth.unwrap_or(0)
-        });
-        rules_obj.insert(rule_id.to_string(), rule_json);
+    if let Some(rules_obj) = json_grammar["rules"].as_object_mut() {
+        for (rule_id, rule) in rules {
+            let rule_json = json!({
+                "symbols": serialize_sequence(&rule.symbols),
+                "usage_count": rule.usage_count,
+                "depth": rule.depth.unwrap_or(0)
+            });
+            rules_obj.insert(rule_id.to_string(), rule_json);
+        }
     }
-    
+
     // Extract and clone the sequence array to avoid borrow issues
-    let sequence_array = json_grammar["final_sequence"].as_array().unwrap().clone();
-    
+    let sequence_array = json_grammar["final_sequence"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+
     // Validate that all rule IDs in the sequence exist in the rules map
     // If they don't exist, add placeholder empty rules to avoid broken references
-    let rules_obj = json_grammar["rules"].as_object_mut().unwrap();
-    for symbol_value in sequence_array { // symbol_value is a Value from json_grammar["final_sequence"]
-        if let Some(symbol_map) = symbol_value.as_object() {
-            if symbol_map.get("type").and_then(Value::as_str) == Some("non_terminal") {
-                if let Some(rule_id_val) = symbol_map.get("rule_id") {
-                    if let Some(rule_id_num) = rule_id_val.as_u64() {
-                        let rule_id_str = rule_id_num.to_string();
-                        if !rules_obj.contains_key(&rule_id_str) {
-                            // Add a placeholder rule with empty symbols
-                            rules_obj.insert(rule_id_str.clone(), json!({ 
-                                "symbols": [], 
-                                "usage_count": 1, 
-                                "depth": 0 
-                            }));
-                            eprintln!("Warning: Added placeholder for missing rule ID {} referenced in sequence", rule_id_str);
+    if let Some(rules_obj) = json_grammar["rules"].as_object_mut() {
+        for symbol_value in sequence_array {
+            if let Some(symbol_map) = symbol_value.as_object() {
+                if symbol_map.get("type").and_then(Value::as_str) == Some("non_terminal") {
+                    if let Some(rule_id_val) = symbol_map.get("rule_id") {
+                        if let Some(rule_id_num) = rule_id_val.as_u64() {
+                            let rule_id_str = rule_id_num.to_string();
+                            if !rules_obj.contains_key(&rule_id_str) {
+                                // Add a placeholder rule with empty symbols
+                                rules_obj.insert(rule_id_str.clone(), json!({
+                                    "symbols": [],
+                                    "usage_count": 1,
+                                    "depth": 0
+                                }));
+                                eprintln!("Warning: Added placeholder for missing rule ID {} referenced in sequence", rule_id_str);
+                            }
                         }
                     }
                 }
             }
         }
     }
-    
+
     json_grammar
 }
 

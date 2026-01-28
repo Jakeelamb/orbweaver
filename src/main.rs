@@ -353,6 +353,21 @@ async fn main() -> Result<()> {
     let base_output_dir = PathBuf::from("."); 
     let determined_run_id = args.run_id.clone().unwrap_or_else(|| Utc::now().format("%Y%m%d_%H%M%S").to_string());
 
+    // Initialize GPU context if not explicitly disabled
+    let mut gpu_context: Option<Arc<GpuContext>> = None;
+    if !args.no_gpu {
+        match GpuContext::new() {
+            Ok(context) => {
+                println!("GPU context initialized successfully.");
+                gpu_context = Some(Arc::new(context));
+            }
+            Err(e) => {
+                eprintln!("Warning: Failed to initialize GPU context: {}. Proceeding with CPU-only processing.", e);
+                // gpu_context remains None, so CPU will be used by default
+            }
+        }
+    }
+
     // --- Resumption Logic ---
     if args.resume {
         // Clone resume_run_dir to take ownership *before* args is potentially reassigned.
@@ -448,12 +463,12 @@ async fn main() -> Result<()> {
 
     // --- Main Processing Logic ---
     let result: Result<(Grammar, HashMap<String, PathBuf>, Vec<(String, usize)>)> = if args.streaming {
-        process_streaming_mode(&args, None, &run_specific_output_dir, &initial_checkpoints).await
+        Ok(process_streaming_mode(&args, gpu_context.clone(), &run_specific_output_dir, &initial_checkpoints).await?)
     } else if args.chunk_size > 0 || args.adaptive_chunking {
         // TODO: Pass GPU context to chunked mode if/when it supports it
-        Ok(process_chunked_mode(&args, &run_specific_output_dir, &initial_checkpoints)?)
+        Ok(process_chunked_mode(&args, gpu_context.clone(), &run_specific_output_dir, &initial_checkpoints)?)
     } else {
-        process_standard_mode(&args, false, None, &run_specific_output_dir, &initial_checkpoints).await
+        Ok(process_standard_mode(&args, gpu_context.clone(), &run_specific_output_dir, &initial_checkpoints).await?)
     };
 
     match result {
@@ -571,8 +586,7 @@ fn generate_outputs(grammar: &Grammar, args: &OrbweaverArgs, run_specific_output
 
 async fn process_standard_mode(
     args: &OrbweaverArgs, 
-    use_gpu: bool, 
-    gpu_context: Option<&GpuContext>,
+    gpu_context: Option<Arc<GpuContext>>,
     run_specific_output_dir: &PathBuf,
     initial_checkpoints: &HashMap<String, PathBuf>
 ) -> Result<(Grammar, HashMap<String, PathBuf>, Vec<(String, usize)>)> { 
@@ -660,65 +674,25 @@ async fn process_standard_mode(
         println!("Processing sequence {} (ID: {}): {} bases", seq_idx, record_id_owned, bases_owned.len());
         
         let task_args = Arc::clone(&args_arc);
-        let task_gpu_context = gpu_context.cloned();
+        let task_gpu_context = gpu_context.clone();
         
         let grammar_result: Grammar = tokio::task::spawn_blocking(move || -> Result<Grammar, anyhow::Error> {
-            if task_args.use_encoding {
-                let encoded_bases = encode_dna(&bases_owned); 
-                println!("  Using 2-bit encoding ({} bases -> {} encoded bases)", 
-                         bases_owned.len(), encoded_bases.len());
-                
-                let mut grammar_builder = GrammarBuilder::new(task_args.min_rule_usage, task_args.reverse_aware);
-                if let Some(max_rules) = task_args.max_rule_count {
-                    grammar_builder = grammar_builder.with_max_rules(max_rules);
-                }
-
-                let use_gpu_override = false; 
-
-                if use_gpu_override && task_gpu_context.is_some() {
-                    grammar_builder = grammar_builder.with_gpu(task_gpu_context.as_ref());
-                    grammar_builder.build_grammar_with_gpu(&encoded_bases, seq_idx)?;
-                } else {
-                    if use_gpu && task_gpu_context.is_none() {
-                        println!("Warning: GPU mode selected, but GPU context is unavailable for sequence {}. Falling back to CPU.", record_id_owned);
-                    } else if use_gpu_override {
-                        println!("INFO: GPU path forced off for debugging.");
-                    }
-                    grammar_builder.build_grammar(&encoded_bases, seq_idx)?;
-                }
-                
-                let (sequence, rules) = grammar_builder.get_grammar();
-                let max_depth = grammar_builder.get_max_rule_depth();
-                
-                Ok(Grammar {
-                    sequence: sequence.clone(),
-                    rules: rules.clone(),
-                    max_depth,
-                    origins: HashMap::new(), 
-                })
-            } else {
-                println!("  WARNING: Processing without 2-bit encoding.");
-                let encoded_bases_fallback = encode_dna(&bases_owned); 
-                let mut grammar_builder = GrammarBuilder::new(task_args.min_rule_usage, task_args.reverse_aware);
-
-                if use_gpu && task_gpu_context.is_some() {
-                    grammar_builder = grammar_builder.with_gpu(task_gpu_context.as_ref());
-                    grammar_builder.build_grammar_with_gpu(&encoded_bases_fallback, seq_idx)?;
-                } else {
-                    if use_gpu && task_gpu_context.is_none() {
-                         println!("Warning: GPU mode selected (no encoding), but GPU context is unavailable for sequence {}. Falling back to CPU.", record_id_owned);
-                    }
-                    grammar_builder.build_grammar(&encoded_bases_fallback, seq_idx)?;
-                }
-                let (sequence, rules) = grammar_builder.get_grammar();
-                let max_depth = grammar_builder.get_max_rule_depth();
-                Ok(Grammar {
-                    sequence: sequence.clone(), 
-                    rules: rules.clone(), 
-                    max_depth, 
-                    origins: HashMap::new(), 
-                })
+            let mut grammar_builder = GrammarBuilder::new(task_args.min_rule_usage, task_args.reverse_aware, task_gpu_context);
+            if let Some(max_rules) = task_args.max_rule_count {
+                grammar_builder = grammar_builder.with_max_rules(max_rules);
             }
+            let encoded_bases = encode_dna(&bases_owned); 
+            println!("  Using 2-bit encoding ({} bases -> {} encoded bases)", 
+                     bases_owned.len(), encoded_bases.len());
+            grammar_builder.build_grammar(&encoded_bases, seq_idx)?;
+            let (sequence, rules) = grammar_builder.get_grammar();
+            let max_depth = grammar_builder.get_max_rule_depth();
+            Ok(Grammar {
+                sequence: sequence.clone(),
+                rules: rules.clone(),
+                max_depth,
+                origins: HashMap::new(), 
+            })
         }).await?
           .with_context(|| format!("Failed to build grammar for sequence index {}", seq_idx))?;
         
@@ -739,20 +713,19 @@ async fn process_standard_mode(
         grammars.push(grammar_result);
     }
     
-    println!("Merging {} individual grammars...", grammars.len());
-    
+    log::info!("Merging {} individual grammars...", grammars.len());
+
     let dummy_config = ChunkingConfig::default(); // Assuming this is okay for now
     let (merged_grammar, _merge_metrics) = merge_grammars(grammars, &dummy_config, total_len_estimate)?;
-    
-    println!("Merging complete. Final grammar has {} rules.", merged_grammar.rules.len());
-    // println!("Total merging time: {:?}", merge_metrics.merge_time);
-    
+
+    log::info!("Merging complete. Final grammar has {} rules.", merged_grammar.rules.len());
+
     Ok((merged_grammar, current_run_checkpoints, chromosome_details))
 }
 
 async fn process_streaming_mode(
     args: &OrbweaverArgs,
-    gpu_context: Option<&GpuContext>,
+    gpu_context: Option<Arc<GpuContext>>,
     run_specific_output_dir: &PathBuf,
     initial_checkpoints: &HashMap<String, PathBuf>
 ) -> Result<(Grammar, HashMap<String, PathBuf>, Vec<(String, usize)>)> {
@@ -792,12 +765,9 @@ async fn process_streaming_mode(
 
         println!("Processing file {} ({}) in streaming mode...", file_idx, input_file_path.display());
 
-        let mut grammar_builder = GrammarBuilder::new(args.min_rule_usage, args.reverse_aware).enable_streaming_mode();
+        let mut grammar_builder = GrammarBuilder::new(args.min_rule_usage, args.reverse_aware, gpu_context.clone()).enable_streaming_mode();
         if let Some(max_rules) = args.max_rule_count {
             grammar_builder = grammar_builder.with_max_rules(max_rules);
-        }
-        if !args.no_gpu && gpu_context.is_some(){
-            grammar_builder = grammar_builder.with_gpu(gpu_context);
         }
 
         let file = File::open(input_file_path)
@@ -883,6 +853,7 @@ async fn process_streaming_mode(
 
 fn process_chunked_mode(
     args: &OrbweaverArgs, 
+    gpu_context: Option<Arc<GpuContext>>,
     run_specific_output_dir: &PathBuf,
     initial_checkpoints: &HashMap<String, PathBuf>
 ) -> Result<(Grammar, HashMap<String, PathBuf>, Vec<(String, usize)>)> {
@@ -939,7 +910,7 @@ fn process_chunked_mode(
         show_progress: true, // Or make this an arg
         adaptive_chunking: args.adaptive_chunking,
         max_memory_per_chunk: args.max_memory_per_chunk_mb.map(|mb| mb * 1024 * 1024),
-        use_gpu: !args.no_gpu, // Assuming ChunkingConfig takes this
+        gpu_context: gpu_context.clone(),
     };
 
     // `parallel_sequitur` would need to be adapted to save/load chunk-level checkpoints
@@ -949,14 +920,12 @@ fn process_chunked_mode(
     let (grammar, _parallel_metrics) = orbweaver::parallel::engine::parallel_sequitur(
         &encoded_sequence, 
         chunking_config,
-        None // Pass GpuContext here if available and `parallel_sequitur` supports it
+        gpu_context // Pass GpuContext here; parallel_sequitur will need to be updated
     )?;
     
     // Save final merged grammar checkpoint
     // utils::export::write_grammar_json(&checkpoint_path, &grammar.sequence, &grammar.rules)?;
     let final_checkpoints = initial_checkpoints.clone();
-    // final_checkpoints.insert(format!("{}_final", seq_id), checkpoint_path);
-    // println!("Saved final chunked grammar checkpoint for {} to {}", seq_id, checkpoint_filename);
 
     Ok((grammar, final_checkpoints, Vec::new())) // Return empty vec for chromosome_details
 }
@@ -973,10 +942,10 @@ mod tests {
     use clap::CommandFactory;
 
     #[test]
-    fn test_default_streaming_enabled() {
+    fn test_default_streaming_disabled() {
         let cmd = OrbweaverArgs::command();
         let matches = cmd.get_matches_from(vec!["orbweaver", "-i", "input.fa"]);
         let streaming_arg = matches.get_flag("streaming");
-        assert!(streaming_arg, "Streaming should be enabled by default if not otherwise specified.");
+        assert!(!streaming_arg, "Streaming should be disabled by default (opt-in via --streaming).");
     }
 }

@@ -14,7 +14,6 @@ use std::time::Instant;
 use union_find::UnionFind;
 use union_find::QuickUnionUf;
 use union_find::UnionBySize;
-use crate::gpu::GpuContext; // Import GpuContext
 use crate::analysis::assembly_index::calculate_rule_assembly_indices; // Added for Assembly Index
 
 /// Metrics for the parallel Sequitur algorithm
@@ -40,7 +39,7 @@ pub struct ParallelMetrics {
 pub fn parallel_sequitur(
     sequence: &[EncodedBase],
     config: ChunkingConfig,
-    gpu_context_param: Option<&GpuContext> 
+    gpu_context: Option<std::sync::Arc<crate::gpu::GpuContext>> 
 ) -> Result<(Grammar, ParallelMetrics)> {
     let total_start = Instant::now();
     let mut metrics: ParallelMetrics = ParallelMetrics::default();
@@ -51,10 +50,6 @@ pub fn parallel_sequitur(
         .build_global();
 
     println!("Using {} threads for parallel processing.", config.num_threads);
-    
-    if config.use_gpu {
-        println!("GPU acceleration enabled for chunk processing");
-    }
 
     // --- Step 1: Split sequence into chunks ---
     // Assuming split_into_chunks is defined elsewhere and returns Vec<Chunk>
@@ -68,24 +63,19 @@ pub fn parallel_sequitur(
     let chunk_results: Vec<Result<Grammar>> = chunks
         .into_par_iter()
         .map(|chunk| {
-             let mut builder = GrammarBuilder::new(config.min_rule_usage, config.reverse_aware);
+             let mut builder = GrammarBuilder::new(
+                config.min_rule_usage, 
+                config.reverse_aware,
+                gpu_context.clone()
+            );
              
-             // Configure the builder
+             // Configure the builder for max_rules (memory constraint)
              if let Some(max_rules) = config.max_memory_per_chunk {
                  builder = builder.with_max_rules(max_rules / 100); 
              }
              
-             // Build grammar using GPU or CPU based on config and context availability
-             if config.use_gpu && gpu_context_param.is_some() {
-                 builder = builder.with_gpu(gpu_context_param);
-                 builder.build_grammar_with_gpu(&chunk.data, chunk.index)?;
-             } else {
-                 if config.use_gpu && gpu_context_param.is_none() {
-                     // Print warning only once or use logging if available
-                     // For now, skipping the print to avoid excessive output
-                 }
-                 builder.build_grammar(&chunk.data, chunk.index)?;
-             }
+             // GrammarBuilder's build_grammar method will internally decide to use GPU
+             builder.build_grammar(&chunk.data, chunk.index)?;
              
              let (seq, rules) = builder.get_grammar();
              let depth = builder.get_max_rule_depth();
@@ -315,10 +305,16 @@ fn deduplicate_rules(grammars_with_ids: &[(usize, Grammar)])
             if let SymbolType::NonTerminal(old_child_id) = original_symbol.symbol_type {
                 // Find the grammar_id associated with the *representative* rule
                 // This requires finding an origin for this final_id
-                let (origin_grammar_id, _) = final_id_to_origins.get(&final_id)
-                                                .and_then(|origins| origins.first()) // Take the first origin as the context for remapping children
-                                                .cloned()
-                                                .ok_or_else(|| anyhow::anyhow!("No origin found for final rule ID {}", final_id)).unwrap(); 
+                let (origin_grammar_id, _) = match final_id_to_origins.get(&final_id)
+                                                .and_then(|origins| origins.first())
+                                                .cloned() {
+                    Some(origin) => origin,
+                    None => {
+                        log::warn!("No origin found for final rule ID {}, keeping original symbol", final_id);
+                        final_symbols.push(original_symbol);
+                        continue;
+                    }
+                }; 
                                                 
                 // Lookup using the representative's original grammar_id and the old_child_id
                 if let Some(final_new_child_id) = final_rule_map.get(&(origin_grammar_id, old_child_id)) {
@@ -428,7 +424,7 @@ mod tests {
             show_progress: false,
             adaptive_chunking: false,
             max_memory_per_chunk: None,
-            use_gpu: false,
+            gpu_context: None,
         };
         
         let (grammar, metrics) = parallel_sequitur(&bases, config, None)?;

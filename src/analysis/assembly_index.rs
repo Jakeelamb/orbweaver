@@ -109,7 +109,8 @@ pub fn calculate_chromosome_assembly_index(sequence: &[Symbol], rules: &HashMap<
 mod tests {
     use super::*;
     use crate::grammar::rule::Rule;
-    use crate::grammar::symbol::{Symbol, SymbolType, Direction};
+    use crate::grammar::symbol::{Symbol, Direction, SymbolType};
+    use crate::grammar::Grammar;
     use crate::encode::dna_2bit::EncodedBase;
     use std::collections::HashMap;
 
@@ -193,8 +194,7 @@ mod tests {
     
     #[test]
     fn test_calculate_rule_assembly_indices_cyclic_dependency_warning() {
-        // This test primarily checks if it handles cycles gracefully (doesn't panic, prints warning)
-        // The AI values might be None for rules involved in a cycle.
+        // This test checks that cycles are detected and an error is returned
         let mut grammar = Grammar {
             sequence: vec![],
             rules: HashMap::new(),
@@ -206,10 +206,9 @@ mod tests {
         // R1 -> R0
         grammar.rules.insert(1, create_rule(1, vec![non_term(1,0)], None));
 
-        calculate_rule_assembly_indices(&mut grammar.rules).unwrap();
-        // Expectation is that indices will be None and warnings printed (captured via stderr or logs if set up)
-        assert!(grammar.rules.get(&0).unwrap().assembly_index.is_none());
-        assert!(grammar.rules.get(&1).unwrap().assembly_index.is_none());
+        // Function should return an error for cycles
+        let result = calculate_rule_assembly_indices(&mut grammar.rules);
+        assert!(result.is_err(), "Expected error for cyclic dependency");
     }
 
     #[test]

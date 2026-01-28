@@ -43,7 +43,7 @@ pub struct GrammarBuilder {
     chunk_count: usize,
     total_bases_processed: usize,
     // Store the GPU context if provided
-    gpu_context: Option<GpuContext>,
+    gpu_context: Option<std::sync::Arc<GpuContext>>,
 }
 
 /// Track performance metrics during grammar construction
@@ -59,7 +59,7 @@ pub struct PerformanceMetrics {
 
 impl GrammarBuilder {
     /// Creates a new GrammarBuilder.
-    pub fn new(min_rule_usage: usize, reverse_aware: bool) -> Self {
+    pub fn new(min_rule_usage: usize, reverse_aware: bool, gpu_context: Option<std::sync::Arc<GpuContext>>) -> Self {
         GrammarBuilder {
             sequence: Vec::new(),
             rules: HashMap::new(),
@@ -75,8 +75,7 @@ impl GrammarBuilder {
             stream_mode: false,
             chunk_count: 0,
             total_bases_processed: 0,
-            // Initialize gpu_context to None
-            gpu_context: None,
+            gpu_context,
         }
     }
 
@@ -100,14 +99,6 @@ impl GrammarBuilder {
         }
         self
     }
-    
-    /// Set whether to use GPU acceleration for grammar construction
-    /// Stores the provided GpuContext.
-    pub fn with_gpu(mut self, gpu_context: Option<&GpuContext>) -> Self {
-        // Clone the context if provided, otherwise set to None
-        self.gpu_context = gpu_context.cloned();
-        self
-    }
 
     /// Initializes the builder with the input sequence.
     /// Converts the raw byte sequence into Terminal Symbols.
@@ -122,16 +113,7 @@ impl GrammarBuilder {
                 Symbol::terminal(i, base, Direction::Forward, Some(source_grammar_id), Some(i))
             })
             .collect();
-        println!("Initialized sequence with {} symbols.", self.sequence.len());
-        println!("DEBUG: First 20 base values after initialization:");
-        for (_i, sym) in self.sequence.iter().take(20).enumerate() {
-            if let SymbolType::Terminal(base) = sym.symbol_type {
-                print!("{} ", base.0);
-            }
-        }
-        println!("");
-        use std::io::Write;
-        std::io::stdout().flush().unwrap();
+        log::debug!("Initialized sequence with {} symbols.", self.sequence.len());
     }
 
     /// Populates the pattern table (digram or k-mer) based on the current sequence state.
@@ -163,31 +145,16 @@ impl GrammarBuilder {
     fn step(&mut self) -> Result<bool> {
         self.metrics.step_count += 1;
         if self.metrics.step_count % 100 == 0 {
-             println!("  [CPU DEBUG] Step: {}, SeqLen: {}, Rules: {}", 
-                 self.metrics.step_count, self.sequence.len(), self.rules.len());
+            log::debug!("Step: {}, SeqLen: {}, Rules: {}",
+                self.metrics.step_count, self.sequence.len(), self.rules.len());
         }
 
         self.rebuild_pattern_table()?;
 
         let pattern_found = if self.kmer_size == 2 {
             // --- Digram Processing --- //
-            println!("DEBUG: DigramTable contains {} unique digrams", self.digram_table.len());
-            if !self.digram_table.is_empty() {
-                let top_digrams = self.digram_table.get_top_digrams(5);
-                println!("DEBUG: Top digrams:");
-                for (i, (key, occurrences)) in top_digrams.iter().enumerate() {
-                    println!("  {}. Key: {:?}, Count: {}", i + 1, key, occurrences.len());
-                    if i == 0 && !occurrences.is_empty() {
-                        println!("     First occurrence position: {}", occurrences[0].0);
-                        println!("     Min usage required: {}", self.min_rule_usage);
-                    }
-                }
-            }
-
             if let Some((key_tuple, count, occurrences)) = self.digram_table.find_most_frequent_digram() {
-                println!("DEBUG: Found digram with key {:?}, count: {}", key_tuple, count);
                 if count >= self.min_rule_usage {
-                    println!("DEBUG: Creating rule for digram with count {}", count);
 
                     // Reconstruct the first digram instance to create the rule
                     // This requires getting the symbols from the sequence using the first position
@@ -226,15 +193,13 @@ impl GrammarBuilder {
                         self.next_rule_id += 1;
                         true // Pattern processed
                     } else {
-                         println!("Warning: Most frequent digram at position {} is too close to sequence end.", first_pos);
-                         false // Could not process this pattern
+                        log::warn!("Most frequent digram at position {} is too close to sequence end.", first_pos);
+                        false // Could not process this pattern
                     }
                 } else {
-                    println!("DEBUG: Digram count {} is below minimum usage {}", count, self.min_rule_usage);
                     false // No frequent pattern found
                 }
             } else {
-                println!("DEBUG: No frequent digrams found");
                 false // No pattern found
             }
 
@@ -243,15 +208,13 @@ impl GrammarBuilder {
             let kmer_table = match &self.kmer_table {
                  Some(table) => table,
                  None => {
-                    println!("Warning: K-mer size > 2 but KmerTable is not initialized.");
+                    log::warn!("K-mer size > 2 but KmerTable is not initialized.");
                     return Ok(false);
                  }
             };
 
             if let Some((kmer_key, count, occurrences)) = kmer_table.find_most_frequent(self.min_rule_usage) {
-                println!("DEBUG: Found k-mer with key {:?}, count: {}", kmer_key, count);
                 if count >= self.min_rule_usage {
-                     println!("DEBUG: Creating rule for k-mer with count {}", count);
                      let representative_kmer = &occurrences[0].1;
 
                      let new_rule = Rule {
@@ -272,11 +235,9 @@ impl GrammarBuilder {
                      self.next_rule_id += 1;
                      true // Pattern processed
                 } else {
-                    println!("DEBUG: K-mer count {} is below minimum usage {}", count, self.min_rule_usage);
                     false // No frequent pattern found
                 }
             } else {
-                println!("DEBUG: No frequent k-mers found");
                 false // No pattern found
             }
         };
@@ -398,8 +359,8 @@ impl GrammarBuilder {
         }
         
         if self.chunk_count % 10 == 0 || self.chunk_count == 1 {
-            println!("Processed chunk {} ({} bases) in {:.2?}. Current stats: {} symbols, {} rules", 
-                     self.chunk_count, 
+            log::info!("Processed chunk {} ({} bases) in {:.2?}. Current stats: {} symbols, {} rules",
+                     self.chunk_count,
                      chunk.len(),
                      chunk_start_time.elapsed(),
                      self.sequence.len(),
@@ -413,11 +374,11 @@ impl GrammarBuilder {
     pub fn finalize_grammar(&mut self) -> Result<()> {
         // For streaming mode, finalize the construction
         if !self.stream_mode {
-            println!("Not in streaming mode, nothing to finalize.");
+            log::debug!("Not in streaming mode, nothing to finalize.");
             return Ok(());
         }
-        
-        println!("Finalizing grammar after {} chunks, {} total bases processed.", 
+
+        log::info!("Finalizing grammar after {} chunks, {} total bases processed.",
                  self.chunk_count, self.total_bases_processed);
                  
         // Continue processing until no more patterns meet the threshold
@@ -427,7 +388,7 @@ impl GrammarBuilder {
             
             // Report progress periodically
             if steps_performed % 100 == 0 {
-                println!("  Finalization progress: {} additional steps", steps_performed);
+                log::debug!("Finalization progress: {} additional steps", steps_performed);
             }
             
             // Periodic rule eviction during finalization, if enabled
@@ -445,8 +406,8 @@ impl GrammarBuilder {
         self.inline_single_use_rules();
         self.metrics.inlining_time += inline_start.elapsed();
         
-        println!("Grammar finalization complete. Performed {} additional steps.", steps_performed);
-        println!("Final stats: {} symbols, {} rules", self.sequence.len(), self.rules.len());
+        log::info!("Grammar finalization complete. Performed {} additional steps.", steps_performed);
+        log::info!("Final stats: {} symbols, {} rules", self.sequence.len(), self.rules.len());
         
         Ok(())
     }
@@ -459,7 +420,7 @@ impl GrammarBuilder {
             match self.build_grammar_with_gpu(initial_sequence, source_grammar_id) {
                 Ok(_) => return Ok(()),
                 Err(e) => {
-                    println!("GPU processing failed: {}. Falling back to CPU.", e);
+                    log::warn!("GPU processing failed: {}. Falling back to CPU.", e);
                     // Fall through to CPU implementation
                 }
             }
@@ -467,12 +428,10 @@ impl GrammarBuilder {
         
         // CPU implementation follows
         let start = Instant::now();
-        
+
         // Initialize the sequence if not in streaming mode
         if !self.stream_mode {
             self.initialize_sequence(initial_sequence, source_grammar_id);
-            // Debug: print first 10 symbols after initialization
-            println!("DEBUG: First 10 symbols after initialization: {:#?}", &self.sequence.iter().take(10).collect::<Vec<_>>());
         } else {
             // In streaming mode, we process the chunk directly
             // build_grammar is called with a single sequence, so chunk_offset is 0
@@ -482,12 +441,6 @@ impl GrammarBuilder {
         // Build the digram table
         let table_start = Instant::now();
         self.rebuild_pattern_table()?;
-        // Debug: print top 5 digrams after building digram table
-        let top_digrams = self.digram_table.get_top_digrams(5);
-        println!("DEBUG: Top 5 digrams after table build:");
-        for (i, (key, occurrences)) in top_digrams.iter().enumerate() {
-            println!("  {}. Key: {:?}, Count: {}", i+1, key, occurrences.len());
-        }
         self.metrics.digram_table_time += table_start.elapsed();
         
         // Iteratively replace digrams
@@ -495,7 +448,7 @@ impl GrammarBuilder {
         while self.step()? {
             steps += 1;
             if steps % 1000 == 0 {
-                println!("Step {}, Rule count: {}", steps, self.rules.len());
+                log::debug!("Step {}, Rule count: {}", steps, self.rules.len());
             }
             
             // Check for rule count limit and evict if necessary
@@ -526,11 +479,10 @@ impl GrammarBuilder {
             }
         }
 
-        // Print stats
+        // Record stats
         self.metrics.step_count = steps;
-        println!("Grammar construction completed in {:?}", start.elapsed());
-        println!("Rules: {}, Steps: {}", self.rules.len(), steps);
-        log::info!("Grammar construction complete. Total rules: {}, Max depth: {}", self.rules.len(), self.get_max_rule_depth());
+        log::info!("Grammar construction completed in {:?}. Rules: {}, Steps: {}, Max depth: {}",
+            start.elapsed(), self.rules.len(), steps, self.get_max_rule_depth());
         Ok(())
     }
     
@@ -631,11 +583,11 @@ impl GrammarBuilder {
                         rule.depth = Some(depth);
                         max_depth = max_depth.max(depth);
                     } else {
-                        println!("Warning: Rule {} not found while setting depth.", rule_id);
+                        log::warn!("Rule {} not found while setting depth.", rule_id);
                     }
                 }
                 Err(e) => {
-                    println!("Warning: {} while calculating depth for rule {}. Assigning depth 0.", e, rule_id);
+                    log::warn!("{} while calculating depth for rule {}. Assigning depth 0.", e, rule_id);
                     if let Some(rule) = self.rules.get_mut(&rule_id) {
                         rule.depth = Some(0); // Assign a default depth on cycle
                     }
@@ -782,7 +734,7 @@ impl GrammarBuilder {
         }
         
         self.metrics.eviction_time += start.elapsed();
-        println!("Evicted {} rules (keeping at most {})", num_to_evict, max_count);
+        log::debug!("Evicted {} rules (keeping at most {})", num_to_evict, max_count);
         
         // Rebuild the pattern table after inlining and removal to reflect changes
         // self.rebuild_pattern_table()?;
@@ -956,7 +908,7 @@ impl GrammarBuilder {
         // Inline each rule
         for rule_id in single_use_rules {
             if let Err(e) = self.inline_rule(rule_id) {
-                println!("Warning: Failed to inline rule {}: {}", rule_id, e);
+                log::warn!("Failed to inline rule {}: {}", rule_id, e);
                 continue;
             }
             
@@ -1098,7 +1050,7 @@ mod tests {
 
     #[test]
     fn test_simple_repetition() -> Result<()> {
-        let mut builder = GrammarBuilder::new(2, false);
+        let mut builder = GrammarBuilder::new(2, false, None);
         let seq = encode_seq(b"AAAAAA");
         builder.build_grammar(&seq, 0)?;
         let (_, rules) = builder.get_grammar();
@@ -1112,7 +1064,7 @@ mod tests {
 
     #[test]
     fn test_overlapping_patterns() -> Result<()> {
-        let mut builder = GrammarBuilder::new(2, false);
+        let mut builder = GrammarBuilder::new(2, false, None);
         let seq = encode_seq(b"ABCABCABC");
         builder.build_grammar(&seq, 0)?;
         let (_final_sequence, rules) = builder.get_grammar();
@@ -1126,7 +1078,7 @@ mod tests {
 
     #[test]
     fn test_nested_rules() -> Result<()> {
-        let mut builder = GrammarBuilder::new(2, false);
+        let mut builder = GrammarBuilder::new(2, false, None);
         let seq = encode_seq(b"ACACACACACACACAC");
         builder.build_grammar(&seq, 0)?;
         let (_final_sequence, rules) = builder.get_grammar();
@@ -1138,7 +1090,7 @@ mod tests {
 
     #[test]
     fn test_rule_utility() -> Result<()> {
-        let mut builder = GrammarBuilder::new(2, false);
+        let mut builder = GrammarBuilder::new(2, false, None);
         let seq = encode_seq(b"AAAACCCC");
         builder.build_grammar(&seq, 0)?;
         let (_final_sequence, rules) = builder.get_grammar();
@@ -1156,7 +1108,7 @@ mod tests {
 
     #[test]
     fn test_no_frequent_digrams() -> Result<()> {
-        let mut builder = GrammarBuilder::new(2, false);
+        let mut builder = GrammarBuilder::new(2, false, None);
         let seq = encode_seq(b"ACGT");
         builder.build_grammar(&seq, 0)?;
         let (final_sequence, rules) = builder.get_grammar();
@@ -1170,7 +1122,7 @@ mod tests {
 
     #[test]
     fn test_empty_sequence() -> Result<()> {
-        let mut builder = GrammarBuilder::new(2, false);
+        let mut builder = GrammarBuilder::new(2, false, None);
         let seq = encode_seq(b"");
         builder.build_grammar(&seq, 0)?;
         let (final_sequence, rules) = builder.get_grammar();
@@ -1181,7 +1133,7 @@ mod tests {
 
     #[test]
     fn test_single_base_sequence() -> Result<()> {
-        let mut builder = GrammarBuilder::new(2, false);
+        let mut builder = GrammarBuilder::new(2, false, None);
         let seq = encode_seq(b"A");
         builder.build_grammar(&seq, 0)?;
         let (final_sequence, rules) = builder.get_grammar();
@@ -1193,7 +1145,7 @@ mod tests {
 
     #[test]
     fn test_reverse_complement_aware() -> Result<()> {
-        let mut builder_aware = GrammarBuilder::new(2, true);
+        let mut builder_aware = GrammarBuilder::new(2, true, None);
         let seq = encode_seq(b"ACGTACGT");
         builder_aware.build_grammar(&seq, 0)?;
         let (_final_sequence_aware, rules_aware) = builder_aware.get_grammar();

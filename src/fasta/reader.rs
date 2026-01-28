@@ -410,12 +410,12 @@ impl Iterator for FastaStream {
         // Get total length if not already known
         if self.total_length.is_none() {
             self.total_length = self.reader.get_sequence_length(self.sequence_id).ok();
-            if self.total_length.is_none() {
-                return None; // Error or empty sequence
-            }
         }
-        
-        let total_length = self.total_length.unwrap();
+
+        let total_length = match self.total_length {
+            Some(len) => len,
+            None => return None, // Error or empty sequence
+        };
         if self.position >= total_length {
             return None; // End of sequence
         }
@@ -495,8 +495,11 @@ impl<'a> Iterator for ChunkedSequenceIterator<'a> {
         if self.total_length.is_none() {
             self.total_length = Some(self.reader.get_sequence_length(self.sequence_id).unwrap_or(0));
         }
-        
-        let total_length = self.total_length.unwrap();
+
+        let total_length = match self.total_length {
+            Some(len) => len,
+            None => return None, // Should not happen after the above, but be safe
+        };
         
         // If we've reached the end, stop
         if self.pos >= total_length {

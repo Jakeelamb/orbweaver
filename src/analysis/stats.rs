@@ -36,8 +36,7 @@ fn get_sequence_uncompressed_length(
                     memo.insert(rule_id, rule_uncompressed_len);
                     total_length += rule_uncompressed_len;
                 } else {
-                    // This case indicates an invalid grammar or an issue in rule mapping.
-                    // eprintln!("Warning: Rule ID {} not found during uncompressed length calculation.", rule_id);
+                    // Invalid grammar or missing rule - skip this rule_id
                 }
             }
         }
