@@ -171,19 +171,44 @@ pub fn format_symbol(symbol: &Symbol, _grammar: &Grammar) -> String {
 }
 
 /// Expands a rule to its DNA string representation
+/// Uses an iterative approach with explicit stack to avoid stack overflow with deeply nested rules
 pub fn expand_rule_to_string(rule: &Rule, grammar: &HashMap<usize, Rule>, parent_strand: Direction) -> String {
     let mut result = String::new();
-    
-    for symbol in &rule.symbols {
+
+    // Work stack: (symbols to process, current index, strand)
+    // Using Vec as a stack to avoid recursion
+    let mut work_stack: Vec<(&[Symbol], usize, Direction)> = vec![(&rule.symbols, 0, parent_strand)];
+
+    // Safety limit to prevent infinite loops from buggy grammars
+    const MAX_ITERATIONS: usize = 10_000_000;
+    let mut iterations = 0;
+
+    while let Some((symbols, idx, current_strand)) = work_stack.pop() {
+        iterations += 1;
+        if iterations > MAX_ITERATIONS {
+            log::warn!("expand_rule_to_string: hit iteration limit, possible cycle in grammar");
+            result.push_str("[TRUNCATED]");
+            break;
+        }
+
+        if idx >= symbols.len() {
+            continue;
+        }
+
+        // Push back the rest of this level to process after current symbol
+        if idx + 1 < symbols.len() {
+            work_stack.push((symbols, idx + 1, current_strand));
+        }
+
+        let symbol = &symbols[idx];
+
         // Combine parent and symbol directions
-        let effective_strand = if parent_strand == Direction::Reverse {
-            // Flip the symbol's strand if parent is reversed
+        let effective_strand = if current_strand == Direction::Reverse {
             symbol.strand.flip()
         } else {
-            // Keep the symbol's strand if parent is forward
             symbol.strand
         };
-        
+
         match &symbol.symbol_type {
             SymbolType::Terminal(base) => {
                 let base_char = match base.0 {
@@ -193,9 +218,8 @@ pub fn expand_rule_to_string(rule: &Rule, grammar: &HashMap<usize, Rule>, parent
                     3 => 'T',
                     _ => 'N',
                 };
-                
+
                 if effective_strand == Direction::Reverse {
-                    // Use lowercase for reverse complement
                     result.push(base_char.to_lowercase().next().unwrap());
                 } else {
                     result.push(base_char);
@@ -203,24 +227,56 @@ pub fn expand_rule_to_string(rule: &Rule, grammar: &HashMap<usize, Rule>, parent
             },
             SymbolType::NonTerminal(rule_id) => {
                 if let Some(nested_rule) = grammar.get(rule_id) {
-                    let expanded = expand_rule_to_string(nested_rule, grammar, effective_strand);
-                    result.push_str(&expanded);
+                    // Push nested rule symbols onto the work stack
+                    work_stack.push((&nested_rule.symbols, 0, effective_strand));
                 } else {
-                    // Rule not found, use a placeholder
                     result.push_str(&format!("[R{}?]", rule_id));
                 }
             }
         }
     }
-    
+
     result
 }
 
 /// Expands a compressed sequence to its full representation using the grammar rules
+/// Uses an iterative approach to avoid stack overflow with deeply nested rules
 pub fn expand_sequence_to_string(sequence: &[Symbol], rules: &HashMap<usize, Rule>) -> String {
     let mut result = String::new();
-    
-    for symbol in sequence {
+
+    // Work stack: (symbols to process, current index, strand)
+    let mut work_stack: Vec<(&[Symbol], usize, Direction)> = vec![(sequence, 0, Direction::Forward)];
+
+    // Safety limit to prevent infinite loops from buggy grammars
+    const MAX_ITERATIONS: usize = 100_000_000;
+    let mut iterations = 0;
+
+    while let Some((symbols, idx, current_strand)) = work_stack.pop() {
+        iterations += 1;
+        if iterations > MAX_ITERATIONS {
+            log::warn!("expand_sequence_to_string: hit iteration limit, possible cycle in grammar");
+            result.push_str("[TRUNCATED]");
+            break;
+        }
+
+        if idx >= symbols.len() {
+            continue;
+        }
+
+        // Push back the rest of this level to process after current symbol
+        if idx + 1 < symbols.len() {
+            work_stack.push((symbols, idx + 1, current_strand));
+        }
+
+        let symbol = &symbols[idx];
+
+        // Combine parent and symbol directions
+        let effective_strand = if current_strand == Direction::Reverse {
+            symbol.strand.flip()
+        } else {
+            symbol.strand
+        };
+
         match &symbol.symbol_type {
             SymbolType::Terminal(base) => {
                 let base_char = match base.0 {
@@ -230,9 +286,8 @@ pub fn expand_sequence_to_string(sequence: &[Symbol], rules: &HashMap<usize, Rul
                     3 => 'T',
                     _ => 'N',
                 };
-                
-                if symbol.strand == Direction::Reverse {
-                    // Use lowercase for reverse complement
+
+                if effective_strand == Direction::Reverse {
                     result.push(base_char.to_lowercase().next().unwrap());
                 } else {
                     result.push(base_char);
@@ -240,16 +295,15 @@ pub fn expand_sequence_to_string(sequence: &[Symbol], rules: &HashMap<usize, Rul
             },
             SymbolType::NonTerminal(rule_id) => {
                 if let Some(rule) = rules.get(rule_id) {
-                    let expanded = expand_rule_to_string(rule, rules, symbol.strand);
-                    result.push_str(&expanded);
+                    // Push rule symbols onto the work stack
+                    work_stack.push((&rule.symbols, 0, effective_strand));
                 } else {
-                    // Rule not found, use a placeholder
                     result.push_str(&format!("[R{}?]", rule_id));
                 }
             }
         }
     }
-    
+
     result
 }
 

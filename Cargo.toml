@@ -38,6 +38,7 @@ rayon = "1.7.0"    # Data parallelism library
 dashmap = "5.5.0"  # Thread-safe concurrent HashMap
 num_cpus = "1.16.0" # For getting the number of available CPU cores
 ordered-float = "3.7.0" # For ordering floating point values
+rustc-hash = "1.1.0"    # Faster non-cryptographic hashing
 
 # GPU Acceleration
 # OpenCL dependency will be added here

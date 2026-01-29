@@ -566,7 +566,7 @@ pub fn grammar_to_graphml_direct(grammar: &Grammar, options: &DotOptions) -> Res
 mod tests {
     use super::*;
     use crate::grammar::rule::Rule;
-    // use crate::grammar::symbol::{Symbol, SymbolType, Direction}; // Already imported via super::*
+    use crate::grammar::symbol::{Symbol, SymbolType, Direction}; // Explicitly importing Symbol
     use crate::encode::dna_2bit::EncodedBase;
     use std::collections::HashMap;
 
@@ -575,29 +575,31 @@ mod tests {
         let rule0 = Rule {
             id: 0,
             symbols: vec![
-                Symbol { id: 0, symbol_type: SymbolType::Terminal(EncodedBase::from_base(b'A').unwrap()), strand: Direction::Forward },
-                Symbol { id: 1, symbol_type: SymbolType::Terminal(EncodedBase::from_base(b'C').unwrap()), strand: Direction::Forward },
+                Symbol { id: 0, symbol_type: SymbolType::Terminal(EncodedBase::from_base(b'A').unwrap()), strand: Direction::Forward, source_grammar_id: None, original_pos: None },
+                Symbol { id: 1, symbol_type: SymbolType::Terminal(EncodedBase::from_base(b'C').unwrap()), strand: Direction::Forward, source_grammar_id: None, original_pos: None },
             ],
             usage_count: 4,
             positions: Vec::new(), // Added default
             depth: Some(1),
+            assembly_index: None,
         };
         let rule1 = Rule {
             id: 1,
             symbols: vec![
-                Symbol { id: 2, symbol_type: SymbolType::NonTerminal(0), strand: Direction::Forward }, 
-                Symbol { id: 3, symbol_type: SymbolType::Terminal(EncodedBase::from_base(b'G').unwrap()), strand: Direction::Forward },
+                Symbol { id: 2, symbol_type: SymbolType::NonTerminal(0), strand: Direction::Forward, source_grammar_id: None, original_pos: None }, 
+                Symbol { id: 3, symbol_type: SymbolType::Terminal(EncodedBase::from_base(b'G').unwrap()), strand: Direction::Forward, source_grammar_id: None, original_pos: None },
             ],
             usage_count: 2,
             positions: Vec::new(), // Added default
             depth: Some(2),
+            assembly_index: None,
         };
         rules.insert(0, rule0);
         rules.insert(1, rule1);
         Grammar {
             sequence: vec![
-                Symbol { id: 10, symbol_type: SymbolType::NonTerminal(0), strand: Direction::Forward },
-                Symbol { id: 11, symbol_type: SymbolType::NonTerminal(1), strand: Direction::Forward },
+                Symbol { id: 10, symbol_type: SymbolType::NonTerminal(0), strand: Direction::Forward, source_grammar_id: None, original_pos: None },
+                Symbol { id: 11, symbol_type: SymbolType::NonTerminal(1), strand: Direction::Forward, source_grammar_id: None, original_pos: None },
             ],
             rules,
             max_depth: 2, 
@@ -641,6 +643,8 @@ mod tests {
             id: 0, // Arbitrary ID for the test symbol itself
             symbol_type: SymbolType::Terminal(base_a),
             strand: Direction::Forward,
+            source_grammar_id: None,
+            original_pos: None,
         };
         assert_eq!(crate::utils::export::format_symbol(&s, &g), "A+"); 
     }

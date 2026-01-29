@@ -143,7 +143,7 @@ mod tests {
 
     #[test]
     fn test_rule_creation() {
-        let s1 = Symbol::terminal(0, EncodedBase(0), Direction::Forward);
+        let s1 = Symbol::terminal(0, EncodedBase(0), Direction::Forward, None, None);
         let s2 = Symbol::non_terminal(1, 100, Direction::Reverse);
         let rule = Rule::new(101, s1, s2);
 

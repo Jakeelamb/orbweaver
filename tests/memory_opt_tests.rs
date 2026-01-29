@@ -43,11 +43,11 @@ mod memory_optimization_tests {
         // Create a builder with a small max rule count (4) and min usage (2)
         let min_rule_usage = 2;
         let max_rule_count = 4;
-        let mut builder = GrammarBuilder::new(min_rule_usage, false)
+        let mut builder = GrammarBuilder::new(min_rule_usage, false, None)
             .with_max_rules(max_rule_count);
         
         // Build the grammar
-        builder.build_grammar(&sequence).expect("Failed to build grammar");
+        builder.build_grammar(&sequence, 0).expect("Failed to build grammar");
         
         // Get the resulting grammar
         let (_, rules) = builder.get_grammar();
@@ -78,7 +78,7 @@ mod memory_optimization_tests {
         let chunk_size = 1000;
         
         // Create a builder with streaming mode enabled
-        let mut streaming_builder = GrammarBuilder::new(2, false)
+        let mut streaming_builder = GrammarBuilder::new(2, false, None)
             .enable_streaming_mode();
         
         // Process the sequence in chunks
@@ -87,7 +87,7 @@ mod memory_optimization_tests {
             let end = std::cmp::min(chunk_start + chunk_size, sequence.len());
             let chunk = &sequence[chunk_start..end];
             
-            streaming_builder.process_sequence_chunk(chunk)
+            streaming_builder.process_sequence_chunk(chunk, 0, chunk_start)
                 .expect("Failed to process chunk");
         }
         
@@ -99,11 +99,11 @@ mod memory_optimization_tests {
         let (streaming_sequence, streaming_rules) = streaming_builder.get_grammar();
         
         // Create a builder without streaming for comparison
-        let mut standard_builder = GrammarBuilder::new(2, false);
+        let mut standard_builder = GrammarBuilder::new(2, false, None);
         
         // Process the entire sequence at once
         let start_time = Instant::now();
-        standard_builder.build_grammar(&sequence).expect("Failed to build grammar");
+        standard_builder.build_grammar(&sequence, 0).expect("Failed to build grammar");
         let standard_time = start_time.elapsed();
         
         // Get the resulting grammar

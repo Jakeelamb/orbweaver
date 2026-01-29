@@ -5,10 +5,12 @@ use std::path::PathBuf;
 use std::fs;
 use chrono::{Utc, DateTime};
 use serde::{Serialize, Deserialize};
-use orbweaver::fasta::reader::{read_sequences_from_multiple_files_async};
+use orbweaver::fasta::reader::{read_sequences_from_multiple_files_async, MemoryMappedFastaReader, FastaReader};
 use orbweaver::encode::dna_2bit::{EncodedBase};
 use orbweaver::grammar::builder::GrammarBuilder;
-use orbweaver::grammar::engine::{Grammar};
+use orbweaver::grammar::engine::Grammar;
+use orbweaver::grammar::lcg::{LcgBuilder, LcgConfig};
+use orbweaver::grammar::{Rule, Symbol};
 use orbweaver::analysis::stats::calculate_and_print_stats;
 use orbweaver::utils::visualization::DotOptions;
 use orbweaver::parallel::chunking::ChunkingConfig;
@@ -242,6 +244,26 @@ struct OrbweaverArgs {
     #[clap(long, action = clap::ArgAction::SetTrue)]
     no_gpu: bool,
 
+    /// Use LCG (Locally Consistent Grammar) algorithm for O(n) scaling.
+    ///
+    /// Recommended for large sequences (>10MB). Uses content-based fingerprinting
+    /// instead of position-based tracking, enabling true parallel processing.
+    #[clap(long, action = clap::ArgAction::SetTrue)]
+    use_lcg: bool,
+
+    /// Use memory-mapped I/O for processing files larger than RAM.
+    ///
+    /// Combines memory-mapped file access with LCG's parallel chunk processing.
+    /// Each chunk is processed independently and merged using fingerprint-based
+    /// deduplication. Automatically enables --use-lcg.
+    #[clap(long, action = clap::ArgAction::SetTrue)]
+    mmap: bool,
+
+    /// Chunk size for memory-mapped processing (in bases).
+    /// Default: 10MB (10_000_000). Larger chunks = better compression but more memory.
+    #[clap(long, value_parser, default_value_t = 10_000_000)]
+    mmap_chunk_size: usize,
+
     /// Graph-related arguments
     #[clap(long, value_parser, default_value_t = String::from("sfdp"))]
     graph_engine: String,
@@ -462,7 +484,10 @@ async fn main() -> Result<()> {
     info!("Output will be saved to: {}", run_specific_output_dir.display());
 
     // --- Main Processing Logic ---
-    let result: Result<(Grammar, HashMap<String, PathBuf>, Vec<(String, usize)>)> = if args.streaming {
+    let result: Result<(Grammar, HashMap<String, PathBuf>, Vec<(String, usize)>)> = if args.mmap {
+        // Memory-mapped mode with LCG - for files larger than RAM
+        Ok(process_mmap_lcg_mode(&args, &run_specific_output_dir, &initial_checkpoints)?)
+    } else if args.streaming {
         Ok(process_streaming_mode(&args, gpu_context.clone(), &run_specific_output_dir, &initial_checkpoints).await?)
     } else if args.chunk_size > 0 || args.adaptive_chunking {
         // TODO: Pass GPU context to chunked mode if/when it supports it
@@ -681,6 +706,9 @@ async fn process_standard_mode(
             if let Some(max_rules) = task_args.max_rule_count {
                 grammar_builder = grammar_builder.with_max_rules(max_rules);
             }
+            if task_args.use_lcg {
+                grammar_builder = grammar_builder.with_lcg();
+            }
             let encoded_bases = encode_dna(&bases_owned); 
             println!("  Using 2-bit encoding ({} bases -> {} encoded bases)", 
                      bases_owned.len(), encoded_bases.len());
@@ -768,6 +796,9 @@ async fn process_streaming_mode(
         let mut grammar_builder = GrammarBuilder::new(args.min_rule_usage, args.reverse_aware, gpu_context.clone()).enable_streaming_mode();
         if let Some(max_rules) = args.max_rule_count {
             grammar_builder = grammar_builder.with_max_rules(max_rules);
+        }
+        if args.use_lcg {
+            grammar_builder = grammar_builder.with_lcg();
         }
 
         let file = File::open(input_file_path)
@@ -931,9 +962,192 @@ fn process_chunked_mode(
 }
 
 fn encode_dna(bases: &[u8]) -> Vec<EncodedBase> {
-    bases.iter()
-        .filter_map(|&b| EncodedBase::from_base(b))
-        .collect()
+    // Use SIMD-optimized batch encoding for better performance
+    let mut output = Vec::new();
+    orbweaver::encode::simd::encode_dna_batch(bases, &mut output);
+    output
+}
+
+/// Process using memory-mapped I/O with LCG algorithm for files larger than RAM.
+///
+/// This mode:
+/// 1. Memory-maps the FASTA file (no need to load into RAM)
+/// 2. Processes chunks in parallel using LCG's content-based fingerprinting
+/// 3. Merges chunk grammars trivially (fingerprints ensure identical content = identical rule IDs)
+fn process_mmap_lcg_mode(
+    args: &OrbweaverArgs,
+    run_specific_output_dir: &PathBuf,
+    initial_checkpoints: &HashMap<String, PathBuf>
+) -> Result<(Grammar, HashMap<String, PathBuf>, Vec<(String, usize)>)> {
+    println!("Using memory-mapped LCG mode for large file processing");
+    println!("  Chunk size: {} bases ({:.1} MB)",
+             args.mmap_chunk_size,
+             args.mmap_chunk_size as f64 / 1_000_000.0);
+
+    let checkpoints_dir = run_specific_output_dir.join("checkpoints");
+    if !checkpoints_dir.exists() {
+        fs::create_dir_all(&checkpoints_dir)
+            .with_context(|| format!("Failed to create checkpoints directory: {:?}", checkpoints_dir))?;
+    }
+
+    let mut current_run_checkpoints = initial_checkpoints.clone();
+    let mut all_grammars: Vec<Grammar> = Vec::new();
+    let mut chromosome_details: Vec<(String, usize)> = Vec::new();
+    let mut total_bases = 0usize;
+
+    for (file_idx, input_file_path) in args.input_files.iter().enumerate() {
+        let file_identifier = format!(
+            "mmap_{}_{}",
+            file_idx,
+            input_file_path.file_stem().unwrap_or_default().to_string_lossy()
+        );
+        let checkpoint_file_name = format!("{}.bincode", file_identifier);
+        let checkpoint_path = checkpoints_dir.join(&checkpoint_file_name);
+
+        // Check for existing checkpoint
+        if let Some(existing_checkpoint_path) = current_run_checkpoints.get(&file_identifier) {
+            if existing_checkpoint_path.exists() && !args.force_rerun {
+                println!("Loading grammar for file {} from checkpoint {:?}",
+                         input_file_path.display(), existing_checkpoint_path);
+                match File::open(existing_checkpoint_path) {
+                    Ok(file) => match bincode::deserialize_from(file) {
+                        Ok(grammar) => {
+                            all_grammars.push(grammar);
+                            continue;
+                        }
+                        Err(e) => println!("Warning: Failed to deserialize checkpoint: {}. Recomputing.", e),
+                    },
+                    Err(e) => println!("Warning: Failed to open checkpoint: {}. Recomputing.", e),
+                }
+            }
+        }
+
+        println!("Memory-mapping file: {}", input_file_path.display());
+        let start_time = std::time::Instant::now();
+
+        // Create memory-mapped reader
+        let mmap_reader = MemoryMappedFastaReader::new(input_file_path, args.skip_ns)
+            .with_context(|| format!("Failed to memory-map file: {}", input_file_path.display()))?;
+
+        // Get sequence count and process each
+        let seq_length = mmap_reader.get_sequence_length(0)
+            .with_context(|| "Failed to get sequence length")?;
+
+        chromosome_details.push((input_file_path.file_name().unwrap_or_default().to_string_lossy().to_string(), seq_length));
+        total_bases += seq_length;
+
+        println!("  Sequence length: {} bases ({:.1} MB)",
+                 seq_length,
+                 seq_length as f64 / 1_000_000.0);
+
+        // Configure LCG
+        let lcg_config = LcgConfig {
+            min_phrase_len: 2,
+            max_phrase_len: 256,
+            window_size: 8,
+            min_occurrences: args.min_rule_usage,
+        };
+
+        // Process in parallel chunks using the memory-mapped reader
+        let chunk_size = args.mmap_chunk_size;
+        let num_chunks = (seq_length + chunk_size - 1) / chunk_size;
+
+        println!("  Processing {} chunks in parallel...", num_chunks);
+
+        // Process chunks in parallel and collect LcgBuilders
+        let chunk_results: Vec<(Vec<Symbol>, LcgBuilder)> = mmap_reader
+            .process_in_parallel_chunks(chunk_size, 0, |chunk_data: &[u8]| {
+                // Encode the chunk
+                let encoded: Vec<EncodedBase> = chunk_data
+                    .iter()
+                    .filter_map(|&b| EncodedBase::from_base(b))
+                    .collect();
+
+                if encoded.is_empty() {
+                    return (Vec::new(), LcgBuilder::new(lcg_config.clone()));
+                }
+
+                // Build grammar for this chunk
+                let mut lcg_builder = LcgBuilder::new(lcg_config.clone());
+                let (compressed_sequence, _rules) = lcg_builder.build_grammar(&encoded, file_idx);
+
+                (compressed_sequence, lcg_builder)
+            })
+            .with_context(|| format!("Failed to process chunks for file: {}", input_file_path.display()))?;
+
+        println!("  Merging {} chunk grammars...", chunk_results.len());
+
+        // Merge all LcgBuilders - fingerprints ensure identical content gets identical rule IDs
+        // We need to remap NonTerminal references as we merge
+        let mut master_builder = LcgBuilder::new(lcg_config.clone());
+        let mut all_compressed_symbols: Vec<Symbol> = Vec::new();
+
+        for (mut compressed_seq, chunk_builder) in chunk_results {
+            // Merge the rules and get the ID mapping
+            let id_mapping = master_builder.merge(chunk_builder);
+
+            // Remap NonTerminal references in this chunk's compressed sequence
+            LcgBuilder::remap_sequence(&mut compressed_seq, &id_mapping);
+
+            // Concatenate the compressed sequences
+            all_compressed_symbols.extend(compressed_seq);
+        }
+
+        // Convert to Grammar
+        let rules_map: HashMap<usize, Rule> = master_builder
+            .get_rules()
+            .clone()
+            .into_iter()
+            .collect();
+
+        let file_grammar = Grammar {
+            sequence: all_compressed_symbols,
+            rules: rules_map,
+            max_depth: 0, // Will be calculated later
+            origins: HashMap::new(),
+        };
+
+        let elapsed = start_time.elapsed();
+        println!("  File processed in {:.2?}", elapsed);
+        println!("  Result: {} symbols, {} rules, {:.2}x compression",
+                 file_grammar.sequence.len(),
+                 file_grammar.rules.len(),
+                 seq_length as f64 / file_grammar.sequence.len().max(1) as f64);
+
+        // Save checkpoint
+        match File::create(&checkpoint_path) {
+            Ok(file_writer) => {
+                if let Err(e) = bincode::serialize_into(file_writer, &file_grammar) {
+                    println!("Warning: Failed to save checkpoint: {}. Proceeding.", e);
+                } else {
+                    println!("  Saved checkpoint to {:?}", checkpoint_path);
+                    current_run_checkpoints.insert(file_identifier.clone(), checkpoint_path.clone());
+                }
+            }
+            Err(e) => println!("Warning: Failed to create checkpoint file: {}. Proceeding.", e),
+        }
+
+        all_grammars.push(file_grammar);
+    }
+
+    // Merge all file grammars if multiple files
+    let final_grammar = if all_grammars.len() == 1 {
+        all_grammars.remove(0)
+    } else {
+        println!("Merging {} file grammars...", all_grammars.len());
+        let dummy_config = ChunkingConfig::default();
+        let (merged, _metrics) = merge_grammars(all_grammars, &dummy_config, total_bases)?;
+        merged
+    };
+
+    println!("Memory-mapped LCG processing complete:");
+    println!("  Total bases: {}", total_bases);
+    println!("  Final sequence: {} symbols", final_grammar.sequence.len());
+    println!("  Final rules: {}", final_grammar.rules.len());
+    println!("  Compression ratio: {:.2}x",
+             total_bases as f64 / final_grammar.sequence.len().max(1) as f64);
+
+    Ok((final_grammar, current_run_checkpoints, chromosome_details))
 }
 
 #[cfg(test)]
