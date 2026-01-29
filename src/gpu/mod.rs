@@ -169,10 +169,8 @@ impl GpuContext {
     
     /// Load and compile the OpenCL kernels
     fn load_kernels(&mut self) -> Result<()> {
-        // Get kernel source code for digram kernel
+        // Get kernel source code from the orbweaver_kernels crate
         let digram_kernel_src = orbweaver_kernels::get_digram_kernel();
-        
-        // Get suffix array kernel from the kernels crate
         let suffix_array_kernel_src = orbweaver_kernels::get_suffix_array_kernel();
         
         // Combine kernels with proper header (OpenCL C version pragma)

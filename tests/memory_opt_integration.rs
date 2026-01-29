@@ -37,8 +37,8 @@ mod memory_optimization_integration_tests {
         
         // Test standard processing
         let standard_start = Instant::now();
-        let mut standard_builder = GrammarBuilder::new(2, false);
-        standard_builder.build_grammar(&sequence).expect("Standard grammar building failed");
+        let mut standard_builder = GrammarBuilder::new(2, false, None);
+        standard_builder.build_grammar(&sequence, 0).expect("Standard grammar building failed");
         let standard_duration = standard_start.elapsed();
         let (standard_seq, standard_rules) = standard_builder.get_grammar();
         
@@ -46,7 +46,7 @@ mod memory_optimization_integration_tests {
         
         // Test streaming processing
         let streaming_start = Instant::now();
-        let mut streaming_builder = GrammarBuilder::new(2, false)
+        let mut streaming_builder = GrammarBuilder::new(2, false, None)
             .enable_streaming_mode()
             .with_max_rules(1000); // Limit rule count
         
@@ -56,7 +56,7 @@ mod memory_optimization_integration_tests {
             let end = std::cmp::min(chunk_start + chunk_size, sequence.len());
             let chunk = &sequence[chunk_start..end];
             
-            streaming_builder.process_sequence_chunk(chunk)
+            streaming_builder.process_sequence_chunk(chunk, 0, chunk_start)
                 .expect("Streaming processing failed");
         }
         

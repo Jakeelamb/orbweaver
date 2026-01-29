@@ -83,8 +83,8 @@ mod tests {
     #[test]
     fn test_hash_symbols() {
         let symbols = vec![
-            Symbol::terminal(0, EncodedBase(0), Direction::Forward),
-            Symbol::terminal(1, EncodedBase(1), Direction::Forward),
+            Symbol::terminal(0, EncodedBase(0), Direction::Forward, None, None),
+            Symbol::terminal(1, EncodedBase(1), Direction::Forward, None, None),
             Symbol::non_terminal(2, 1, Direction::Forward),
         ];
         
@@ -93,8 +93,8 @@ mod tests {
         assert_eq!(hash1, hash2, "Same input should produce same hash");
         
         let different_symbols = vec![
-            Symbol::terminal(0, EncodedBase(2), Direction::Forward),
-            Symbol::terminal(1, EncodedBase(3), Direction::Forward),
+            Symbol::terminal(0, EncodedBase(2), Direction::Forward, None, None),
+            Symbol::terminal(1, EncodedBase(3), Direction::Forward, None, None),
         ];
         
         let hash3 = hash_symbols(&different_symbols);
@@ -121,8 +121,8 @@ mod tests {
         let base_t = EncodedBase::from_base(b'T').unwrap();
         
         // A+ T+ should be equivalent to A- T- (reverse complement)
-        let sym_a_fwd = Symbol::terminal(0, base_a, Direction::Forward);
-        let sym_t_fwd = Symbol::terminal(1, base_t, Direction::Forward);
+        let sym_a_fwd = Symbol::terminal(0, base_a, Direction::Forward, None, None);
+        let sym_t_fwd = Symbol::terminal(1, base_t, Direction::Forward, None, None);
         let sym_a_rev = sym_a_fwd.reverse_complement();
         let sym_t_rev = sym_t_fwd.reverse_complement();
         
@@ -140,10 +140,10 @@ mod tests {
         let base_c = EncodedBase::from_base(b'C').unwrap();
         let base_g = EncodedBase::from_base(b'G').unwrap();
         
-        let sym_a_fwd = Symbol::terminal(0, base_a, Direction::Forward);
-        let sym_t_fwd = Symbol::terminal(1, base_t, Direction::Forward);
-        let sym_c_fwd = Symbol::terminal(2, base_c, Direction::Forward);
-        let sym_g_fwd = Symbol::terminal(3, base_g, Direction::Forward);
+        let sym_a_fwd = Symbol::terminal(0, base_a, Direction::Forward, None, None);
+        let sym_t_fwd = Symbol::terminal(1, base_t, Direction::Forward, None, None);
+        let sym_c_fwd = Symbol::terminal(2, base_c, Direction::Forward, None, None);
+        let sym_g_fwd = Symbol::terminal(3, base_g, Direction::Forward, None, None);
         
         // Test AT/TA case
         let digram1 = (sym_a_fwd, sym_t_fwd);

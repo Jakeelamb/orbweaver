@@ -160,7 +160,7 @@ mod tests {
     use std::collections::HashMap;
 
     fn create_terminal(id: usize, base_val: u8, strand: Direction) -> Symbol {
-        Symbol::terminal(id, EncodedBase(base_val), strand)
+        Symbol::terminal(id, EncodedBase(base_val), strand, None, None)
     }
 
     fn create_non_terminal(id: usize, rule_id: usize, strand: Direction) -> Symbol {

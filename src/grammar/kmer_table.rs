@@ -231,7 +231,7 @@ mod tests {
 
     // Helper to create terminal symbols
     fn term(id: usize, base_val: u8, dir: Direction) -> Symbol {
-        Symbol::terminal(id, EncodedBase(base_val), dir)
+        Symbol::terminal(id, EncodedBase(base_val), dir, None, None)
     }
 
     #[test]
@@ -297,9 +297,9 @@ mod tests {
     #[test]
     fn test_canonicalization_kmer() {
         let table = KmerTable::new(3);
-        let s1 = Symbol::terminal(0, EncodedBase(0), Direction::Forward); // A+ id0
-        let s2 = Symbol::terminal(1, EncodedBase(1), Direction::Forward); // C+ id1
-        let s3 = Symbol::terminal(2, EncodedBase(2), Direction::Forward); // G+ id2
+        let s1 = Symbol::terminal(0, EncodedBase(0), Direction::Forward, None, None); // A+ id0
+        let s2 = Symbol::terminal(1, EncodedBase(1), Direction::Forward, None, None); // C+ id1
+        let s3 = Symbol::terminal(2, EncodedBase(2), Direction::Forward, None, None); // G+ id2
 
         // kmer_ctg_rev is G.rc, C.rc, A.rc (from s3,s2,s1)
         let kmer_ctg_rev = vec![

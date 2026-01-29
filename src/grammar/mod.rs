@@ -5,6 +5,8 @@ pub mod digram;
 pub mod digram_table;
 pub mod builder;
 pub mod kmer_table;
+pub mod alphabet;
+pub mod lcg;
 
 // Export core types for anyone importing the grammar module
 pub use crate::grammar::rule::Rule;
@@ -13,3 +15,4 @@ pub use crate::grammar::engine::Grammar;
 pub use crate::grammar::builder::GrammarBuilder;
 pub use crate::grammar::digram::Digram;
 pub use crate::grammar::digram_table::DigramTable;
+pub use crate::grammar::alphabet::AlphabetType;

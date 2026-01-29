@@ -1,6 +1,7 @@
 // extern crate assert_matches;
 use crate::grammar::digram_table::{DigramTable, DigramKeyTuple, DigramSource};
 use crate::grammar::kmer_table::KmerTable;
+use crate::grammar::lcg::{LcgBuilder, LcgConfig};
 use crate::grammar::rule::Rule;
 use crate::grammar::symbol::{Symbol, SymbolType, Direction};
 use crate::encode::dna_2bit::EncodedBase;
@@ -10,7 +11,7 @@ use std::time::Instant;
 use crate::gpu::GpuContext;
 use crate::gpu::digram::GpuSequence;
 use crate::grammar::engine::Grammar;
-use crate::analysis::assembly_index::calculate_rule_assembly_indices; // Added for Assembly Index
+use crate::analysis::assembly_index::calculate_rule_assembly_indices;
 use log;
 
 /// Builds a grammar (set of rules) by iteratively replacing 
@@ -44,6 +45,8 @@ pub struct GrammarBuilder {
     total_bases_processed: usize,
     // Store the GPU context if provided
     gpu_context: Option<std::sync::Arc<GpuContext>>,
+    // Use LCG (Locally Consistent Grammar) algorithm for O(n) scaling
+    use_lcg: bool,
 }
 
 /// Track performance metrics during grammar construction
@@ -76,7 +79,16 @@ impl GrammarBuilder {
             chunk_count: 0,
             total_bases_processed: 0,
             gpu_context,
+            use_lcg: false,
         }
+    }
+
+    /// Enable LCG (Locally Consistent Grammar) algorithm for O(n) scaling.
+    /// This is recommended for large sequences (>10MB) as it avoids the O(n²)
+    /// complexity of the traditional Sequitur approach.
+    pub fn with_lcg(mut self) -> Self {
+        self.use_lcg = true;
+        self
     }
 
     /// Sets the maximum number of rules before triggering rule eviction.
@@ -149,6 +161,9 @@ impl GrammarBuilder {
                 self.metrics.step_count, self.sequence.len(), self.rules.len());
         }
 
+        // Rebuild the pattern table each step.
+        // Note: Incremental updates are complex because position indices shift after replacements.
+        // A future optimization would use content-based keys (fingerprinting) like the LCG algorithm.
         self.rebuild_pattern_table()?;
 
         let pattern_found = if self.kmer_size == 2 {
@@ -415,6 +430,11 @@ impl GrammarBuilder {
     /// Builds a grammar from the given sequence.
     /// This is the main entry point for grammar construction.
     pub fn build_grammar(&mut self, initial_sequence: &[EncodedBase], source_grammar_id: usize) -> Result<()> {
+        // Use LCG algorithm if enabled (O(n) vs O(n²))
+        if self.use_lcg {
+            return self.build_grammar_lcg(initial_sequence, source_grammar_id);
+        }
+
         // Use GPU acceleration if context is available
         if self.gpu_context.is_some() {
             match self.build_grammar_with_gpu(initial_sequence, source_grammar_id) {
@@ -425,8 +445,8 @@ impl GrammarBuilder {
                 }
             }
         }
-        
-        // CPU implementation follows
+
+        // CPU implementation follows (traditional Sequitur-style O(n²))
         let start = Instant::now();
 
         // Initialize the sequence if not in streaming mode
@@ -485,7 +505,52 @@ impl GrammarBuilder {
             start.elapsed(), self.rules.len(), steps, self.get_max_rule_depth());
         Ok(())
     }
-    
+
+    /// Build grammar using the LCG (Locally Consistent Grammar) algorithm.
+    /// This is O(n) instead of O(n²) and scales to terabyte-sized inputs.
+    fn build_grammar_lcg(&mut self, initial_sequence: &[EncodedBase], source_grammar_id: usize) -> Result<()> {
+        let start = Instant::now();
+        log::info!("Starting LCG (Locally Consistent Grammar) construction...");
+
+        // Configure LCG based on our settings
+        let config = LcgConfig {
+            min_phrase_len: 2,
+            max_phrase_len: 256,
+            window_size: 8,
+            min_occurrences: self.min_rule_usage,
+        };
+
+        let mut lcg_builder = LcgBuilder::new(config);
+        let (compressed_sequence, lcg_rules) = lcg_builder.build_grammar(initial_sequence, source_grammar_id);
+
+        // Transfer results to our builder
+        self.sequence = compressed_sequence;
+        self.rules = lcg_rules.into_iter().collect();
+        self.next_rule_id = self.rules.keys().max().map(|m| m + 1).unwrap_or(0);
+
+        // Calculate rule depths
+        self.calculate_rule_depths();
+
+        // Calculate Assembly Indices
+        match calculate_rule_assembly_indices(&mut self.rules) {
+            Ok(_) => log::debug!("Assembly indices calculated successfully."),
+            Err(e) => {
+                log::warn!("Failed to calculate assembly indices: {}. Proceeding without them.", e);
+            }
+        }
+
+        log::info!(
+            "LCG grammar construction completed in {:?}. Sequence: {} -> {} symbols, Rules: {}, Compression: {:.2}x",
+            start.elapsed(),
+            initial_sequence.len(),
+            self.sequence.len(),
+            self.rules.len(),
+            initial_sequence.len() as f64 / self.sequence.len().max(1) as f64
+        );
+
+        Ok(())
+    }
+
     /// Process the grammar using GPU acceleration, including digram finding and suffix array construction.
     pub fn build_grammar_with_gpu(&mut self, initial_sequence: &[EncodedBase], source_grammar_id: usize) -> Result<()> {
         if self.gpu_context.is_none() {
@@ -919,6 +984,8 @@ impl GrammarBuilder {
         self.metrics.inlining_time += start.elapsed();
     }
 
+    /// Replaces digram occurrences with a new rule symbol.
+    /// The digram table is rebuilt after this by the caller (step function).
     fn replace_digram_occurrences(
         &mut self,
         rule_id: usize,
@@ -927,41 +994,41 @@ impl GrammarBuilder {
         if occurrences.is_empty() || self.sequence.is_empty() {
             return Ok(());
         }
-        let mut new_sequence = Vec::with_capacity(self.sequence.len());
-        let mut current_pos = 0;
+
+        // Sort occurrences by position ascending
         let mut sorted_occurrences = occurrences.to_vec();
         sorted_occurrences.sort_by_key(|(pos, _)| *pos);
 
-        let mut occurrence_iter = sorted_occurrences.iter().peekable();
+        // Filter out overlapping occurrences (keep non-overlapping only)
+        let mut non_overlapping: Vec<usize> = Vec::with_capacity(sorted_occurrences.len());
+        let mut last_end = 0usize;
+
+        for (pos, _) in &sorted_occurrences {
+            if *pos >= last_end {
+                non_overlapping.push(*pos);
+                last_end = pos + 2; // Digram occupies pos and pos+1
+            }
+        }
+
+        // Build new sequence with replacements in a single pass
+        let mut new_sequence = Vec::with_capacity(self.sequence.len() - non_overlapping.len());
+        let mut occ_iter = non_overlapping.iter().peekable();
+        let mut current_pos = 0;
 
         while current_pos < self.sequence.len() {
-            if let Some((occ_pos, _)) = occurrence_iter.peek() {
-                if current_pos == *occ_pos {
-                    // Replace digram with new rule symbol
-                    new_sequence.push(Symbol::non_terminal(
-                        current_pos, // Original position for the new symbol
-                        rule_id,
-                        Direction::Forward, // Assuming Forward for now
-                    ));
-                    // Advance past the two symbols that formed the digram
-                    current_pos += 2;
-                    occurrence_iter.next(); // Consume this occurrence
-
-                    // Skip any overlapping occurrences
-                    while let Some((next_occ_pos, _)) = occurrence_iter.peek() {
-                        if *next_occ_pos < current_pos {
-                            occurrence_iter.next(); // Consume overlapping occurrence
-                        } else {
-                            break;
-                        }
-                    }
+            if let Some(&&occ_pos) = occ_iter.peek() {
+                if current_pos == occ_pos {
+                    // Replace digram with non-terminal
+                    new_sequence.push(Symbol::non_terminal(new_sequence.len(), rule_id, Direction::Forward));
+                    current_pos += 2; // Skip both symbols
+                    occ_iter.next();
                     continue;
                 }
             }
-            // Copy symbol if not part of a replaced digram
-            new_sequence.push(self.sequence[current_pos].clone());
+            new_sequence.push(self.sequence[current_pos]);
             current_pos += 1;
         }
+
         self.sequence = new_sequence;
         Ok(())
     }
