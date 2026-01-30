@@ -1614,6 +1614,7 @@ dependencies = [
  "bincode",
  "bio",
  "bitnuc",
+ "bumpalo",
  "byteorder",
  "chrono",
  "clap",

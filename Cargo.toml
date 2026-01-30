@@ -76,6 +76,7 @@ crossbeam-channel = "0.5"
 memmap2 = "0.7.1" # Add memmap2
 twox-hash = "1.6.3"
 union-find = "0.4.2"
+bumpalo = { version = "3.14", features = ["collections"] } # Arena allocator for reduced allocation overhead
 
 # Profiling dependencies
 pprof = { version = "0.12.1", features = ["flamegraph", "protobuf-codec"], optional = true }

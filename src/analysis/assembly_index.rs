@@ -2,7 +2,7 @@ use crate::grammar::rule::Rule;
 use crate::grammar::symbol::{Symbol, SymbolType};
 // use crate::encode::dna_2bit::EncodedBase; // This is not used in this function
 use std::collections::{HashMap, HashSet, VecDeque};
-use anyhow::{Result, bail};
+use anyhow::Result;
 
 /// Calculates and caches the assembly index for each rule in the grammar.
 /// The assembly index is stored in Rule::assembly_index.
@@ -80,7 +80,22 @@ pub fn calculate_rule_assembly_indices(rules: &mut HashMap<usize, Rule>) -> Resu
     // Check for cycles (rules with nonzero in-degree)
     let remaining: Vec<_> = in_degree.iter().filter(|(_, &deg)| deg > 0).map(|(&id, _)| id).collect();
     if !remaining.is_empty() {
-        bail!("Cycle detected in rule dependencies: {:?}", remaining);
+        // Instead of bailing, assign fallback assembly indices for cyclic rules.
+        // This is common with LCG grammars where mutual references can create cycles.
+        // Fallback AI = rule.symbols.len() - 1 (minimum assembly steps for the rule)
+        log::warn!(
+            "Cycle detected in {} rule dependencies: {:?}. Assigning fallback assembly indices.",
+            remaining.len(),
+            if remaining.len() <= 10 { format!("{:?}", remaining) } else { format!("{:?}...", &remaining[..10]) }
+        );
+
+        for rule_id in remaining {
+            if let Some(rule) = rules.get_mut(&rule_id) {
+                // Fallback: use the number of symbols minus 1 as assembly index
+                // This represents the minimum number of assembly steps for this rule
+                rule.assembly_index = Some(rule.symbols.len().saturating_sub(1));
+            }
+        }
     }
     Ok(())
 }
@@ -193,22 +208,53 @@ mod tests {
     }
     
     #[test]
-    fn test_calculate_rule_assembly_indices_cyclic_dependency_warning() {
-        // This test checks that cycles are detected and an error is returned
+    fn test_calculate_rule_assembly_indices_cyclic_dependency_fallback() {
+        // This test checks that cycles are detected and fallback assembly indices are assigned
         let mut grammar = Grammar {
             sequence: vec![],
             rules: HashMap::new(),
             max_depth: 0,
             origins: HashMap::new(),
         };
-        // R0 -> R1
+        // R0 -> R1 (one non-terminal symbol)
         grammar.rules.insert(0, create_rule(0, vec![non_term(0,1)], None));
-        // R1 -> R0
+        // R1 -> R0 (one non-terminal symbol)
         grammar.rules.insert(1, create_rule(1, vec![non_term(1,0)], None));
 
-        // Function should return an error for cycles
+        // Function should succeed and assign fallback indices for cyclic rules
         let result = calculate_rule_assembly_indices(&mut grammar.rules);
-        assert!(result.is_err(), "Expected error for cyclic dependency");
+        assert!(result.is_ok(), "Should succeed with fallback for cyclic dependency");
+
+        // Check that fallback assembly indices were assigned
+        // Fallback = symbols.len() - 1 = 1 - 1 = 0
+        assert_eq!(grammar.rules.get(&0).unwrap().assembly_index, Some(0));
+        assert_eq!(grammar.rules.get(&1).unwrap().assembly_index, Some(0));
+    }
+
+    #[test]
+    fn test_calculate_rule_assembly_indices_mixed_cyclic_and_acyclic() {
+        // Test with both cyclic and acyclic rules
+        let mut grammar = Grammar {
+            sequence: vec![],
+            rules: HashMap::new(),
+            max_depth: 0,
+            origins: HashMap::new(),
+        };
+        // R0 -> A T (no dependencies, should be processed first)
+        grammar.rules.insert(0, create_rule(0, vec![term(0,0), term(1,3)], None));
+        // R1 -> R2 (cycle with R2)
+        grammar.rules.insert(1, create_rule(1, vec![non_term(2,2), term(3,0)], None));
+        // R2 -> R1 (cycle with R1)
+        grammar.rules.insert(2, create_rule(2, vec![non_term(4,1)], None));
+
+        let result = calculate_rule_assembly_indices(&mut grammar.rules);
+        assert!(result.is_ok(), "Should succeed with fallback for partial cycles");
+
+        // R0 should have proper assembly index (2 symbols - 1 = 1)
+        assert_eq!(grammar.rules.get(&0).unwrap().assembly_index, Some(1));
+        // R1 and R2 should have fallback indices
+        assert!(grammar.rules.get(&1).unwrap().assembly_index.is_some());
+        assert!(grammar.rules.get(&2).unwrap().assembly_index.is_some());
     }
 
     #[test]

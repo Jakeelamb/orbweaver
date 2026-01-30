@@ -160,7 +160,19 @@ pub struct OrbweaverArgs {
     /// Default: 1MB (1024 * 1024).
     #[clap(long, value_parser)]
     pub chunk_size_streaming: Option<usize>,
-    
+
+    /// Enable streaming output mode for writing results.
+    ///
+    /// Writes JSON output incrementally with periodic flushing,
+    /// reducing peak memory usage for very large grammars.
+    #[clap(long, action = clap::ArgAction::SetTrue)]
+    pub streaming_output: bool,
+
+    /// Flush interval for streaming output (number of rules between flushes).
+    /// Default: 1000.
+    #[clap(long, value_parser, default_value = "1000")]
+    pub streaming_output_flush_interval: usize,
+
     /// Enable adaptive chunk sizing.
     /// 
     /// Dynamically adjust chunk sizes based on sequence complexity

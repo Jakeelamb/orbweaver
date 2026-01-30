@@ -164,6 +164,23 @@ pub struct MemoryMappedFastaReader {
     skip_ns: bool,
 }
 
+/// Metadata about a chunk for overlap-aware processing
+#[derive(Debug, Clone)]
+pub struct ChunkMetadata {
+    /// Starting position in the original sequence
+    pub start_pos: usize,
+    /// Length of the chunk (not including overlap from previous chunk)
+    pub effective_length: usize,
+    /// Length including overlap region at the end
+    pub total_length: usize,
+    /// Whether this is the first chunk
+    pub is_first: bool,
+    /// Whether this is the last chunk
+    pub is_last: bool,
+    /// Overlap size with the next chunk
+    pub overlap_size: usize,
+}
+
 impl MemoryMappedFastaReader {
     /// Create a new memory-mapped FASTA reader
     pub fn new(path: &Path, skip_ns: bool) -> Result<Self> {
@@ -229,6 +246,92 @@ impl MemoryMappedFastaReader {
         Ok(results)
     }
     
+    /// Process FASTA file in memory-mapped mode with parallel chunks and overlap support.
+    ///
+    /// This method enables detection of patterns that span chunk boundaries by including
+    /// overlap regions at chunk boundaries.
+    ///
+    /// # Arguments
+    /// * `chunk_size` - Size of each chunk in bases
+    /// * `overlap_size` - Size of overlap region between consecutive chunks
+    /// * `sequence_id` - Index of the sequence to process
+    /// * `processor` - Function to process each chunk, receives (data, metadata)
+    ///
+    /// # Returns
+    /// A vector of results from processing each chunk
+    pub fn process_in_parallel_chunks_with_overlap<F, T>(
+        &self,
+        chunk_size: usize,
+        overlap_size: usize,
+        sequence_id: usize,
+        processor: F,
+    ) -> Result<Vec<T>>
+    where
+        F: Fn(&[u8], ChunkMetadata) -> T + Send + Sync,
+        T: Send,
+    {
+        if sequence_id >= self.records.len() {
+            anyhow::bail!("Sequence ID {} out of range (max: {})", sequence_id, self.records.len() - 1);
+        }
+
+        let record = &self.records[sequence_id];
+        println!("Processing record '{}' in parallel chunks with overlap", record.id);
+
+        // Ensure overlap is reasonable
+        let effective_overlap = overlap_size.min(chunk_size / 2);
+        let effective_stride = chunk_size.saturating_sub(effective_overlap);
+
+        if effective_stride == 0 {
+            anyhow::bail!("Chunk size {} is too small for overlap {}", chunk_size, overlap_size);
+        }
+
+        // Calculate how many chunks we need
+        let num_chunks = (record.sequence_length + effective_stride - 1) / effective_stride;
+        println!(
+            "Splitting into {} chunks of size {} with {} overlap (effective stride: {})",
+            num_chunks, chunk_size, effective_overlap, effective_stride
+        );
+
+        // Process chunks in parallel
+        let results: Vec<T> = (0..num_chunks)
+            .into_par_iter()
+            .map(|chunk_idx| {
+                let start = chunk_idx * effective_stride;
+                let is_first = chunk_idx == 0;
+                let is_last = chunk_idx == num_chunks - 1;
+
+                // For non-last chunks, include overlap region
+                let end = if is_last {
+                    record.sequence_length
+                } else {
+                    std::cmp::min(start + chunk_size, record.sequence_length)
+                };
+
+                let effective_length = if is_last {
+                    end - start
+                } else {
+                    effective_stride
+                };
+
+                let metadata = ChunkMetadata {
+                    start_pos: start,
+                    effective_length,
+                    total_length: end - start,
+                    is_first,
+                    is_last,
+                    overlap_size: if is_last { 0 } else { effective_overlap },
+                };
+
+                let data = self.read_sequence_range_internal(sequence_id, start, end - start)
+                    .expect("Failed to read sequence range");
+
+                processor(&data, metadata)
+            })
+            .collect();
+
+        Ok(results)
+    }
+
     /// Parse FASTA headers and record information from memory-mapped file
     fn parse_fasta_headers(mmap: &Mmap) -> Result<Vec<MmapFastaRecord>> {
         let mut records = Vec::new();
@@ -291,8 +394,8 @@ impl MemoryMappedFastaReader {
         Ok(records)
     }
     
-    /// Internal method to read a range of sequence data
-    fn read_sequence_range_internal(&self, sequence_id: usize, start: usize, length: usize) -> Result<Vec<u8>> {
+    /// Read a range of sequence data
+    pub fn read_sequence_range_internal(&self, sequence_id: usize, start: usize, length: usize) -> Result<Vec<u8>> {
         if sequence_id >= self.records.len() {
             anyhow::bail!("Sequence ID {} out of range", sequence_id);
         }

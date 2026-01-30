@@ -7,6 +7,8 @@
 //! - Fingerprint computation
 //!
 //! Uses lookup tables and batch processing for efficient auto-vectorization.
+//! Also provides explicit SIMD intrinsics for x86_64 (AVX2) and aarch64 (NEON)
+//! when available.
 
 use super::dna_2bit::EncodedBase;
 
@@ -247,6 +249,209 @@ pub fn compute_window_fingerprints(sequence: &[EncodedBase], window_size: usize)
     fingerprints
 }
 
+// =============================================================================
+// Explicit SIMD Intrinsics
+// =============================================================================
+
+/// Check if AVX2 is available at runtime
+#[cfg(target_arch = "x86_64")]
+pub fn has_avx2() -> bool {
+    is_x86_feature_detected!("avx2")
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+pub fn has_avx2() -> bool {
+    false
+}
+
+/// Check if NEON is available (always true on aarch64)
+#[cfg(target_arch = "aarch64")]
+pub fn has_neon() -> bool {
+    true
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+pub fn has_neon() -> bool {
+    false
+}
+
+/// AVX2-optimized DNA encoding (x86_64 only)
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn encode_dna_avx2(input: &[u8], output: &mut Vec<EncodedBase>) {
+    use std::arch::x86_64::*;
+
+    output.clear();
+    output.reserve(input.len());
+
+    // Create lookup vectors for ASCII to 2-bit conversion
+    // We'll process in 32-byte chunks
+    let chunks = input.chunks_exact(32);
+    let remainder = chunks.remainder();
+
+    // Character constants
+    let a_upper = _mm256_set1_epi8(b'A' as i8);
+    let c_upper = _mm256_set1_epi8(b'C' as i8);
+    let g_upper = _mm256_set1_epi8(b'G' as i8);
+    let t_upper = _mm256_set1_epi8(b'T' as i8);
+    let a_lower = _mm256_set1_epi8(b'a' as i8);
+    let c_lower = _mm256_set1_epi8(b'c' as i8);
+    let g_lower = _mm256_set1_epi8(b'g' as i8);
+    let t_lower = _mm256_set1_epi8(b't' as i8);
+
+    // Encoding values
+    let val_0 = _mm256_set1_epi8(0);
+    let val_1 = _mm256_set1_epi8(1);
+    let val_2 = _mm256_set1_epi8(2);
+    let val_3 = _mm256_set1_epi8(3);
+    let val_invalid = _mm256_set1_epi8(-1); // 0xFF
+
+    for chunk in chunks {
+        let data = _mm256_loadu_si256(chunk.as_ptr() as *const __m256i);
+
+        // Compare with each valid character (upper and lower case)
+        let is_a = _mm256_or_si256(
+            _mm256_cmpeq_epi8(data, a_upper),
+            _mm256_cmpeq_epi8(data, a_lower),
+        );
+        let is_c = _mm256_or_si256(
+            _mm256_cmpeq_epi8(data, c_upper),
+            _mm256_cmpeq_epi8(data, c_lower),
+        );
+        let is_g = _mm256_or_si256(
+            _mm256_cmpeq_epi8(data, g_upper),
+            _mm256_cmpeq_epi8(data, g_lower),
+        );
+        let is_t = _mm256_or_si256(
+            _mm256_cmpeq_epi8(data, t_upper),
+            _mm256_cmpeq_epi8(data, t_lower),
+        );
+
+        // Create result vector with encoded values
+        let result = _mm256_blendv_epi8(
+            _mm256_blendv_epi8(
+                _mm256_blendv_epi8(
+                    _mm256_blendv_epi8(val_invalid, val_0, is_a),
+                    val_1, is_c,
+                ),
+                val_2, is_g,
+            ),
+            val_3, is_t,
+        );
+
+        // Extract and filter valid bases
+        let mut result_arr = [0i8; 32];
+        _mm256_storeu_si256(result_arr.as_mut_ptr() as *mut __m256i, result);
+
+        for &val in &result_arr {
+            if val != -1 {
+                output.push(EncodedBase(val as u8));
+            }
+        }
+    }
+
+    // Handle remainder with scalar code
+    for &byte in remainder {
+        let encoded = ASCII_TO_2BIT[byte as usize];
+        if encoded != 0xFF {
+            output.push(EncodedBase(encoded));
+        }
+    }
+}
+
+/// NEON-optimized DNA encoding (aarch64 only)
+#[cfg(target_arch = "aarch64")]
+unsafe fn encode_dna_neon(input: &[u8], output: &mut Vec<EncodedBase>) {
+    use std::arch::aarch64::*;
+
+    output.clear();
+    output.reserve(input.len());
+
+    // Process in 16-byte chunks
+    let chunks = input.chunks_exact(16);
+    let remainder = chunks.remainder();
+
+    // Character constants
+    let a_upper = vdupq_n_u8(b'A');
+    let c_upper = vdupq_n_u8(b'C');
+    let g_upper = vdupq_n_u8(b'G');
+    let t_upper = vdupq_n_u8(b'T');
+    let a_lower = vdupq_n_u8(b'a');
+    let c_lower = vdupq_n_u8(b'c');
+    let g_lower = vdupq_n_u8(b'g');
+    let t_lower = vdupq_n_u8(b't');
+
+    // Encoding values
+    let val_0 = vdupq_n_u8(0);
+    let val_1 = vdupq_n_u8(1);
+    let val_2 = vdupq_n_u8(2);
+    let val_3 = vdupq_n_u8(3);
+    let val_invalid = vdupq_n_u8(0xFF);
+
+    for chunk in chunks {
+        let data = vld1q_u8(chunk.as_ptr());
+
+        // Compare with each valid character
+        let is_a = vorrq_u8(vceqq_u8(data, a_upper), vceqq_u8(data, a_lower));
+        let is_c = vorrq_u8(vceqq_u8(data, c_upper), vceqq_u8(data, c_lower));
+        let is_g = vorrq_u8(vceqq_u8(data, g_upper), vceqq_u8(data, g_lower));
+        let is_t = vorrq_u8(vceqq_u8(data, t_upper), vceqq_u8(data, t_lower));
+
+        // Build result using bitwise select
+        let mut result = val_invalid;
+        result = vbslq_u8(is_a, val_0, result);
+        result = vbslq_u8(is_c, val_1, result);
+        result = vbslq_u8(is_g, val_2, result);
+        result = vbslq_u8(is_t, val_3, result);
+
+        // Extract and filter valid bases
+        let mut result_arr = [0u8; 16];
+        vst1q_u8(result_arr.as_mut_ptr(), result);
+
+        for &val in &result_arr {
+            if val != 0xFF {
+                output.push(EncodedBase(val));
+            }
+        }
+    }
+
+    // Handle remainder with scalar code
+    for &byte in remainder {
+        let encoded = ASCII_TO_2BIT[byte as usize];
+        if encoded != 0xFF {
+            output.push(EncodedBase(encoded));
+        }
+    }
+}
+
+/// Best-effort SIMD DNA encoding that uses the optimal implementation for the current platform.
+///
+/// Falls back to scalar code if SIMD is not available.
+pub fn encode_dna_simd(input: &[u8], output: &mut Vec<EncodedBase>) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_avx2() {
+            // SAFETY: We checked that AVX2 is available
+            unsafe {
+                encode_dna_avx2(input, output);
+                return;
+            }
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        // NEON is always available on aarch64
+        unsafe {
+            encode_dna_neon(input, output);
+            return;
+        }
+    }
+
+    // Fallback to batch encoding
+    encode_dna_batch(input, output);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -333,5 +538,54 @@ mod tests {
         decode_dna_batch(&input, &mut output);
 
         assert_eq!(output, b"ACGT");
+    }
+
+    #[test]
+    fn test_encode_dna_simd() {
+        let input = b"ACGTACGT";
+        let mut output = Vec::new();
+        super::encode_dna_simd(input, &mut output);
+
+        assert_eq!(output.len(), 8);
+        assert_eq!(output[0], EncodedBase(0b00)); // A
+        assert_eq!(output[1], EncodedBase(0b01)); // C
+        assert_eq!(output[2], EncodedBase(0b10)); // G
+        assert_eq!(output[3], EncodedBase(0b11)); // T
+    }
+
+    #[test]
+    fn test_encode_dna_simd_with_invalid() {
+        let input = b"ACNGTXACGT";
+        let mut output = Vec::new();
+        super::encode_dna_simd(input, &mut output);
+
+        // N and X should be skipped
+        assert_eq!(output.len(), 8);
+    }
+
+    #[test]
+    fn test_encode_dna_simd_long_sequence() {
+        // Test with a sequence longer than SIMD register size
+        let input: Vec<u8> = (0..100).map(|i| match i % 4 {
+            0 => b'A',
+            1 => b'C',
+            2 => b'G',
+            _ => b'T',
+        }).collect();
+
+        let mut output = Vec::new();
+        super::encode_dna_simd(&input, &mut output);
+
+        assert_eq!(output.len(), 100);
+        for (i, base) in output.iter().enumerate() {
+            assert_eq!(base.0, (i % 4) as u8);
+        }
+    }
+
+    #[test]
+    fn test_simd_detection() {
+        // Just verify the detection functions compile and run
+        let _ = super::has_avx2();
+        let _ = super::has_neon();
     }
 }
