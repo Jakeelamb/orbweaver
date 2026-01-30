@@ -11,6 +11,7 @@ use std::time::Instant;
 extern crate orbweaver_kernels;
 
 pub mod digram;
+pub mod lcg;
 pub mod suffix_array;
 
 /// Represents a GPU context for accelerating specific operations
@@ -172,17 +173,22 @@ impl GpuContext {
         // Get kernel source code from the orbweaver_kernels crate
         let digram_kernel_src = orbweaver_kernels::get_digram_kernel();
         let suffix_array_kernel_src = orbweaver_kernels::get_suffix_array_kernel();
-        
+        let lcg_kernel_src = orbweaver_kernels::get_lcg_kernel();
+
         // Combine kernels with proper header (OpenCL C version pragma)
         let combined_src = format!(
             "#pragma OPENCL EXTENSION cl_khr_global_int32_base_atomics : enable\n\
              #pragma OPENCL EXTENSION cl_khr_local_int32_base_atomics : enable\n\
+             #pragma OPENCL EXTENSION cl_khr_int64_base_atomics : enable\n\
              \n\
              {}\n\
              \n\
-             {}", 
-            digram_kernel_src, 
-            suffix_array_kernel_src
+             {}\n\
+             \n\
+             {}",
+            digram_kernel_src,
+            suffix_array_kernel_src,
+            lcg_kernel_src
         );
         
         // Build program with proper error handling

@@ -184,6 +184,125 @@ __kernel void sort_suffixes(
 "
 }
 
+/// Returns the OpenCL kernel source code for LCG (Locally Consistent Grammar) acceleration
+pub fn get_lcg_kernel() -> &'static str {
+    "
+// lcg_kernel.cl
+// GPU kernels for Locally Consistent Grammar (LCG) acceleration
+
+// FxHash-compatible constants (matches rustc_hash)
+#define FX_HASH_K 0x517cc1b727220a95UL
+
+// Compute FxHash-compatible fingerprint for a digram (two 2-bit encoded bases)
+inline ulong compute_digram_fingerprint(uchar b1, uchar b2) {
+    ulong hash = 0UL;
+    hash = (hash ^ (ulong)b1) * FX_HASH_K;
+    hash = (hash ^ (ulong)b2) * FX_HASH_K;
+    return hash;
+}
+
+// Kernel 1: Compute position fingerprints for all positions in the sequence
+__kernel void compute_position_fingerprints(
+    __global const uchar *sequence,
+    const uint sequence_len,
+    __global ulong *fingerprints
+) {
+    const uint gid = get_global_id(0);
+
+    if (gid >= sequence_len) return;
+
+    if (gid + 1 < sequence_len) {
+        const uchar b1 = sequence[gid];
+        const uchar b2 = sequence[gid + 1];
+        fingerprints[gid] = compute_digram_fingerprint(b1, b2);
+    } else {
+        fingerprints[gid] = (ulong)sequence[gid];
+    }
+}
+
+// Kernel 2: Find local minima in the fingerprint array
+__kernel void find_local_minima(
+    __global const ulong *fingerprints,
+    const uint num_fingerprints,
+    const uint half_window,
+    const uint min_phrase_len,
+    const uint max_phrase_len,
+    __global uchar *is_cut_point,
+    __global uint *cut_point_count
+) {
+    const uint gid = get_global_id(0);
+
+    if (gid == 0) {
+        is_cut_point[gid] = 1;
+        atomic_inc(cut_point_count);
+        return;
+    }
+
+    if (gid >= num_fingerprints) {
+        is_cut_point[gid] = 0;
+        return;
+    }
+
+    const ulong fp = fingerprints[gid];
+    const uint window_start = (gid > half_window) ? (gid - half_window) : 0;
+    const uint window_end = min(gid + half_window + 1, num_fingerprints);
+
+    uchar is_local_min = 1;
+    for (uint i = window_start; i < window_end && is_local_min; i++) {
+        if (fingerprints[i] < fp) {
+            is_local_min = 0;
+        }
+    }
+
+    is_cut_point[gid] = is_local_min;
+    if (is_local_min) {
+        atomic_inc(cut_point_count);
+    }
+}
+
+// Kernel 3: Compact cut points into a dense array
+__kernel void compact_cut_points(
+    __global const uchar *is_cut_point,
+    const uint num_positions,
+    __global uint *cut_points,
+    __global uint *cut_point_index
+) {
+    const uint gid = get_global_id(0);
+    if (gid >= num_positions) return;
+    if (is_cut_point[gid]) {
+        const uint idx = atomic_inc(cut_point_index);
+        cut_points[idx] = gid;
+    }
+}
+
+// Kernel 4: Compute phrase fingerprints
+__kernel void compute_phrase_fingerprints(
+    __global const uchar *sequence,
+    const uint sequence_len,
+    __global const uint *cut_points,
+    const uint num_phrases,
+    __global ulong *phrase_fingerprints
+) {
+    const uint gid = get_global_id(0);
+    if (gid >= num_phrases) return;
+
+    const uint start = cut_points[gid];
+    const uint end = (gid + 1 < num_phrases) ? cut_points[gid + 1] : sequence_len;
+
+    if (start >= end) {
+        phrase_fingerprints[gid] = 0UL;
+        return;
+    }
+
+    ulong hash = 0UL;
+    for (uint i = start; i < end; i++) {
+        hash = (hash ^ (ulong)sequence[i]) * FX_HASH_K;
+    }
+    phrase_fingerprints[gid] = hash;
+}
+"
+}
+
 /// Get vector addition OpenCL kernel code (for testing)
 pub fn get_vector_add_kernel() -> &'static str {
     // Return only the kernel code itself

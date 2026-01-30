@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::fs;
 use chrono::{Utc, DateTime};
 use serde::{Serialize, Deserialize};
-use orbweaver::fasta::reader::{read_sequences_from_multiple_files_async, MemoryMappedFastaReader, FastaReader};
+use orbweaver::fasta::reader::{read_sequences_from_multiple_files_async, MemoryMappedFastaReader, FastaReader, ChunkMetadata};
 use orbweaver::encode::dna_2bit::{EncodedBase};
 use orbweaver::grammar::builder::GrammarBuilder;
 use orbweaver::grammar::engine::Grammar;
@@ -22,6 +22,7 @@ use std::fs::File;
 use bincode;
 use log::{info};
 use orbweaver::utils::export::{write_grammar_text, write_grammar_json as io_write_grammar_json, write_grammar_graphml};
+use orbweaver::io::output_json::write_grammar_json_streaming;
 use orbweaver::utils::visualization::{write_grammar_gfa, write_grammar_dot};
 use orbweaver::io::output_fasta::write_grammar_fasta;
 use std::fs::write as fs_write;
@@ -216,7 +217,19 @@ struct OrbweaverArgs {
     /// Default: 1MB (1024 * 1024).
     #[clap(long, value_parser)]
     chunk_size_streaming: Option<usize>,
-    
+
+    /// Enable streaming output mode for writing results.
+    ///
+    /// Writes JSON output incrementally with periodic flushing,
+    /// reducing peak memory usage for very large grammars.
+    #[clap(long, action = clap::ArgAction::SetTrue)]
+    streaming_output: bool,
+
+    /// Flush interval for streaming output (number of rules between flushes).
+    /// Default: 1000.
+    #[clap(long, value_parser, default_value_t = 1000)]
+    streaming_output_flush_interval: usize,
+
     /// Enable adaptive chunk sizing.
     /// 
     /// Dynamically adjust chunk sizes based on sequence complexity
@@ -263,6 +276,14 @@ struct OrbweaverArgs {
     /// Default: 10MB (10_000_000). Larger chunks = better compression but more memory.
     #[clap(long, value_parser, default_value_t = 10_000_000)]
     mmap_chunk_size: usize,
+
+    /// Auto-tune LCG parameters based on sequence characteristics.
+    ///
+    /// When enabled, analyzes a sample of the sequence to determine optimal
+    /// window size, phrase lengths, and occurrence thresholds. Recommended
+    /// for maximizing compression on unknown sequences.
+    #[clap(long, action = clap::ArgAction::SetTrue)]
+    auto_tune_lcg: bool,
 
     /// Graph-related arguments
     #[clap(long, value_parser, default_value_t = String::from("sfdp"))]
@@ -568,9 +589,20 @@ fn generate_outputs(grammar: &Grammar, args: &OrbweaverArgs, run_specific_output
         Some(ref user_path) => run_specific_output_dir.join(user_path),
         None => run_specific_output_dir.join("grammar.json"),
     };
-    info!("Writing grammar to JSON: {:?}", json_output_path);
-    io_write_grammar_json(&json_output_path, &grammar.sequence, &grammar.rules)
-        .with_context(|| format!("Failed to write JSON grammar to {:?}", json_output_path))?;
+    if args.streaming_output {
+        info!("Writing grammar to JSON (streaming): {:?}", json_output_path);
+        write_grammar_json_streaming(
+            &json_output_path,
+            &grammar.sequence,
+            &grammar.rules,
+            args.streaming_output_flush_interval,
+        )
+        .with_context(|| format!("Failed to write streaming JSON grammar to {:?}", json_output_path))?;
+    } else {
+        info!("Writing grammar to JSON: {:?}", json_output_path);
+        io_write_grammar_json(&json_output_path, &grammar.sequence, &grammar.rules)
+            .with_context(|| format!("Failed to write JSON grammar to {:?}", json_output_path))?;
+    }
 
     // Text output (conditional based on user argument)
     if let Some(ref user_path) = args.output_text {
@@ -1040,12 +1072,35 @@ fn process_mmap_lcg_mode(
                  seq_length,
                  seq_length as f64 / 1_000_000.0);
 
-        // Configure LCG
-        let lcg_config = LcgConfig {
-            min_phrase_len: 2,
-            max_phrase_len: 256,
-            window_size: 8,
-            min_occurrences: args.min_rule_usage,
+        // Configure LCG - optionally with auto-tuning
+        let lcg_config = if args.auto_tune_lcg {
+            // Read a sample from the sequence for auto-tuning
+            let sample_size = 10_000.min(seq_length);
+            let sample_data = mmap_reader.read_sequence_range_internal(0, 0, sample_size)
+                .unwrap_or_default();
+            let sample_encoded: Vec<EncodedBase> = sample_data
+                .iter()
+                .filter_map(|&b| EncodedBase::from_base(b))
+                .collect();
+
+            if !sample_encoded.is_empty() {
+                println!("  Auto-tuning LCG parameters based on {} sample bases...", sample_encoded.len());
+                LcgConfig::auto_tune(&sample_encoded, Some(sample_size))
+            } else {
+                LcgConfig {
+                    min_phrase_len: 2,
+                    max_phrase_len: 256,
+                    window_size: 8,
+                    min_occurrences: args.min_rule_usage,
+                }
+            }
+        } else {
+            LcgConfig {
+                min_phrase_len: 2,
+                max_phrase_len: 256,
+                window_size: 8,
+                min_occurrences: args.min_rule_usage,
+            }
         };
 
         // Process in parallel chunks using the memory-mapped reader
@@ -1054,9 +1109,13 @@ fn process_mmap_lcg_mode(
 
         println!("  Processing {} chunks in parallel...", num_chunks);
 
-        // Process chunks in parallel and collect LcgBuilders
-        let chunk_results: Vec<(Vec<Symbol>, LcgBuilder)> = mmap_reader
-            .process_in_parallel_chunks(chunk_size, 0, |chunk_data: &[u8]| {
+        // Use overlap from args (default 1000)
+        let overlap_size = args.chunk_overlap;
+        println!("  Using overlap size: {} bases", overlap_size);
+
+        // Process chunks in parallel with overlap support
+        let chunk_results: Vec<(Vec<Symbol>, LcgBuilder, Option<Vec<EncodedBase>>)> = mmap_reader
+            .process_in_parallel_chunks_with_overlap(chunk_size, overlap_size, 0, |chunk_data: &[u8], metadata: ChunkMetadata| {
                 // Encode the chunk
                 let encoded: Vec<EncodedBase> = chunk_data
                     .iter()
@@ -1064,34 +1123,44 @@ fn process_mmap_lcg_mode(
                     .collect();
 
                 if encoded.is_empty() {
-                    return (Vec::new(), LcgBuilder::new(lcg_config.clone()));
+                    return (Vec::new(), LcgBuilder::new(lcg_config.clone()), None);
                 }
 
-                // Build grammar for this chunk
-                let mut lcg_builder = LcgBuilder::new(lcg_config.clone());
-                let (compressed_sequence, _rules) = lcg_builder.build_grammar(&encoded, file_idx);
+                // Build grammar for this chunk using pooled buffers for efficiency
+                let mut lcg_builder = LcgBuilder::with_pooling(lcg_config.clone(), encoded.len());
+                let (compressed_sequence, _rules) = lcg_builder.build_grammar_pooled(&encoded, file_idx);
 
-                (compressed_sequence, lcg_builder)
+                // Extract overlap region for boundary pattern detection
+                let overlap_data = if !metadata.is_last && metadata.overlap_size > 0 {
+                    let overlap_start = encoded.len().saturating_sub(metadata.overlap_size);
+                    Some(encoded[overlap_start..].to_vec())
+                } else {
+                    None
+                };
+
+                (compressed_sequence, lcg_builder, overlap_data)
             })
             .with_context(|| format!("Failed to process chunks for file: {}", input_file_path.display()))?;
 
-        println!("  Merging {} chunk grammars...", chunk_results.len());
+        println!("  Merging {} chunk grammars with overlap-aware boundary handling...", chunk_results.len());
 
-        // Merge all LcgBuilders - fingerprints ensure identical content gets identical rule IDs
-        // We need to remap NonTerminal references as we merge
-        let mut master_builder = LcgBuilder::new(lcg_config.clone());
-        let mut all_compressed_symbols: Vec<Symbol> = Vec::new();
+        // Separate the results for the overlap-aware merge
+        let mut chunk_sequences: Vec<(Vec<Symbol>, Option<Vec<EncodedBase>>)> = Vec::new();
+        let mut chunk_builders: Vec<LcgBuilder> = Vec::new();
 
-        for (mut compressed_seq, chunk_builder) in chunk_results {
-            // Merge the rules and get the ID mapping
-            let id_mapping = master_builder.merge(chunk_builder);
-
-            // Remap NonTerminal references in this chunk's compressed sequence
-            LcgBuilder::remap_sequence(&mut compressed_seq, &id_mapping);
-
-            // Concatenate the compressed sequences
-            all_compressed_symbols.extend(compressed_seq);
+        for (compressed_seq, chunk_builder, overlap_data) in chunk_results {
+            chunk_sequences.push((compressed_seq, overlap_data));
+            chunk_builders.push(chunk_builder);
         }
+
+        // Merge all chunks with overlap-aware boundary handling
+        // Use pooled builder for efficiency on large sequences
+        let total_symbols: usize = chunk_sequences.iter().map(|(seq, _)| seq.len()).sum();
+        let mut master_builder = LcgBuilder::with_pooling(lcg_config.clone(), total_symbols);
+        let (all_compressed_symbols, _id_mappings) = master_builder.merge_chunks_with_overlap(
+            chunk_sequences,
+            chunk_builders,
+        );
 
         // Convert to Grammar
         let rules_map: HashMap<usize, Rule> = master_builder
