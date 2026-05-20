@@ -15,6 +15,7 @@ use orbweaver::analysis::stats::calculate_and_print_stats;
 use orbweaver::utils::visualization::DotOptions;
 use orbweaver::parallel::chunking::ChunkingConfig;
 use orbweaver::parallel::engine::{merge_grammars};
+use orbweaver::analysis::assembly_index::calculate_rule_assembly_indices;
 use std::sync::Arc;
 use orbweaver::gpu::GpuContext;
 use std::collections::HashMap;
@@ -25,8 +26,8 @@ use orbweaver::utils::export::{write_grammar_text, write_grammar_json as io_writ
 use orbweaver::io::output_json::write_grammar_json_streaming;
 use orbweaver::utils::visualization::{write_grammar_gfa, write_grammar_dot};
 use orbweaver::io::output_fasta::write_grammar_fasta;
-use std::fs::write as fs_write;
-use orbweaver::utils::profiling; // Added for profiling RAII guard
+use orbweaver::io::output_motifs::write_motif_table;
+use orbweaver::utils::profiling;
 use uuid;
 
 // Use the configuration module if needed, or args directly
@@ -117,12 +118,6 @@ struct OrbweaverArgs {
     /// which can be visualized with tools like Bandage.
     #[clap(long, value_parser)]
     output_gfa: Option<PathBuf>,
-
-    /// Output tabular summary of repeats.
-    ///
-    /// Writes a text file summarizing identified repeats, sorted by size or frequency.
-    #[clap(long, value_parser)]
-    output_repeats: Option<PathBuf>,
 
     /// Print statistics about the generated grammar.
     /// 
@@ -251,10 +246,16 @@ struct OrbweaverArgs {
     #[clap(long, value_parser)]
     max_memory_per_chunk_mb: Option<usize>,
 
-    /// Disable GPU acceleration (CPU fallback).
+    /// Enable experimental GPU acceleration.
     ///
-    /// GPU acceleration is used by default. This flag forces CPU-only processing.
+    /// The focused research path is CPU LCG by default. GPU support is kept
+    /// behind this flag until benchmarks prove it helps end-to-end grammar
+    /// construction.
     #[clap(long, action = clap::ArgAction::SetTrue)]
+    gpu: bool,
+
+    /// Legacy no-op retained so old scripts fail less abruptly.
+    #[clap(long, hide = true, action = clap::ArgAction::SetTrue)]
     no_gpu: bool,
 
     /// Use LCG (Locally Consistent Grammar) algorithm for O(n) scaling.
@@ -276,6 +277,14 @@ struct OrbweaverArgs {
     /// Default: 10MB (10_000_000). Larger chunks = better compression but more memory.
     #[clap(long, value_parser, default_value_t = 10_000_000)]
     mmap_chunk_size: usize,
+
+    /// Use hierarchical merge for extremely large genomes (100GB+).
+    ///
+    /// Instead of merging all chunks at once, merges in a tree-like fashion
+    /// to reduce peak memory from O(N) to O(log N) grammars.
+    /// Recommended for genomes > 50GB with limited RAM.
+    #[clap(long, action = clap::ArgAction::SetTrue)]
+    hierarchical_merge: bool,
 
     /// Auto-tune LCG parameters based on sequence characteristics.
     ///
@@ -396,9 +405,9 @@ async fn main() -> Result<()> {
     let base_output_dir = PathBuf::from("."); 
     let determined_run_id = args.run_id.clone().unwrap_or_else(|| Utc::now().format("%Y%m%d_%H%M%S").to_string());
 
-    // Initialize GPU context if not explicitly disabled
+    // GPU is opt-in. The CPU LCG path is the baseline until measured otherwise.
     let mut gpu_context: Option<Arc<GpuContext>> = None;
-    if !args.no_gpu {
+    if args.gpu && !args.no_gpu {
         match GpuContext::new() {
             Ok(context) => {
                 println!("GPU context initialized successfully.");
@@ -518,9 +527,9 @@ async fn main() -> Result<()> {
     };
 
     match result {
-        Ok((final_grammar, final_checkpoints, chromosome_details)) => {
+        Ok((mut final_grammar, final_checkpoints, chromosome_details)) => {
             info!("Grammar construction completed successfully.");
-            generate_outputs(&final_grammar, &args, &run_specific_output_dir, &chromosome_details)?;
+            generate_outputs(&mut final_grammar, &args, &run_specific_output_dir, &chromosome_details)?;
             
             // Update and save metadata as completed
             metadata_to_save.status = "completed".to_string();
@@ -552,8 +561,10 @@ async fn main() -> Result<()> {
 }
 
 /// Generates all requested output files from the final grammar.
-fn generate_outputs(grammar: &Grammar, args: &OrbweaverArgs, run_specific_output_dir: &PathBuf, chromosome_details: &[(String, usize)]) -> Result<()> {
+fn generate_outputs(grammar: &mut Grammar, args: &OrbweaverArgs, run_specific_output_dir: &PathBuf, chromosome_details: &[(String, usize)]) -> Result<()> {
     info!("Generating outputs in directory: {:?}", run_specific_output_dir);
+    calculate_rule_assembly_indices(&mut grammar.rules)
+        .context("failed to calculate rule assembly indices before output generation")?;
 
     let dot_options = DotOptions {
         engine: args.graph_engine.clone(),
@@ -621,14 +632,10 @@ fn generate_outputs(grammar: &Grammar, args: &OrbweaverArgs, run_specific_output
     write_grammar_gfa(&gfa_path, grammar)
         .with_context(|| format!("Failed to write GFA to {:?}", gfa_path))?;
 
-    if let Some(ref user_path) = args.output_repeats {
-        let final_path = run_specific_output_dir.join(user_path);
-        info!("Writing repeats summary to: {:?}", final_path);
-        // Placeholder for actual repeat writing logic
-        // grammar.write_repeats_summary(&final_path)?;
-        fs_write(&final_path, "Repeat summary placeholder.") // Replace with actual call
-            .with_context(|| format!("Failed to write repeats summary to {:?}", final_path))?;
-    }
+    let motif_table_path = run_specific_output_dir.join("motif_table.tsv");
+    info!("Writing motif table: {:?}", motif_table_path);
+    write_motif_table(&motif_table_path, grammar)
+        .with_context(|| format!("Failed to write motif table to {:?}", motif_table_path))?;
 
     if args.stats {
         info!("Calculating and printing statistics...");
@@ -1142,25 +1149,49 @@ fn process_mmap_lcg_mode(
             })
             .with_context(|| format!("Failed to process chunks for file: {}", input_file_path.display()))?;
 
-        println!("  Merging {} chunk grammars with overlap-aware boundary handling...", chunk_results.len());
-
-        // Separate the results for the overlap-aware merge
-        let mut chunk_sequences: Vec<(Vec<Symbol>, Option<Vec<EncodedBase>>)> = Vec::new();
-        let mut chunk_builders: Vec<LcgBuilder> = Vec::new();
-
-        for (compressed_seq, chunk_builder, overlap_data) in chunk_results {
-            chunk_sequences.push((compressed_seq, overlap_data));
-            chunk_builders.push(chunk_builder);
-        }
-
-        // Merge all chunks with overlap-aware boundary handling
-        // Use pooled builder for efficiency on large sequences
-        let total_symbols: usize = chunk_sequences.iter().map(|(seq, _)| seq.len()).sum();
-        let mut master_builder = LcgBuilder::with_pooling(lcg_config.clone(), total_symbols);
-        let (all_compressed_symbols, _id_mappings) = master_builder.merge_chunks_with_overlap(
-            chunk_sequences,
-            chunk_builders,
+        println!("  Merging {} chunk grammars{}...",
+            chunk_results.len(),
+            if args.hierarchical_merge { " (hierarchical mode for large genomes)" } else { " with overlap-aware boundary handling" }
         );
+
+        let (all_compressed_symbols, master_builder) = if args.hierarchical_merge {
+            // Use hierarchical merge for very large genomes
+            // This reduces peak memory from O(N) to O(log N) grammars
+            use orbweaver::grammar::lcg::HierarchicalMerger;
+
+            let mut merger = HierarchicalMerger::new(lcg_config.clone());
+
+            for (compressed_seq, chunk_builder, overlap_data) in chunk_results {
+                merger.add_chunk(compressed_seq, overlap_data, chunk_builder);
+
+                // Log progress periodically
+                let (stack_depth, symbols, rules) = merger.memory_stats();
+                if stack_depth > 0 && stack_depth % 10 == 0 {
+                    log::debug!("Hierarchical merge progress: stack depth={}, symbols={}, rules={}",
+                        stack_depth, symbols, rules);
+                }
+            }
+
+            merger.finalize()
+        } else {
+            // Standard merge - all chunks at once
+            let mut chunk_sequences: Vec<(Vec<Symbol>, Option<Vec<EncodedBase>>)> = Vec::new();
+            let mut chunk_builders: Vec<LcgBuilder> = Vec::new();
+
+            for (compressed_seq, chunk_builder, overlap_data) in chunk_results {
+                chunk_sequences.push((compressed_seq, overlap_data));
+                chunk_builders.push(chunk_builder);
+            }
+
+            // Use pooled builder for efficiency on large sequences
+            let total_symbols: usize = chunk_sequences.iter().map(|(seq, _)| seq.len()).sum();
+            let mut master_builder = LcgBuilder::with_pooling(lcg_config.clone(), total_symbols);
+            let (all_compressed_symbols, _id_mappings) = master_builder.merge_chunks_with_overlap(
+                chunk_sequences,
+                chunk_builders,
+            );
+            (all_compressed_symbols, master_builder)
+        };
 
         // Convert to Grammar
         let rules_map: HashMap<usize, Rule> = master_builder

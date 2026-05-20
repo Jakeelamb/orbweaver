@@ -167,7 +167,6 @@ pub fn find_digram_positions(sequence: &[EncodedBase], digram_id: u8) -> Vec<usi
 
 /// Batch compute digram counts for multiple chunks in parallel.
 /// Uses Rayon for parallel processing.
-#[cfg(feature = "parallel")]
 pub fn count_digrams_parallel(sequences: &[&[EncodedBase]]) -> [usize; 16] {
     use rayon::prelude::*;
 

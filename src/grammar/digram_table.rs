@@ -293,12 +293,12 @@ impl DigramTable {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::grammar::symbol::{Symbol, Direction, SymbolType};
+    use crate::grammar::symbol::{Symbol, Direction};
     use crate::encode::dna_2bit::EncodedBase;
 
     #[test]
     fn test_add_and_find_digram_sharded() {
-        let mut table = new_test_table(4);
+        let table = new_test_table(4);
         let s1 = Symbol::terminal(0, EncodedBase(0), Direction::Forward, None, None);
         let s2 = Symbol::terminal(1, EncodedBase(1), Direction::Forward, None, None);
         let s3 = Symbol::terminal(2, EncodedBase(2), Direction::Forward, None, None);
@@ -323,7 +323,7 @@ mod tests {
 
     #[test]
     fn test_get_top_digrams_sharded() {
-        let mut table = new_test_table(2);
+        let table = new_test_table(2);
         let s_a = Symbol::terminal(0, EncodedBase(0), Direction::Forward, None, None);
         let s_c = Symbol::terminal(1, EncodedBase(1), Direction::Forward, None, None);
         let s_g = Symbol::terminal(2, EncodedBase(2), Direction::Forward, None, None);
@@ -336,7 +336,7 @@ mod tests {
         table.add_digram(2, s_g.clone(), s_t.clone(), true);
 
         let key_ac = DigramTable::canonical_key((&s_a, &s_c), true);
-        let key_cg = DigramTable::canonical_key((&s_c, &s_g), true);
+        let _key_cg = DigramTable::canonical_key((&s_c, &s_g), true);
 
         let top_2 = table.get_top_digrams(2);
         assert_eq!(top_2.len(), 2);

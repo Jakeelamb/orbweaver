@@ -124,7 +124,7 @@ pub fn calculate_chromosome_assembly_index(sequence: &[Symbol], rules: &HashMap<
 mod tests {
     use super::*;
     use crate::grammar::rule::Rule;
-    use crate::grammar::symbol::{Symbol, Direction, SymbolType};
+    use crate::grammar::symbol::{Symbol, Direction};
     use crate::grammar::Grammar;
     use crate::encode::dna_2bit::EncodedBase;
     use std::collections::HashMap;

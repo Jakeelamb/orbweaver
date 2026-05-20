@@ -151,17 +151,59 @@ orbweaver -i genome.fasta --streaming-output --streaming-output-flush-interval 5
 
 ---
 
-## Remaining Work
+### ✅ Phase 5: Hierarchical Merge for Huge Genomes
+**Files:** `src/grammar/lcg.rs`, `src/main.rs`
 
-All major optimization phases are complete!
+**Changes:**
+1. Added `merge_chunks_hierarchical()` - batch hierarchical merge
+2. Added `HierarchicalMerger` struct for streaming merge:
+   - `add_chunk()` - add chunks one by one
+   - `finalize()` - complete the merge
+   - `memory_stats()` - monitor memory usage
+3. Added `--hierarchical-merge` CLI flag
+4. Updated mmap processing to use hierarchical merge when flag is set
+5. Added 4 unit tests for hierarchical merge
+
+**Memory Efficiency:**
+- Standard merge: O(N) grammars in memory
+- Hierarchical merge: O(log N) grammars in memory
+- For 10,000 chunks: ~10,000 → ~14 concurrent grammars
+
+**Usage for huge genomes (100GB+):**
+```bash
+orbweaver -i salamander.fasta \
+  --mmap \
+  --mmap-chunk-size 50000000 \
+  --hierarchical-merge \
+  --auto-tune-lcg \
+  --streaming-output
+```
+
+---
+
+## Current Focus
+
+The project has been narrowed to one serious research path:
+
+```bash
+orbweaver \
+  --input-files <assembly.fna> \
+  --mmap \
+  --hierarchical-merge \
+  --auto-tune-lcg \
+  --streaming-output \
+  --stats
+```
+
+Legacy in-memory, streaming, and chunked modes remain for compatibility and tests. New feature work should target mmap + LCG + hierarchical merge unless there is benchmark evidence to do otherwise.
 
 ---
 
 ## Build Status
 ```bash
-cargo build --release  # ✅ Succeeds with warnings
-cargo test --lib       # ✅ 127 passed, 2 ignored
-cargo test             # ✅ All tests pass
+cargo check       # ✅ Succeeds
+cargo test --lib  # ✅ 131 passed, 2 ignored
+cargo test --tests # ✅ Passes, including 10MB large-sequence tests
 ```
 
 ## Test Commands for Verification
@@ -190,23 +232,22 @@ cargo build --release
 |------|---------|
 | `src/analysis/assembly_index.rs` | Cycle detection fallback |
 | `src/fasta/reader.rs` | `ChunkMetadata`, overlap-aware processing |
-| `src/grammar/lcg.rs` | GPU integration, auto-tuning, overlap merge, memory pooling |
-| `src/main.rs` | Use chunk_overlap, auto-tune flag, streaming output, pooled LCG |
+| `src/grammar/lcg.rs` | GPU integration, auto-tuning, overlap merge, memory pooling, hierarchical merge |
+| `src/main.rs` | CPU baseline by default, opt-in GPU, chunk_overlap, auto-tune, streaming output, pooled LCG, hierarchical merge |
 | `src/gpu/mod.rs` | Register LCG kernel |
 | `src/gpu/lcg.rs` | **NEW** - GPU LCG parser |
 | `src/gpu/lcg_kernel.cl` | **NEW** - OpenCL kernels |
 | `orbweaver-kernels/src/lib.rs` | Add `get_lcg_kernel()` |
 | `src/encode/simd.rs` | Explicit AVX2/NEON intrinsics |
-| `src/io/output_json.rs` | Streaming JSON writer |
-| `src/args.rs` | Streaming output CLI flags |
-| `Cargo.toml` | Added bumpalo dependency |
-| `tests/integration_tests.rs` | Fixed with `current_dir()` |
-| `tests/large_sequence_tests.rs` | Fixed TempDir lifetime and assertions |
+| `src/io/output_json.rs` | Streaming JSON writer, missing-rule validation instead of placeholder rules |
+| `src/io/output_motifs.rs` | Rule-level motif table with canonical content fingerprints |
+| `Cargo.toml` | Removed unused database/network/VBQ dependencies; kept focused runtime deps |
+| `README.md`, `GOAL.md`, `docs/*` | Renarrowed project contract around cross-species grammar motif comparison |
+| `tests/large_sequence_tests.rs` | Fixed TempDir lifetime and success/stat assertions |
 
 ---
 
 ## Next Session Priorities
-1. Clean up compiler warnings (`cargo fix --lib`)
-2. Consider additional optimizations based on profiling
-3. Benchmark memory pooling vs regular for different sequence sizes
-4. Add end-to-end performance benchmarks
+1. Add a benchmark harness that records command, wall time, peak RSS, rule count, graph size, and artifacts
+2. Fix assembly-index completeness for streaming/mmap stats output
+3. Add cross-species comparison over stable motif fingerprints

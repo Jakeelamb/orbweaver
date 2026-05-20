@@ -1,4 +1,4 @@
-use crate::grammar::symbol::{Symbol, Direction, SymbolType};
+use crate::grammar::symbol::{Symbol, Direction};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::fmt;
@@ -309,8 +309,7 @@ pub fn find_most_frequent_digram_with_min_count(
 mod tests {
     use super::*;
     use crate::encode::dna_2bit::EncodedBase;
-    use crate::grammar::symbol::{Direction, Symbol, SymbolType};
-    use crate::grammar::digram_table::DigramTable;
+    use crate::grammar::symbol::{Direction, Symbol};
 
     fn encode_seq(seq_bytes: &[u8]) -> Vec<EncodedBase> {
         seq_bytes.iter().filter_map(|&b| EncodedBase::from_base(b)).collect()
@@ -318,10 +317,6 @@ mod tests {
 
     fn create_terminal(id: u32, base: u8, strand: Direction) -> Symbol {
         Symbol::terminal(id as usize, EncodedBase(base), strand, None, None)
-    }
-
-    fn create_nonterminal(id: u32, rule_id: u32, strand: Direction) -> Symbol {
-        Symbol::non_terminal(id as usize, rule_id as usize, strand)
     }
 
     #[test]
@@ -335,7 +330,6 @@ mod tests {
 
     #[test]
     fn test_reverse_complement() {
-        use crate::grammar::symbol::SymbolType;
         let a = create_terminal(0, 0, Direction::Forward); // A+
         let c = create_terminal(1, 1, Direction::Forward); // C+
         let digram = Digram::new(a, c);
@@ -427,7 +421,7 @@ mod tests {
         let seq = encode_seq(b"ACGTAC");
         let result = find_most_frequent_terminal_digram_suffix_array(&seq, 2, true);
         assert!(result.is_some());
-        let (key, count, positions) = result.unwrap();
+        let (_key, count, positions) = result.unwrap();
         assert_eq!(count, 2);
         assert_eq!(positions.len(), 2);
     }

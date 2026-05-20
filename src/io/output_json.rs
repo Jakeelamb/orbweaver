@@ -1,7 +1,7 @@
 use crate::grammar::symbol::{Symbol, SymbolType};
 use crate::grammar::rule::Rule;
 use crate::grammar::engine::Grammar;
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
 use std::path::Path;
 use std::fs::File;
@@ -18,7 +18,7 @@ pub fn write_grammar_json(path: &Path, sequence: &[Symbol], rules: &HashMap<usiz
     let mut writer = BufWriter::new(file);
     
     // Convert the grammar to JSON
-    let json_value = grammar_to_json(sequence, rules);
+    let json_value = grammar_to_json(sequence, rules)?;
     
     // Serialize to pretty-printed JSON
     let json_str = serde_json::to_string_pretty(&json_value)
@@ -38,7 +38,7 @@ pub fn write_grammar_json_from_grammar(path: &Path, grammar: &Grammar) -> Result
 }
 
 /// Convert the grammar (sequence and rules) to a JSON value.
-fn grammar_to_json(sequence: &[Symbol], rules: &HashMap<usize, Rule>) -> Value {
+fn grammar_to_json(sequence: &[Symbol], rules: &HashMap<usize, Rule>) -> Result<Value> {
     // Create a JSON object for the grammar
     let mut json_grammar = json!({
         "final_sequence": serialize_sequence(sequence),
@@ -57,38 +57,15 @@ fn grammar_to_json(sequence: &[Symbol], rules: &HashMap<usize, Rule>) -> Value {
         }
     }
 
-    // Extract and clone the sequence array to avoid borrow issues
-    let sequence_array = json_grammar["final_sequence"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
-
-    // Validate that all rule IDs in the sequence exist in the rules map
-    // If they don't exist, add placeholder empty rules to avoid broken references
-    if let Some(rules_obj) = json_grammar["rules"].as_object_mut() {
-        for symbol_value in sequence_array {
-            if let Some(symbol_map) = symbol_value.as_object() {
-                if symbol_map.get("type").and_then(Value::as_str) == Some("non_terminal") {
-                    if let Some(rule_id_val) = symbol_map.get("rule_id") {
-                        if let Some(rule_id_num) = rule_id_val.as_u64() {
-                            let rule_id_str = rule_id_num.to_string();
-                            if !rules_obj.contains_key(&rule_id_str) {
-                                // Add a placeholder rule with empty symbols
-                                rules_obj.insert(rule_id_str.clone(), json!({
-                                    "symbols": [],
-                                    "usage_count": 1,
-                                    "depth": 0
-                                }));
-                                eprintln!("Warning: Added placeholder for missing rule ID {} referenced in sequence", rule_id_str);
-                            }
-                        }
-                    }
-                }
+    for symbol in sequence {
+        if let SymbolType::NonTerminal(rule_id) = symbol.symbol_type {
+            if !rules.contains_key(&rule_id) {
+                bail!("final sequence references missing rule {}", rule_id);
             }
         }
     }
 
-    json_grammar
+    Ok(json_grammar)
 }
 
 /// Serialize a sequence of symbols to a JSON array.

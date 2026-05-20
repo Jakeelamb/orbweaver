@@ -677,7 +677,7 @@ pub fn write_grammar_graphml(path: &Path, grammar: &Grammar, dot_options: &DotOp
 mod tests {
     use super::*;
     use crate::grammar::rule::Rule;
-    use crate::grammar::symbol::{Symbol, SymbolType, Direction};
+    use crate::grammar::symbol::{Symbol, Direction};
     use crate::encode::dna_2bit::EncodedBase;
     use std::collections::HashMap;
 

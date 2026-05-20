@@ -226,7 +226,7 @@ impl KmerTable {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::grammar::symbol::{Symbol, Direction, SymbolType};
+    use crate::grammar::symbol::{Symbol, Direction};
     use crate::encode::dna_2bit::EncodedBase;
 
     // Helper to create terminal symbols

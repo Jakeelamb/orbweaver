@@ -47,7 +47,9 @@ fn test_tiny_fasta_to_json() {
 
     // Check for grammar.json in the run directory
     let json_path = run_dir.join("grammar.json");
+    let motif_table_path = run_dir.join("motif_table.tsv");
     assert!(json_path.exists(), "grammar.json not found in run directory");
+    assert!(motif_table_path.exists(), "motif_table.tsv not found in run directory");
 
     // Basic JSON validation
     let json_content = fs::read_to_string(&json_path).unwrap();
@@ -94,10 +96,12 @@ fn test_comprehensive_functionality() {
     let grammar_json_path = run_dir.join("grammar.json");
     let grammar_gfa_path = run_dir.join("grammar.gfa");
     let grammar_dot_path = run_dir.join("grammar.dot");
+    let motif_table_path = run_dir.join("motif_table.tsv");
 
     assert!(grammar_json_path.exists(), "JSON output file not created in run directory");
     assert!(grammar_gfa_path.exists(), "GFA output file not created in run directory");
     assert!(grammar_dot_path.exists(), "DOT output file not created in run directory");
+    assert!(motif_table_path.exists(), "Motif table not created in run directory");
 
     // Read and check contents of output files
     let json_content = fs::read_to_string(&grammar_json_path).unwrap();
@@ -108,6 +112,12 @@ fn test_comprehensive_functionality() {
 
     let gfa_content = fs::read_to_string(&grammar_gfa_path).unwrap();
     assert!(gfa_content.contains("S\t"), "GFA file doesn't contain segment lines");
+
+    let motif_table_content = fs::read_to_string(&motif_table_path).unwrap();
+    assert!(
+        motif_table_content.starts_with("rule_id\tfingerprint\tlength"),
+        "Motif table header is incorrect"
+    );
 }
 
 // TODO: Add more integration tests:

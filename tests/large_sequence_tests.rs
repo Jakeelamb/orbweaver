@@ -2,8 +2,6 @@
 
 use anyhow::Result;
 use assert_cmd::Command;
-use assert_cmd::assert::OutputAssertExt;
-use predicates::prelude::*;
 use std::fs;
 use std::io::Write;
 use tempfile::tempdir;
@@ -69,8 +67,13 @@ fn test_10mb_highly_repetitive_sequence_standard_mode() -> Result<()> {
     let duration = start_time.elapsed();
     println!("Orbweaver processing took: {:?}", duration);
 
-    // Log output goes to stderr, check success and stderr for completion message
-    output.assert().success().stderr(predicate::str::contains("Grammar construction completed"));
+    assert!(output.status.success(), "orbweaver failed: {:?}", output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Number of Rules:"),
+        "expected stats in stdout, got:\n{}",
+        stdout
+    );
 
     // Check that output json was created and is not empty
     assert!(output_json_path.exists(), "Output JSON file should exist");
@@ -108,8 +111,13 @@ fn test_10mb_highly_repetitive_sequence_streaming_mode() -> Result<()> {
     let duration = start_time.elapsed();
     println!("Orbweaver streaming processing took: {:?}", duration);
 
-    // Log output goes to stderr, check success and stderr for completion message
-    output.assert().success().stderr(predicate::str::contains("Grammar construction completed"));
+    assert!(output.status.success(), "orbweaver failed: {:?}", output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Number of Rules:"),
+        "expected stats in stdout, got:\n{}",
+        stdout
+    );
 
     assert!(output_json_path.exists(), "Output JSON file should exist for streaming test");
     let metadata = fs::metadata(&output_json_path)?;

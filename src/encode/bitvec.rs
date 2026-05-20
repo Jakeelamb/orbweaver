@@ -251,7 +251,7 @@ impl BitVector {
     }
     
     /// Iterate through the bases in the BitVector
-    pub fn iter(&self) -> BitVectorIterator {
+    pub fn iter(&self) -> BitVectorIterator<'_> {
         BitVectorIterator {
             bitvec: self,
             position: 0,

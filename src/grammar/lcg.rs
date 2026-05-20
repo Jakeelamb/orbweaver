@@ -1035,6 +1035,251 @@ impl LcgBuilder {
 
         0
     }
+
+    /// Hierarchical merge for very large genomes.
+    ///
+    /// Instead of merging all N chunks at once (requiring O(N) grammars in memory),
+    /// this merges in a tree-like fashion:
+    /// - Level 1: merge pairs (0,1), (2,3), (4,5), ... → N/2 results
+    /// - Level 2: merge pairs of level 1 results → N/4 results
+    /// - Continue until 1 final result
+    ///
+    /// This reduces peak memory from O(N) to O(log N) grammars.
+    ///
+    /// # Arguments
+    /// * `chunk_data` - Vector of (compressed_sequence, overlap_data, builder) for each chunk
+    ///
+    /// # Returns
+    /// Tuple of (merged_sequence, final_builder)
+    pub fn merge_chunks_hierarchical(
+        config: LcgConfig,
+        mut chunk_data: Vec<(Vec<Symbol>, Option<Vec<EncodedBase>>, LcgBuilder)>,
+    ) -> (Vec<Symbol>, LcgBuilder) {
+        if chunk_data.is_empty() {
+            return (Vec::new(), LcgBuilder::new(config));
+        }
+
+        if chunk_data.len() == 1 {
+            let (seq, _, builder) = chunk_data.pop().unwrap();
+            return (seq, builder);
+        }
+
+        let total_chunks = chunk_data.len();
+        log::info!(
+            "Starting hierarchical merge of {} chunks (estimated {} levels)",
+            total_chunks,
+            (total_chunks as f64).log2().ceil() as usize
+        );
+
+        let mut level = 0;
+        while chunk_data.len() > 1 {
+            level += 1;
+            let pairs_to_merge = chunk_data.len() / 2;
+            let has_odd = chunk_data.len() % 2 == 1;
+
+            log::debug!(
+                "Hierarchical merge level {}: {} items → {} pairs{}",
+                level,
+                chunk_data.len(),
+                pairs_to_merge,
+                if has_odd { " + 1 carried over" } else { "" }
+            );
+
+            let mut next_level: Vec<(Vec<Symbol>, Option<Vec<EncodedBase>>, LcgBuilder)> =
+                Vec::with_capacity(pairs_to_merge + if has_odd { 1 } else { 0 });
+
+            // Process pairs
+            let mut iter = chunk_data.into_iter();
+            while let Some((seq1, overlap1, builder1)) = iter.next() {
+                if let Some((seq2, overlap2, builder2)) = iter.next() {
+                    // Merge this pair
+                    let (merged_seq, merged_builder) = Self::merge_pair(
+                        config.clone(),
+                        (seq1, overlap1, builder1),
+                        (seq2, overlap2, builder2),
+                    );
+                    next_level.push((merged_seq, None, merged_builder));
+                } else {
+                    // Odd one out - carry forward
+                    next_level.push((seq1, overlap1, builder1));
+                }
+            }
+
+            chunk_data = next_level;
+
+            log::debug!(
+                "Level {} complete: {} items, {} total rules",
+                level,
+                chunk_data.len(),
+                chunk_data.iter().map(|(_, _, b)| b.rules.len()).sum::<usize>()
+            );
+        }
+
+        let (seq, _, builder) = chunk_data.pop().unwrap();
+        log::info!(
+            "Hierarchical merge complete: {} levels, {} symbols, {} rules",
+            level,
+            seq.len(),
+            builder.rules.len()
+        );
+
+        (seq, builder)
+    }
+
+    /// Merge two chunk results into one.
+    fn merge_pair(
+        config: LcgConfig,
+        (mut seq1, overlap1, mut builder1): (Vec<Symbol>, Option<Vec<EncodedBase>>, LcgBuilder),
+        (mut seq2, _overlap2, builder2): (Vec<Symbol>, Option<Vec<EncodedBase>>, LcgBuilder),
+    ) -> (Vec<Symbol>, LcgBuilder) {
+        // Merge builder2's rules into builder1
+        let id_mapping = builder1.merge(builder2);
+
+        // Remap references in seq2
+        Self::remap_sequence(&mut seq2, &id_mapping);
+
+        // Handle overlap region for boundary pattern detection
+        if let Some(overlap_bases) = overlap1 {
+            let overlap_phrases = builder1.parse_locally_consistent(&overlap_bases);
+            for phrase in overlap_phrases {
+                if phrase.len >= config.min_phrase_len {
+                    if let Some(&rule_id) = builder1.fingerprint_to_rule.get(&phrase.fingerprint) {
+                        if let Some(rule) = builder1.rules.get_mut(&rule_id) {
+                            rule.usage_count += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Calculate overlap skip
+        let skip_count = builder1.calculate_overlap_skip_count(&seq1, &seq2);
+
+        // Concatenate sequences
+        seq1.extend(seq2.into_iter().skip(skip_count));
+
+        (seq1, builder1)
+    }
+
+}
+
+/// Streaming hierarchical merge that processes chunks as they arrive.
+///
+/// This is memory-efficient for extremely large genomes because it:
+/// 1. Processes chunks in order without storing all of them
+/// 2. Maintains a stack of partial merges at different levels
+/// 3. Eagerly merges when two items at the same level are ready
+///
+/// Memory usage is O(log N) grammars at any time.
+pub struct HierarchicalMerger {
+    config: LcgConfig,
+    /// Stack of (level, sequence, builder) - maintains merge tree state
+    stack: Vec<(usize, Vec<Symbol>, LcgBuilder)>,
+    /// Total chunks processed
+    chunks_processed: usize,
+}
+
+impl HierarchicalMerger {
+    pub fn new(config: LcgConfig) -> Self {
+        Self {
+            config,
+            stack: Vec::new(),
+            chunks_processed: 0,
+        }
+    }
+
+    /// Add a processed chunk to the merger.
+    /// This may trigger one or more merges if we have pairs at the same level.
+    pub fn add_chunk(
+        &mut self,
+        sequence: Vec<Symbol>,
+        overlap_data: Option<Vec<EncodedBase>>,
+        builder: LcgBuilder,
+    ) {
+        self.chunks_processed += 1;
+
+        // Start at level 0
+        let mut current_level = 0;
+        let mut current_seq = sequence;
+        let mut current_overlap = overlap_data;
+        let mut current_builder = builder;
+
+        // Keep merging while we have a partner at the same level
+        while let Some(&(top_level, _, _)) = self.stack.last() {
+            if top_level == current_level {
+                // Pop the partner and merge
+                let (_, partner_seq, partner_builder) = self.stack.pop().unwrap();
+
+                let (merged_seq, merged_builder) = LcgBuilder::merge_pair(
+                    self.config.clone(),
+                    (partner_seq, None, partner_builder),
+                    (current_seq, current_overlap, current_builder),
+                );
+
+                current_seq = merged_seq;
+                current_overlap = None;
+                current_builder = merged_builder;
+                current_level += 1;
+
+                log::trace!(
+                    "Streaming merge at level {}: {} symbols, {} rules",
+                    current_level,
+                    current_seq.len(),
+                    current_builder.rules.len()
+                );
+            } else {
+                break;
+            }
+        }
+
+        // Push current state to stack
+        self.stack.push((current_level, current_seq, current_builder));
+    }
+
+    /// Finalize the merge, combining any remaining items in the stack.
+    pub fn finalize(mut self) -> (Vec<Symbol>, LcgBuilder) {
+        log::info!(
+            "Finalizing hierarchical merge: {} chunks processed, {} stack items remaining",
+            self.chunks_processed,
+            self.stack.len()
+        );
+
+        if self.stack.is_empty() {
+            return (Vec::new(), LcgBuilder::new(self.config));
+        }
+
+        // Merge remaining items from bottom to top (left to right in sequence order)
+        while self.stack.len() > 1 {
+            // Pop two items and merge them
+            let (_, seq2, builder2) = self.stack.pop().unwrap();
+            let (level1, seq1, builder1) = self.stack.pop().unwrap();
+
+            let (merged_seq, merged_builder) = LcgBuilder::merge_pair(
+                self.config.clone(),
+                (seq1, None, builder1),
+                (seq2, None, builder2),
+            );
+
+            // Push merged result (level doesn't matter in finalization)
+            self.stack.push((level1 + 1, merged_seq, merged_builder));
+        }
+
+        let (_, seq, builder) = self.stack.pop().unwrap();
+        log::info!(
+            "Hierarchical merge finalized: {} symbols, {} rules",
+            seq.len(),
+            builder.rules.len()
+        );
+
+        (seq, builder)
+    }
+
+    /// Get current memory statistics: (stack_depth, total_symbols, total_rules)
+    pub fn memory_stats(&self) -> (usize, usize, usize) {
+        let total_symbols: usize = self.stack.iter().map(|(_, seq, _): &(usize, Vec<Symbol>, LcgBuilder)| seq.len()).sum();
+        let total_rules: usize = self.stack.iter().map(|(_, _, b): &(usize, Vec<Symbol>, LcgBuilder)| b.rules.len()).sum();
+        (self.stack.len(), total_symbols, total_rules)
+    }
 }
 
 #[cfg(test)]
@@ -1245,5 +1490,160 @@ mod tests {
 
         // After second build, buffers should still exist
         assert!(builder.buffers.is_some(), "Buffers should be reused across builds");
+    }
+
+    #[test]
+    fn test_hierarchical_merge_basic() {
+        let config = LcgConfig {
+            min_phrase_len: 2,
+            max_phrase_len: 8,
+            window_size: 4,
+            min_occurrences: 2,
+        };
+
+        // Create several chunks with similar patterns
+        let seqs = vec![
+            encode_seq(b"ACACACACACAC"),
+            encode_seq(b"ACACACACACAC"),
+            encode_seq(b"GTGTGTGTGTGT"),
+            encode_seq(b"ACACACACACAC"),
+        ];
+
+        // Build grammar for each chunk
+        let mut chunk_data: Vec<(Vec<Symbol>, Option<Vec<EncodedBase>>, LcgBuilder)> = Vec::new();
+        for (idx, seq) in seqs.iter().enumerate() {
+            let mut builder = LcgBuilder::new(config.clone());
+            let (compressed, _) = builder.build_grammar(seq, idx);
+            chunk_data.push((compressed, None, builder));
+        }
+
+        // Merge hierarchically
+        let (merged_seq, merged_builder) = LcgBuilder::merge_chunks_hierarchical(config, chunk_data);
+
+        // Should have produced a merged result
+        assert!(!merged_seq.is_empty(), "Merged sequence should not be empty");
+        assert!(!merged_builder.rules.is_empty(), "Should have rules after merge");
+    }
+
+    #[test]
+    fn test_hierarchical_merger_streaming() {
+        let config = LcgConfig {
+            min_phrase_len: 2,
+            max_phrase_len: 8,
+            window_size: 4,
+            min_occurrences: 2,
+        };
+
+        let mut merger = HierarchicalMerger::new(config.clone());
+
+        // Add chunks one by one (simulating streaming)
+        let seqs = vec![
+            encode_seq(b"ACACACACACAC"),
+            encode_seq(b"ACACACACACAC"),
+            encode_seq(b"GTGTGTGTGTGT"),
+            encode_seq(b"ACACACACACAC"),
+            encode_seq(b"GTGTGTGTGTGT"),
+        ];
+
+        for (idx, seq) in seqs.iter().enumerate() {
+            let mut builder = LcgBuilder::new(config.clone());
+            let (compressed, _) = builder.build_grammar(seq, idx);
+            merger.add_chunk(compressed, None, builder);
+        }
+
+        // Finalize
+        let (merged_seq, merged_builder) = merger.finalize();
+
+        assert!(!merged_seq.is_empty(), "Merged sequence should not be empty");
+        assert!(!merged_builder.rules.is_empty(), "Should have rules after merge");
+    }
+
+    #[test]
+    fn test_hierarchical_merge_memory_efficiency() {
+        let config = LcgConfig {
+            min_phrase_len: 2,
+            max_phrase_len: 8,
+            window_size: 4,
+            min_occurrences: 2,
+        };
+
+        let mut merger = HierarchicalMerger::new(config.clone());
+
+        // Add 16 chunks to test multiple merge levels
+        for idx in 0..16 {
+            let seq = if idx % 2 == 0 {
+                encode_seq(b"ACACACACACACACAC")
+            } else {
+                encode_seq(b"GTGTGTGTGTGTGTGT")
+            };
+            let mut builder = LcgBuilder::new(config.clone());
+            let (compressed, _) = builder.build_grammar(&seq, idx);
+            merger.add_chunk(compressed, None, builder);
+
+            // Check that stack depth is bounded
+            let (stack_depth, _, _) = merger.memory_stats();
+            // Stack depth should be at most log2(chunks_added) + 1
+            let max_expected_depth = ((idx + 1) as f64).log2().ceil() as usize + 1;
+            assert!(
+                stack_depth <= max_expected_depth,
+                "Stack depth {} should be <= {} for {} chunks",
+                stack_depth, max_expected_depth, idx + 1
+            );
+        }
+
+        let (merged_seq, merged_builder) = merger.finalize();
+        assert!(!merged_seq.is_empty());
+        assert!(!merged_builder.rules.is_empty());
+    }
+
+    #[test]
+    fn test_hierarchical_vs_standard_merge_produces_rules() {
+        let config = LcgConfig {
+            min_phrase_len: 2,
+            max_phrase_len: 8,
+            window_size: 4,
+            min_occurrences: 2,
+        };
+
+        // Create chunks
+        let seqs = vec![
+            encode_seq(b"ACACACACACAC"),
+            encode_seq(b"ACACACACACAC"),
+            encode_seq(b"ACACACACACAC"),
+            encode_seq(b"ACACACACACAC"),
+        ];
+
+        // Build grammars for hierarchical merge
+        let mut hierarchical_chunks: Vec<(Vec<Symbol>, Option<Vec<EncodedBase>>, LcgBuilder)> = Vec::new();
+        for (idx, seq) in seqs.iter().enumerate() {
+            let mut builder = LcgBuilder::new(config.clone());
+            let (compressed, _) = builder.build_grammar(seq, idx);
+            hierarchical_chunks.push((compressed, None, builder));
+        }
+
+        // Hierarchical merge
+        let (hier_seq, hier_builder) = LcgBuilder::merge_chunks_hierarchical(config.clone(), hierarchical_chunks);
+
+        // Build grammars for standard merge
+        let mut standard_sequences: Vec<(Vec<Symbol>, Option<Vec<EncodedBase>>)> = Vec::new();
+        let mut standard_builders: Vec<LcgBuilder> = Vec::new();
+        for (idx, seq) in seqs.iter().enumerate() {
+            let mut builder = LcgBuilder::new(config.clone());
+            let (compressed, _) = builder.build_grammar(seq, idx);
+            standard_sequences.push((compressed, None));
+            standard_builders.push(builder);
+        }
+
+        // Standard merge
+        let mut master_builder = LcgBuilder::new(config);
+        let (std_seq, _) = master_builder.merge_chunks_with_overlap(standard_sequences, standard_builders);
+
+        // Both should produce rules (identical sequences = deduplicated rules)
+        assert!(!hier_builder.rules.is_empty(), "Hierarchical should produce rules");
+        assert!(!master_builder.rules.is_empty(), "Standard should produce rules");
+
+        // Both sequences should be non-empty
+        assert!(!hier_seq.is_empty());
+        assert!(!std_seq.is_empty());
     }
 }

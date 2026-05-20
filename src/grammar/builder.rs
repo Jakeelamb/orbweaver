@@ -168,7 +168,7 @@ impl GrammarBuilder {
 
         let pattern_found = if self.kmer_size == 2 {
             // --- Digram Processing --- //
-            if let Some((key_tuple, count, occurrences)) = self.digram_table.find_most_frequent_digram() {
+            if let Some((_key_tuple, count, occurrences)) = self.digram_table.find_most_frequent_digram() {
                 if count >= self.min_rule_usage {
 
                     // Reconstruct the first digram instance to create the rule
@@ -228,7 +228,7 @@ impl GrammarBuilder {
                  }
             };
 
-            if let Some((kmer_key, count, occurrences)) = kmer_table.find_most_frequent(self.min_rule_usage) {
+            if let Some((_kmer_key, count, occurrences)) = kmer_table.find_most_frequent(self.min_rule_usage) {
                 if count >= self.min_rule_usage {
                      let representative_kmer = &occurrences[0].1;
 

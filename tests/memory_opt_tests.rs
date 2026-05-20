@@ -107,7 +107,7 @@ mod memory_optimization_tests {
         let standard_time = start_time.elapsed();
         
         // Get the resulting grammar
-        let (standard_sequence, standard_rules) = standard_builder.get_grammar();
+        let (_standard_sequence, standard_rules) = standard_builder.get_grammar();
         
         // Print results for comparison
         println!("Streaming mode processed {} bases in {:?}", sequence_size, streaming_time);
